@@ -2,7 +2,8 @@
  * Coverage for the first-run / provider-switch config mutators in
  * provider-switch-config: subscription-provider selection, the full first-run
  * reset (config + process.env + stored provider credentials), the third-party
- * `OPENAI_BASE_URL` guard, and Cerebras / NEAR AI local-provider wiring.
+ * `OPENAI_BASE_URL` guard, Pi config-only switching/compensation, and Cerebras /
+ * NEAR AI local-provider wiring.
  * Deterministic: it drives the pure config mutators and asserts against
  * process.env and the in-memory config object; no live provider is contacted.
  */
@@ -32,7 +33,11 @@ import {
   applySubscriptionProviderConfig,
   clearPersistedFirstRunConfig,
   clearSubscriptionProviderConfig,
+  createProviderSwitchConnection,
   openAiBaseUrlIsThirdParty,
+  PI_PROVIDER_SWITCH_ENV_KEYS,
+  restoreProviderSwitchState,
+  snapshotProviderSwitchState,
 } from "./provider-switch-config";
 
 const ENV_KEYS_TO_RESTORE = ["ELIZA_HOME", "ELIZA_STATE_DIR"] as const;
@@ -406,6 +411,191 @@ describe("Cerebras direct-account wiring", () => {
     expect(DIRECT_ACCOUNT_PROVIDER_ENV["cerebras-api"]).toBe(
       "CEREBRAS_API_KEY",
     );
+  });
+});
+
+describe("Pi provider-switch config", () => {
+  it("requires an OpenAI- or Anthropic-qualified primary model", () => {
+    for (const primaryModel of [
+      undefined,
+      "",
+      "gpt-5",
+      "/gpt-5",
+      "openai/",
+      "google/gemini-2.5-pro",
+      " openai/gpt-5",
+      "openai/gpt-5 ",
+      "openai/gpt 5",
+      "openai/gpt\n5",
+      `openai/gpt${String.fromCharCode(0x7f)}5`,
+      "OpenAI/gpt-5",
+      "openai//gpt-5",
+      "openai/./gpt-5",
+      "openai/../gpt-5",
+      "openai/gpt-5/",
+    ]) {
+      expect(() =>
+        createProviderSwitchConnection({
+          provider: "pi",
+          primaryModel,
+        }),
+      ).toThrow(/provider-qualified primaryModel/);
+    }
+  });
+
+  it("preserves valid model subpaths after the provider qualifier", () => {
+    expect(
+      createProviderSwitchConnection({
+        provider: "pi",
+        primaryModel: "openai/models/gpt-5:preview",
+      }),
+    ).toMatchObject({ primaryModel: "openai/models/gpt-5:preview" });
+  });
+
+  it("rejects every explicit Pi API-key value until secure onboarding is available", () => {
+    for (const apiKey of ["sk-must-not-be-accepted", "", "   "]) {
+      expect(() =>
+        createProviderSwitchConnection({
+          provider: "pi",
+          primaryModel: "openai/gpt-5.4-mini",
+          apiKey,
+        }),
+      ).toThrow(/Secure Pi API-key onboarding is not available yet/);
+    }
+  });
+
+  it("applies a config-only Pi switch with the qualified model", async () => {
+    const config: Partial<ElizaConfig> = {
+      serviceRouting: {
+        llmText: {
+          backend: "openai",
+          transport: "direct",
+          primaryModel: "gpt-5",
+        },
+      },
+    };
+
+    await applyFirstRunConnectionConfig(config, {
+      kind: "local-provider",
+      provider: "pi",
+      primaryModel: "anthropic/claude-sonnet-4-6",
+    });
+
+    expect(config.serviceRouting?.llmText).toMatchObject({
+      backend: "pi",
+      transport: "direct",
+      primaryModel: "anthropic/claude-sonnet-4-6",
+    });
+    expect(config.agents?.defaults?.model?.primary).toBe(
+      "anthropic/claude-sonnet-4-6",
+    );
+    expect(config.env).toBeUndefined();
+  });
+
+  it("restores full config and only Pi-managed environment keys in place", () => {
+    const config: Partial<ElizaConfig> = {
+      serviceRouting: {
+        llmText: {
+          backend: "openai",
+          transport: "direct",
+          primaryModel: "gpt-5",
+        },
+      },
+      env: { vars: { EXISTING_KEY: "existing" } },
+    };
+    const environment: NodeJS.ProcessEnv = {
+      ELIZAOS_CLOUD_ENABLED: "true",
+      UNRELATED_CONCURRENT_KEY: "before",
+    };
+    const snapshot = snapshotProviderSwitchState(config, environment);
+
+    config.serviceRouting = {
+      llmText: {
+        backend: "pi",
+        transport: "direct",
+        primaryModel: "openai/gpt-5.4-mini",
+      },
+    };
+    config.env = { vars: { NEW_KEY: "new" } };
+    delete environment.ELIZAOS_CLOUD_ENABLED;
+    environment.OPENAI_BASE_URL = "https://switch.invalid/v1";
+    environment.UNRELATED_CONCURRENT_KEY = "concurrent-update";
+    environment.ADDED_CONCURRENT_KEY = "preserved";
+
+    const originalConfigIdentity = config;
+    restoreProviderSwitchState(config, snapshot, environment);
+
+    expect(config).toBe(originalConfigIdentity);
+    expect(config).toEqual(snapshot.config);
+    expect(Object.keys(snapshot.environment)).toEqual(
+      PI_PROVIDER_SWITCH_ENV_KEYS,
+    );
+    expect(environment.ELIZAOS_CLOUD_ENABLED).toBe("true");
+    expect(environment.OPENAI_BASE_URL).toBeUndefined();
+    expect(environment.UNRELATED_CONCURRENT_KEY).toBe("concurrent-update");
+    expect(environment.ADDED_CONCURRENT_KEY).toBe("preserved");
+  });
+
+  it("covers every environment key mutated by real Pi preparation", async () => {
+    const originalEnvironment = { ...process.env };
+    const unrelatedKey = "PI_SWITCH_UNRELATED_CONCURRENT";
+    try {
+      for (const key of PI_PROVIDER_SWITCH_ENV_KEYS) {
+        process.env[key] = key.endsWith("BASE_URL")
+          ? "https://www.elizacloud.ai/api/v1"
+          : `seed-${key}`;
+      }
+      process.env[unrelatedKey] = "before";
+      const beforeSwitch = { ...process.env };
+      const config: Partial<ElizaConfig> = {
+        serviceRouting: {
+          llmText: {
+            backend: "openai",
+            transport: "direct",
+            primaryModel: "gpt-5",
+          },
+        },
+      };
+      const snapshot = snapshotProviderSwitchState(config);
+
+      await applyFirstRunConnectionConfig(config, {
+        kind: "local-provider",
+        provider: "pi",
+        primaryModel: "openai/models/gpt-5:preview",
+      });
+
+      const changedKeys = new Set([
+        ...Object.keys(beforeSwitch),
+        ...Object.keys(process.env),
+      ]);
+      const actuallyChanged = [...changedKeys].filter(
+        (key) => beforeSwitch[key] !== process.env[key],
+      );
+      expect(actuallyChanged.length).toBeGreaterThan(0);
+      expect(
+        actuallyChanged.every((key) =>
+          PI_PROVIDER_SWITCH_ENV_KEYS.includes(
+            key as (typeof PI_PROVIDER_SWITCH_ENV_KEYS)[number],
+          ),
+        ),
+      ).toBe(true);
+
+      process.env[unrelatedKey] = "concurrent-update";
+      restoreProviderSwitchState(config, snapshot);
+      for (const key of PI_PROVIDER_SWITCH_ENV_KEYS) {
+        expect(process.env[key]).toBe(beforeSwitch[key]);
+      }
+      expect(process.env[unrelatedKey]).toBe("concurrent-update");
+    } finally {
+      for (const key of new Set([
+        ...Object.keys(originalEnvironment),
+        ...Object.keys(process.env),
+      ])) {
+        const originalValue = originalEnvironment[key];
+        if (originalValue === undefined) delete process.env[key];
+        else process.env[key] = originalValue;
+      }
+    }
   });
 });
 

@@ -86,6 +86,8 @@ export {
 	type LinkedAccountStatus,
 	type LinkedAccountsConfig,
 	type LinkedAccountUsage,
+	LLM_TEXT_ROUTE_RUNTIME_SETTING_BY_FIELD,
+	type LlmTextRouteRuntimeSettingKey,
 	SERVICE_ROUTE_ACCOUNT_STRATEGIES,
 	type ServiceCapability,
 	type ServiceRouteAccountStrategy,

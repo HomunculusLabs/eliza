@@ -27,6 +27,7 @@ import {
   type BootPhaseName,
   createBootContext,
   type ElizaBootResult,
+  preparePreferredProviderPluginForBoot,
   resolveBootPlan,
 } from "./boot-pipeline.ts";
 // ---------------------------------------------------------------------------
@@ -261,6 +262,7 @@ import {
 } from "./deferred-boot-owner.ts";
 import { markDeferredBootPhase } from "./deferred-boot-status.ts";
 import {
+  resolveLlmTextRuntimeSettings,
   resolvePreferredProviderId,
   resolvePreferredProviderPluginName,
   resolvePrimaryModel,
@@ -4361,6 +4363,7 @@ export async function startEliza(
   const preferredProviderId = resolvePreferredProviderId(config);
   const preferredProviderPluginName =
     resolvePreferredProviderPluginName(config);
+  const llmTextRuntimeSettings = resolveLlmTextRuntimeSettings(config);
 
   // 4. Ensure workspace exists with required files
   const workspaceDir =
@@ -4552,6 +4555,17 @@ export async function startEliza(
   const otherPlugins = resolvedPlugins.filter(
     (p) => !PREREGISTER_PLUGINS.has(p.name),
   );
+  const preferredBootPlugin = preparePreferredProviderPluginForBoot({
+    resolvedPlugins: otherPlugins,
+    preferredPackageName: preferredProviderPluginName,
+    priorityBoost: bootContext.policy.preferredProviderPriorityBoost,
+    configProjection: llmTextRuntimeSettings,
+  });
+  if (preferredBootPlugin) {
+    logger.info(
+      `[eliza] Prepared preferred plugin "${preferredBootPlugin.name}" with priority ${preferredBootPlugin.priority ?? 0} (preferred provider: ${preferredProviderId ?? "unknown"})`,
+    );
+  }
   const preferredTextRuntimeProviderName = resolveRuntimeProviderName(
     resolvedPlugins,
     preferredProviderPluginName,
@@ -4666,19 +4680,6 @@ export async function startEliza(
 
   const pluginsForRuntime = otherPlugins.map((p) => p.plugin);
   const visionModeSetting = resolveVisionModeSetting(config);
-  if (preferredProviderPluginName) {
-    for (const plugin of pluginsForRuntime) {
-      if (plugin.name === preferredProviderPluginName) {
-        plugin.priority =
-          (plugin.priority ?? 0) +
-          bootContext.policy.preferredProviderPriorityBoost;
-        logger.info(
-          `[eliza] Boosted plugin "${plugin.name}" priority to ${plugin.priority} (preferred provider: ${preferredProviderId ?? "unknown"})`,
-        );
-        break;
-      }
-    }
-  }
 
   // Deduplicate actions across all plugins to avoid "Action already registered"
   // warnings from elizaOS core. basic-capabilities is registered first by the
@@ -5486,26 +5487,28 @@ export async function startEliza(
         .map((plugin) => plugin.name)
         .filter((name): name is string => typeof name === "string"),
     );
-    const deferredPluginsForRuntime = deferredResolvedPlugins
+    const deferredResolvedForRuntime = deferredResolvedPlugins
       .filter((p) => !PREREGISTER_PLUGINS.has(p.name))
-      .filter((p) => !alreadyRegisteredPluginNames.has(p.plugin.name ?? p.name))
-      .map((p) => p.plugin);
+      .filter(
+        (p) => !alreadyRegisteredPluginNames.has(p.plugin.name ?? p.name),
+      );
+    const preferredDeferredPlugin = preparePreferredProviderPluginForBoot({
+      resolvedPlugins: deferredResolvedForRuntime,
+      preferredPackageName: preferredProviderPluginName,
+      priorityBoost: bootContext.policy.preferredProviderPriorityBoost,
+      configProjection: llmTextRuntimeSettings,
+    });
+    const deferredPluginsForRuntime = deferredResolvedForRuntime.map(
+      (resolved) => resolved.plugin,
+    );
     if (deferredPluginsForRuntime.length === 0) {
       return;
     }
 
-    if (preferredProviderPluginName) {
-      for (const plugin of deferredPluginsForRuntime) {
-        if (plugin.name === preferredProviderPluginName) {
-          plugin.priority =
-            (plugin.priority ?? 0) +
-            bootContext.policy.preferredProviderPriorityBoost;
-          logger.info(
-            `[eliza] Boosted deferred plugin "${plugin.name}" priority to ${plugin.priority} (preferred provider: ${preferredProviderId ?? "unknown"})`,
-          );
-          break;
-        }
-      }
+    if (preferredDeferredPlugin) {
+      logger.info(
+        `[eliza] Prepared deferred preferred plugin "${preferredDeferredPlugin.name}" with priority ${preferredDeferredPlugin.priority ?? 0} (preferred provider: ${preferredProviderId ?? "unknown"})`,
+      );
     }
     deduplicatePluginActions([
       basicCapabilitiesPlugin,
@@ -5585,11 +5588,7 @@ export async function startEliza(
     // but it does not block the other workers from starting. A setImmediate
     // yield between registrations lets /api/* interleave.
     // Mirrors the yield-between-imports loop in the deferred static import phase.
-    const preferredPlugin = preferredProviderPluginName
-      ? deferredPluginsForRuntime.find(
-          (plugin) => plugin.name === preferredProviderPluginName,
-        )
-      : undefined;
+    const preferredPlugin = preferredDeferredPlugin;
     const registrationQueue = preferredPlugin
       ? [
           preferredPlugin,

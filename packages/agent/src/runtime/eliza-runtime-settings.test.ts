@@ -161,12 +161,24 @@ describe("buildRuntimeSettingsProjection", () => {
   it("projects explicit canonical routing omissions as disabled capabilities", () => {
     const settings = buildRuntimeSettingsProjection({
       serviceRouting: {
-        llmText: { backend: "cerebras", transport: "direct" },
+        llmText: {
+          backend: "pi",
+          transport: "direct",
+          primaryModel: "openai/gpt-5.4-mini",
+          smallModel: "openai/gpt-5.4-mini",
+          largeModel: "anthropic/claude-sonnet-4-5",
+        },
       },
     } as ElizaConfig);
 
-    expect(settings.ELIZA_CANONICAL_LLM_TEXT_ENABLED).toBe("true");
-    expect(settings.ELIZA_CANONICAL_EMBEDDINGS_ENABLED).toBe("false");
+    expect(settings).toMatchObject({
+      ELIZA_CANONICAL_LLM_TEXT_ENABLED: "true",
+      ELIZA_CANONICAL_EMBEDDINGS_ENABLED: "false",
+      ELIZA_LLM_TEXT_BACKEND: "pi",
+      ELIZA_LLM_TEXT_PRIMARY_MODEL: "openai/gpt-5.4-mini",
+      ELIZA_LLM_TEXT_SMALL_MODEL: "openai/gpt-5.4-mini",
+      ELIZA_LLM_TEXT_LARGE_MODEL: "anthropic/claude-sonnet-4-5",
+    });
   });
 
   it("preserves legacy plugin capabilities when canonical routing is absent", () => {

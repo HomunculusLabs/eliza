@@ -281,7 +281,11 @@ export function getProviderOptions(): Array<{
   keyPrefix: string | null;
   description: string;
 }> {
-  return FIRST_RUN_PROVIDER_CATALOG.map((provider) => ({
+  return FIRST_RUN_PROVIDER_CATALOG.filter(
+    (provider) =>
+      !("onboardingVisible" in provider) ||
+      provider.onboardingVisible !== false,
+  ).map((provider) => ({
     id: provider.id,
     name: provider.name,
     envKey: provider.envKey,

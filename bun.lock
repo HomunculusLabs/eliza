@@ -130,6 +130,7 @@
         "@elizaos/plugin-notes": "workspace:*",
         "@elizaos/plugin-openai": "workspace:*",
         "@elizaos/plugin-phone": "workspace:*",
+        "@elizaos/plugin-pi-ai": "workspace:*",
         "@elizaos/plugin-pty": "workspace:*",
         "@elizaos/plugin-registry": "workspace:*",
         "@elizaos/plugin-scheduling": "workspace:*",

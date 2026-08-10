@@ -44,6 +44,7 @@
       "source": "bundled",
       "tags": [
         "agent-skills",
+        "clawhub",
         "otto",
         "skills",
         "agents",
@@ -65,6 +66,14 @@
           "sensitive": false,
           "label": "Auto Load",
           "help": "Automatically load installed skills on startup",
+          "advanced": false
+        },
+        "SKILLS_REGISTRY": {
+          "type": "string",
+          "required": false,
+          "sensitive": false,
+          "label": "Registry",
+          "help": "Skill registry URL (default: https://clawhub.ai)",
           "advanced": false
         },
         "BUNDLED_SKILLS_DIRS": {
@@ -4111,6 +4120,29 @@
       },
       "kind": "plugin",
       "subtype": "feature"
+    },
+    {
+      "id": "pi-ai",
+      "name": "Pi AI",
+      "description": "Opt-in provider-neutral text generation gateway backed by Pi AI.",
+      "npmName": "@elizaos/plugin-pi-ai",
+      "source": "bundled",
+      "tags": [],
+      "config": {},
+      "render": {
+        "visible": false,
+        "pinTo": [],
+        "style": "card",
+        "group": "ai-provider",
+        "actions": []
+      },
+      "resources": {},
+      "dependsOn": [],
+      "channels": [],
+      "shortIds": [],
+      "providerBackends": ["pi"],
+      "kind": "plugin",
+      "subtype": "ai-provider"
     },
     {
       "id": "plugin-manager",

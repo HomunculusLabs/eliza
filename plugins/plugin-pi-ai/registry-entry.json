@@ -1,0 +1,13 @@
+{
+  "id": "pi-ai",
+  "name": "Pi AI",
+  "description": "Opt-in provider-neutral text generation gateway backed by Pi AI.",
+  "npmName": "@elizaos/plugin-pi-ai",
+  "providerBackends": ["pi"],
+  "render": {
+    "visible": false,
+    "group": "ai-provider"
+  },
+  "kind": "plugin",
+  "subtype": "ai-provider"
+}

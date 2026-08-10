@@ -213,3 +213,26 @@ export type ServiceRouteConfig = {
 export type ServiceRoutingConfig = Partial<
 	Record<ServiceCapability, ServiceRouteConfig>
 >;
+
+/**
+ * Provider-neutral runtime setting keys for the canonical text route. Hosts
+ * project these values into runtime settings and the selected provider plugin's
+ * init config; plugins must not persist equivalent provider-specific env state.
+ */
+export const LLM_TEXT_ROUTE_RUNTIME_SETTING_BY_FIELD = {
+	backend: "ELIZA_LLM_TEXT_BACKEND",
+	primaryModel: "ELIZA_LLM_TEXT_PRIMARY_MODEL",
+	nanoModel: "ELIZA_LLM_TEXT_NANO_MODEL",
+	smallModel: "ELIZA_LLM_TEXT_SMALL_MODEL",
+	mediumModel: "ELIZA_LLM_TEXT_MEDIUM_MODEL",
+	largeModel: "ELIZA_LLM_TEXT_LARGE_MODEL",
+	megaModel: "ELIZA_LLM_TEXT_MEGA_MODEL",
+	responseHandlerModel: "ELIZA_LLM_TEXT_RESPONSE_HANDLER_MODEL",
+	actionPlannerModel: "ELIZA_LLM_TEXT_ACTION_PLANNER_MODEL",
+	plannerModel: "ELIZA_LLM_TEXT_PLANNER_MODEL",
+} as const satisfies Readonly<
+	Partial<Record<keyof ServiceRouteConfig, string>>
+>;
+
+export type LlmTextRouteRuntimeSettingKey =
+	(typeof LLM_TEXT_ROUTE_RUNTIME_SETTING_BY_FIELD)[keyof typeof LLM_TEXT_ROUTE_RUNTIME_SETTING_BY_FIELD];

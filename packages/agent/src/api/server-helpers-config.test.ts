@@ -1,12 +1,23 @@
 /**
- * Tests for the destructive-reset guard (#8801 / #9943). isSafeResetStateDir
- * decides whether a path may be wiped by the "reset state" operation. A bug here
- * could erase the filesystem root, $HOME, or an unrelated directory — so the
- * guard (under-home AND contains an "eliza" segment, never root/home itself) is
- * pinned.
+ * Tests configuration helpers that guard destructive reset paths and serialize
+ * first-run provider options. The reset cases pin filesystem safety; provider
+ * projection cases ensure hidden configuration-only backends stay out of UI
+ * onboarding responses.
  */
 import { describe, expect, it } from "vitest";
-import { isSafeResetStateDir } from "./server-helpers-config";
+import {
+  getProviderOptions,
+  isSafeResetStateDir,
+} from "./server-helpers-config";
+
+describe("getProviderOptions", () => {
+  it("does not expose the configuration-only Pi backend during onboarding", () => {
+    const providers = getProviderOptions();
+
+    expect(providers.some((provider) => provider.id === "pi")).toBe(false);
+    expect(providers.some((provider) => provider.id === "openai")).toBe(true);
+  });
+});
 
 describe("isSafeResetStateDir", () => {
   const home = "/home/user";

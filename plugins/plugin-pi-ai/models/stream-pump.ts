@@ -187,13 +187,16 @@ export function createPiStreamAttempt(args: {
     return outcome.value;
   };
 
+  const commitSemanticDelta = (): void => {
+    if (committed) return;
+    committed = true;
+    readySettled = true;
+    ready.resolve();
+  };
+
   const publishVisibleDelta = async (delta: string): Promise<void> => {
     if (delta.length === 0) return;
-    if (!committed) {
-      committed = true;
-      readySettled = true;
-      ready.resolve();
-    }
+    commitSemanticDelta();
     visibleText += delta;
     queue.push(delta);
     try {
@@ -367,6 +370,9 @@ export function createPiStreamAttempt(args: {
             throw streamProtocolError(
               "Pi stream emitted an invalid content delta",
             );
+          }
+          if (event.delta.length > 0) {
+            commitSemanticDelta();
           }
           if (
             event.type === "text_delta" &&

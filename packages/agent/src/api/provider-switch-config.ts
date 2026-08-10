@@ -15,6 +15,7 @@ import {
 } from "@elizaos/auth/account-storage";
 import { applySubscriptionCredentials } from "@elizaos/auth/credentials";
 import { SUBSCRIPTION_PROVIDER_MAP } from "@elizaos/auth/types";
+import { ElizaError } from "@elizaos/core";
 import type {
   DeploymentTargetConfig,
   LinkedAccountFlagsConfig,
@@ -56,6 +57,126 @@ type MutableElizaConfig = Partial<ElizaConfig> & {
 };
 
 const trimToUndefined = asNonEmptyString;
+
+const PI_SUPPORTED_UPSTREAM_PROVIDERS = new Set(["openai", "anthropic"]);
+
+function hasValidPiModelComponents(primaryModel: string): boolean {
+  for (const character of primaryModel) {
+    const codePoint = character.codePointAt(0);
+    if (
+      character.trim().length === 0 ||
+      codePoint === undefined ||
+      codePoint <= 0x1f ||
+      (codePoint >= 0x7f && codePoint <= 0x9f)
+    ) {
+      return false;
+    }
+  }
+  const separatorIndex = primaryModel.indexOf("/");
+  if (separatorIndex <= 0 || separatorIndex === primaryModel.length - 1) {
+    return false;
+  }
+  const upstreamProvider = primaryModel.slice(0, separatorIndex);
+  if (!PI_SUPPORTED_UPSTREAM_PROVIDERS.has(upstreamProvider)) return false;
+  return primaryModel
+    .slice(separatorIndex + 1)
+    .split("/")
+    .every(
+      (component) =>
+        component.length > 0 && component !== "." && component !== "..",
+    );
+}
+
+/** Environment keys the config-only Pi switch can clear or replace. */
+export const PI_PROVIDER_SWITCH_ENV_KEYS = [
+  "ELIZAOS_CLOUD_ENABLED",
+  "ELIZAOS_CLOUD_API_KEY",
+  "ELIZAOS_CLOUD_BASE_URL",
+  "ELIZAOS_CLOUD_NANO_MODEL",
+  "ELIZAOS_CLOUD_MEDIUM_MODEL",
+  "ELIZAOS_CLOUD_SMALL_MODEL",
+  "ELIZAOS_CLOUD_LARGE_MODEL",
+  "ELIZAOS_CLOUD_MEGA_MODEL",
+  "ELIZAOS_CLOUD_RESPONSE_HANDLER_MODEL",
+  "ELIZAOS_CLOUD_SHOULD_RESPOND_MODEL",
+  "ELIZAOS_CLOUD_ACTION_PLANNER_MODEL",
+  "ELIZAOS_CLOUD_PLANNER_MODEL",
+  "OPENAI_BASE_URL",
+  "OPENAI_API_KEY",
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_API_KEY",
+] as const;
+
+function validatePiConnection(args: {
+  apiKey?: string;
+  primaryModel?: string;
+}): string {
+  if (args.apiKey !== undefined) {
+    throw new ElizaError(
+      "Secure Pi API-key onboarding is not available yet; omit apiKey and use a preconfigured runtime credential.",
+      {
+        code: "PI_SECURE_ONBOARDING_NOT_AVAILABLE",
+        context: { provider: "pi" },
+      },
+    );
+  }
+
+  const primaryModel = trimToUndefined(args.primaryModel);
+  if (
+    !primaryModel ||
+    args.primaryModel !== primaryModel ||
+    !hasValidPiModelComponents(primaryModel)
+  ) {
+    throw new ElizaError(
+      "Pi requires a provider-qualified primaryModel using openai/<model> or anthropic/<model>.",
+      {
+        code: "PI_QUALIFIED_MODEL_REQUIRED",
+        context: { provider: "pi" },
+      },
+    );
+  }
+
+  return primaryModel;
+}
+
+export interface ProviderSwitchStateSnapshot {
+  config: MutableElizaConfig;
+  environment: Record<string, string | undefined>;
+}
+
+/** Captures full config plus only environment keys a Pi switch can mutate. */
+export function snapshotProviderSwitchState(
+  config: MutableElizaConfig,
+  environment: NodeJS.ProcessEnv = process.env,
+): ProviderSwitchStateSnapshot {
+  const environmentSnapshot: Record<string, string | undefined> = {};
+  for (const key of PI_PROVIDER_SWITCH_ENV_KEYS) {
+    environmentSnapshot[key] = environment[key];
+  }
+  return {
+    config: structuredClone(config),
+    environment: environmentSnapshot,
+  };
+}
+
+/** Restores captured state without clobbering unrelated concurrent env updates. */
+export function restoreProviderSwitchState(
+  config: MutableElizaConfig,
+  snapshot: ProviderSwitchStateSnapshot,
+  environment: NodeJS.ProcessEnv = process.env,
+): void {
+  const mutableConfig = config as Record<string, unknown>;
+  for (const key of Object.keys(mutableConfig)) delete mutableConfig[key];
+  Object.assign(mutableConfig, structuredClone(snapshot.config));
+
+  for (const [key, value] of Object.entries(snapshot.environment)) {
+    if (value === undefined) {
+      delete environment[key];
+    } else {
+      environment[key] = value;
+    }
+  }
+}
 
 function ensureEnv(config: MutableElizaConfig): Record<string, unknown> {
   config.env ??= {};
@@ -829,6 +950,14 @@ export function createProviderSwitchConnection(args: {
     };
   }
 
+  if (provider === "pi") {
+    return {
+      kind: "local-provider",
+      provider,
+      primaryModel: validatePiConnection(args),
+    };
+  }
+
   return {
     kind: "local-provider",
     provider,
@@ -842,6 +971,13 @@ export async function applyFirstRunConnectionConfig(
   connection: FirstRunConnection,
 ): Promise<void> {
   const normalizedConnection = connection;
+
+  if (
+    normalizedConnection.kind === "local-provider" &&
+    normalizedConnection.provider === "pi"
+  ) {
+    validatePiConnection(normalizedConnection);
+  }
 
   delete (config as Record<string, unknown>).connection;
   const existingDeploymentTarget = normalizeDeploymentTargetConfig(

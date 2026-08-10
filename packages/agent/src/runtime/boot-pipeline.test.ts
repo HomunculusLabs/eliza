@@ -2,12 +2,14 @@
  * Exercises the typed boot boundary with deterministic phase doubles, including
  * ordering, immutable environment capture, policy parsing, and reverse cleanup.
  */
+import { AgentRuntime, ModelType, type Plugin } from "@elizaos/core";
 import { describe, expect, it, vi } from "vitest";
 import {
   BOOT_PHASES,
   type BootPhase,
   captureAgentEnvironment,
   createBootContext,
+  preparePreferredProviderPluginForBoot,
   resolveBootPlan,
   resolveBootPolicy,
   runBootPhases,
@@ -28,6 +30,115 @@ describe("boot pipeline", () => {
       apiExposePort: false,
       preferredProviderPriorityBoost: 10,
     });
+  });
+
+  it("projects config and boosts all ten preferred text slots without changing direct providers", async () => {
+    const textSlots = [
+      ModelType.TEXT_NANO,
+      ModelType.TEXT_SMALL,
+      ModelType.TEXT_MEDIUM,
+      ModelType.TEXT_LARGE,
+      ModelType.TEXT_MEGA,
+      ModelType.RESPONSE_HANDLER,
+      ModelType.ACTION_PLANNER,
+      ModelType.TEXT_REASONING_SMALL,
+      ModelType.TEXT_REASONING_LARGE,
+      ModelType.TEXT_COMPLETION,
+    ] as const;
+    const models = Object.fromEntries(
+      textSlots.map((slot) => [slot, async () => "ok"]),
+    ) as Plugin["models"];
+    const directPlugin: Plugin = {
+      name: "openai",
+      description: "direct provider fixture",
+      priority: 1,
+      models,
+    };
+    const piPlugin: Plugin = {
+      name: "pi",
+      description: "Pi gateway fixture",
+      config: { EXISTING_SETTING: "kept" },
+      models,
+    };
+    const resolved = [
+      { name: "@elizaos/plugin-openai", plugin: directPlugin },
+      { name: "@elizaos/plugin-pi-ai", plugin: piPlugin },
+    ];
+
+    const prepared = preparePreferredProviderPluginForBoot({
+      resolvedPlugins: resolved,
+      preferredPackageName: "@elizaos/plugin-pi-ai",
+      priorityBoost: 10,
+      configProjection: {
+        ELIZA_LLM_TEXT_BACKEND: "pi",
+        ELIZA_LLM_TEXT_PRIMARY_MODEL: "openai/gpt-5.4-mini",
+        ELIZA_LLM_TEXT_SMALL_MODEL: "openai/gpt-5.4-nano",
+      },
+    });
+
+    expect(prepared).toBe(piPlugin);
+    expect(piPlugin.priority).toBe(10);
+    expect(piPlugin.config).toEqual({
+      EXISTING_SETTING: "kept",
+      ELIZA_LLM_TEXT_BACKEND: "pi",
+      ELIZA_LLM_TEXT_PRIMARY_MODEL: "openai/gpt-5.4-mini",
+      ELIZA_LLM_TEXT_SMALL_MODEL: "openai/gpt-5.4-nano",
+    });
+    expect(directPlugin.priority).toBe(1);
+    expect(directPlugin.config).toBeUndefined();
+
+    preparePreferredProviderPluginForBoot({
+      resolvedPlugins: resolved,
+      preferredPackageName: "@elizaos/plugin-openai",
+      priorityBoost: 10,
+      configProjection: {
+        ELIZA_LLM_TEXT_BACKEND: "openai",
+        ELIZA_LLM_TEXT_PRIMARY_MODEL: "gpt-5.6",
+      },
+    });
+    expect(piPlugin.priority).toBeUndefined();
+    expect(piPlugin.config).toEqual({ EXISTING_SETTING: "kept" });
+    expect(directPlugin.priority).toBe(11);
+    expect(directPlugin.config).toEqual({
+      ELIZA_LLM_TEXT_BACKEND: "openai",
+      ELIZA_LLM_TEXT_PRIMARY_MODEL: "gpt-5.6",
+    });
+
+    preparePreferredProviderPluginForBoot({
+      resolvedPlugins: resolved,
+      preferredPackageName: "@elizaos/plugin-pi-ai",
+      priorityBoost: 10,
+      configProjection: {
+        ELIZA_LLM_TEXT_BACKEND: "pi",
+        ELIZA_LLM_TEXT_PRIMARY_MODEL: "anthropic/claude-sonnet-4-6",
+      },
+    });
+    expect(piPlugin.priority).toBe(10);
+    expect(piPlugin.config).toEqual({
+      EXISTING_SETTING: "kept",
+      ELIZA_LLM_TEXT_BACKEND: "pi",
+      ELIZA_LLM_TEXT_PRIMARY_MODEL: "anthropic/claude-sonnet-4-6",
+    });
+    expect(piPlugin.config).not.toHaveProperty("ELIZA_LLM_TEXT_SMALL_MODEL");
+    expect(directPlugin.priority).toBe(1);
+    expect(directPlugin.config).toBeUndefined();
+
+    const runtime = new AgentRuntime({ logLevel: "fatal" });
+    await runtime.registerPlugin(directPlugin);
+    await runtime.registerPlugin(piPlugin);
+    for (const slot of textSlots) {
+      expect(
+        runtime
+          .getModelRegistrations()
+          .filter((registration) => registration.modelType === slot)
+          .map(({ provider, priority }) => ({ provider, priority })),
+      ).toEqual([
+        { provider: "pi", priority: 10 },
+        { provider: "openai", priority: 1 },
+      ]);
+    }
+    await runtime.unloadPlugin("pi");
+    await runtime.unloadPlugin("openai");
   });
 
   it("runs phases once in declared order and disposes in reverse order", async () => {

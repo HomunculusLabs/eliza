@@ -9,18 +9,19 @@
  *      idempotency key matches a record within retention we return
  *      `deduped`. Otherwise we accept synchronously and run the op
  *      asynchronously on the next microtask.
- *   4. Each phase mutation is appended to the repo. The repo's active-op
- *      slot is the single-flight gate; no extra in-memory mutex is used
- *      across operations, but the manager serializes its own
- *      `executeOperation` calls via a Promise chain.
+ *   4. Each phase mutation is appended to the repo. Accepted operations may
+ *      retain a process-local compensation callback; failures restore state and
+ *      can request one cold previous-runtime attempt without changing the failed
+ *      operation outcome. The repository remains the single-flight gate.
  */
 
 import crypto from "node:crypto";
-import type { AgentRuntime } from "@elizaos/core";
-import { logger } from "@elizaos/core";
+import { type AgentRuntime, ElizaError, logger } from "@elizaos/core";
 import type { ClassifyContext } from "./classifier.ts";
 import type { HealthChecker } from "./health.ts";
 import type {
+  HealthCheckReport,
+  OperationCompensation,
   OperationError,
   OperationErrorCode,
   OperationIntent,
@@ -86,6 +87,7 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
    */
   private executionChain: Promise<void> = Promise.resolve();
   private startChain: Promise<void> = Promise.resolve();
+  private readonly compensations = new Map<string, OperationCompensation>();
 
   constructor(opts: DefaultRuntimeOperationManagerOptions) {
     this.repository = opts.repository;
@@ -158,7 +160,37 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
       startedAt: now,
     };
 
-    await this.repository.create(op);
+    try {
+      await this.repository.create(op);
+    } catch (cause) {
+      // error-policy:J2 restore accepted-only mutations, then add operation
+      // persistence context while preserving the original cause.
+      let restoreError: string | undefined;
+      if (req.compensation) {
+        try {
+          await req.compensation.restore();
+        } catch (restoreCause) {
+          // error-policy:J1 operation boundary — preserve the persistence
+          // failure and attach the failed restoration as secondary context.
+          restoreError =
+            restoreCause instanceof Error
+              ? restoreCause.message
+              : String(restoreCause);
+        }
+      }
+      throw new ElizaError("Runtime operation could not be persisted", {
+        code: "RUNTIME_OPERATION_PERSIST_FAILED",
+        cause,
+        context: {
+          kind: preparedIntent.kind,
+          tier,
+          ...(restoreError ? { restoreError } : {}),
+        },
+      });
+    }
+    if (req.compensation) {
+      this.compensations.set(op.id, req.compensation);
+    }
     logger.info(
       `[runtime-ops] Accepted op ${op.id} kind=${op.kind} tier=${op.tier}`,
     );
@@ -211,26 +243,35 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
       finishedAt: validateAt,
     });
 
+    const reportPhase = (phase: OperationPhase): Promise<void> =>
+      this.repository.appendPhase(id, phase);
     const strategy = this.strategies[op.tier];
     if (!strategy) {
-      await this.failOperation(id, {
-        message: `No strategy registered for tier=${op.tier}`,
-        code: "no-strategy-for-tier",
-      });
+      await this.failOperationWithCompensation(
+        id,
+        {
+          message: `No strategy registered for tier=${op.tier}`,
+          code: "no-strategy-for-tier",
+        },
+        null,
+        reportPhase,
+      );
       return;
     }
 
     const runtime = this.runtime();
     if (!runtime) {
-      await this.failOperation(id, {
-        message: "No live runtime available to apply operation",
-        code: "no-runtime",
-      });
+      await this.failOperationWithCompensation(
+        id,
+        {
+          message: "No live runtime available to apply operation",
+          code: "no-runtime",
+        },
+        null,
+        reportPhase,
+      );
       return;
     }
-
-    const reportPhase = (phase: OperationPhase): Promise<void> =>
-      this.repository.appendPhase(id, phase);
 
     let newRuntime: AgentRuntime;
     try {
@@ -242,7 +283,12 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logger.warn(`[runtime-ops] Strategy failed for op ${id}: ${message}`);
-      await this.failOperation(id, { message, code: strategyErrorCode(err) });
+      await this.failOperationWithCompensation(
+        id,
+        { message, code: strategyErrorCode(err) },
+        this.runtime(),
+        reportPhase,
+      );
       return;
     }
 
@@ -254,7 +300,32 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
       startedAt: healthStart,
     });
 
-    const report = await this.healthChecker.runForRuntime(newRuntime);
+    let report: HealthCheckReport;
+    try {
+      report = await this.healthChecker.runForRuntime(newRuntime);
+    } catch (cause) {
+      // error-policy:J1 operation boundary — a broken health gate is a failed
+      // restart and must enter the same restoration path as a negative report.
+      const message = cause instanceof Error ? cause.message : String(cause);
+      await this.repository.updateLastPhase(id, {
+        status: "failed",
+        finishedAt: Date.now(),
+        error: { message },
+      });
+      logger.warn(
+        `[runtime-ops] Health checker threw for op ${id}: ${message}`,
+      );
+      await this.failOperationWithCompensation(
+        id,
+        {
+          message: `Health check failed: ${message}`,
+          code: "health-check-failed",
+        },
+        newRuntime,
+        reportPhase,
+      );
+      return;
+    }
     const healthEnd = Date.now();
 
     if (!report.ok) {
@@ -271,10 +342,15 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
       // previous runtime requires a two-phase restart contract with the API
       // server restart closure.
       logger.warn(`[runtime-ops] Health check failed for op ${id}`);
-      await this.failOperation(id, {
-        message: "Required health checks failed",
-        code: "health-check-failed",
-      });
+      await this.failOperationWithCompensation(
+        id,
+        {
+          message: "Required health checks failed",
+          code: "health-check-failed",
+        },
+        newRuntime,
+        reportPhase,
+      );
       return;
     }
 
@@ -291,7 +367,103 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
       status: "succeeded",
       finishedAt: Date.now(),
     });
+    this.compensations.delete(id);
     logger.info(`[runtime-ops] Operation ${id} succeeded`);
+  }
+
+  private async failOperationWithCompensation(
+    id: string,
+    error: OperationError,
+    runtime: AgentRuntime | null,
+    reportPhase: (phase: OperationPhase) => Promise<void>,
+  ): Promise<void> {
+    const compensation = this.compensations.get(id);
+    this.compensations.delete(id);
+    if (!compensation) {
+      await this.failOperation(id, error);
+      return;
+    }
+
+    const restoreStartedAt = Date.now();
+    try {
+      await compensation.restore();
+      await reportPhase({
+        name: "restore-config",
+        status: "succeeded",
+        startedAt: restoreStartedAt,
+        finishedAt: Date.now(),
+      });
+    } catch (cause) {
+      // error-policy:J1 operation boundary — retain the original failure and
+      // record restoration failure as the terminal operation cause.
+      const message = cause instanceof Error ? cause.message : String(cause);
+      await reportPhase({
+        name: "restore-config",
+        status: "failed",
+        startedAt: restoreStartedAt,
+        finishedAt: Date.now(),
+        error: { message },
+      });
+      await this.failOperation(id, {
+        ...error,
+        cause: `Configuration restoration failed: ${message}`,
+      });
+      return;
+    }
+
+    if (compensation.restartPreviousRuntime) {
+      const coldStrategy = this.strategies.cold;
+      if (!runtime || !coldStrategy) {
+        const message = !runtime
+          ? "No runtime available for previous-runtime restart"
+          : "No cold strategy registered for previous-runtime restart";
+        const now = Date.now();
+        await reportPhase({
+          name: "rollback-restart",
+          status: "failed",
+          startedAt: now,
+          finishedAt: now,
+          error: { message },
+        });
+      } else {
+        let rollbackFailureReported = false;
+        try {
+          await coldStrategy.apply({
+            runtime,
+            intent: {
+              kind: "restart",
+              reason: "restore previous runtime after failed operation",
+            },
+            reportPhase: (phase) => {
+              if (phase.status === "failed") rollbackFailureReported = true;
+              return reportPhase({ ...phase, name: "rollback-restart" });
+            },
+          });
+        } catch (cause) {
+          // error-policy:J1 operation boundary — record a terminal recovery
+          // failure even when the cold strategy throws before reporting one.
+          const message =
+            cause instanceof Error ? cause.message : String(cause);
+          if (!rollbackFailureReported) {
+            const now = Date.now();
+            await reportPhase({
+              name: "rollback-restart",
+              status: "failed",
+              startedAt: now,
+              finishedAt: now,
+              error: { message },
+            });
+          }
+          logger.warn(
+            `[runtime-ops] Previous-runtime restart failed for op ${id}: ${message}`,
+          );
+        }
+      }
+    }
+
+    // Compensation never turns the requested operation into a success. The
+    // original failure remains the operation outcome even when recovery works.
+    await this.failOperation(id, error);
   }
 
   private async failOperation(

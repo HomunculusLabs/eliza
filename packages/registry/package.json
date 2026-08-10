@@ -40,6 +40,7 @@
     "./first-party/curated-app-definitions.json": "./src/first-party/curated-app-definitions.json",
     "./first-party/channel-plugin-map.json": "./src/first-party/channel-plugin-map.json",
     "./first-party/provider-plugin-map.json": "./src/first-party/provider-plugin-map.json",
+    "./first-party/provider-backend-plugin-map.json": "./src/first-party/provider-backend-plugin-map.json",
     "./first-party/short-id-plugin-map.json": "./src/first-party/short-id-plugin-map.json"
   },
   "scripts": {

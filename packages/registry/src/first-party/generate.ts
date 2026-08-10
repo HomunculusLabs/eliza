@@ -10,7 +10,8 @@
  * the Zod schema, dedupes by id, and writes the aggregated `generated.json` that
  * the runtime loader reads (a single committed artifact, trivial to stage
  * alongside an on-device bundle), plus the derived curated-app / channel /
- * provider maps. `--check` re-runs the generator and fails on drift for CI.
+ * provider maps, including distinct environment-key and canonical-backend
+ * ownership artifacts. `--check` re-runs the generator and fails on drift for CI.
  *
  *   bun run --cwd packages/registry generate:first-party           # rewrite generated.json
  *   bun run --cwd packages/registry generate:first-party --check   # CI drift gate
@@ -69,6 +70,13 @@ const CHANNEL_MAP_PATH = join(HERE, "channel-plugin-map.json");
 // this instead of hand-maintaining PROVIDER_PLUGIN_MAP. Entries opt in by
 // marking config fields with `autoEnableProvider: true`.
 const PROVIDER_MAP_PATH = join(HERE, "provider-plugin-map.json");
+// Derived canonical service-route backend -> provider plugin package map. This
+// remains separate from environment-key ownership so upstream credentials do
+// not implicitly activate a gateway backend.
+const PROVIDER_BACKEND_MAP_PATH = join(
+  HERE,
+  "provider-backend-plugin-map.json",
+);
 // Derived short-id -> plugin-package map. The agent statically imports this to
 // build OPTIONAL_PLUGIN_MAP instead of hand-maintaining the alias table. Entries
 // opt in by listing bare ids in `shortIds` (e.g. evm/solana/wallet -> wallet).
@@ -143,6 +151,32 @@ export function collectShortIdPluginMap(
     Object.keys(map)
       .sort()
       .map((k) => [k, map[k]]),
+  );
+}
+
+export function collectProviderBackendPluginMap(
+  entries: RegistryEntry[],
+): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const entry of entries) {
+    for (const backend of entry.providerBackends ?? []) {
+      if (!entry.npmName) {
+        throw new Error(
+          `[registry/generate] provider backend "${backend}" claimed by ${entry.id} without an npmName`,
+        );
+      }
+      if (map[backend] && map[backend] !== entry.npmName) {
+        throw new Error(
+          `[registry/generate] provider backend "${backend}" claimed by both ${map[backend]} and ${entry.npmName}`,
+        );
+      }
+      map[backend] = entry.npmName;
+    }
+  }
+  return Object.fromEntries(
+    Object.keys(map)
+      .sort()
+      .map((key) => [key, map[key]]),
   );
 }
 
@@ -239,6 +273,7 @@ export function generateFirstPartyRegistry(): {
   curated: string;
   channels: string;
   providers: string;
+  providerBackends: string;
   shortIds: string;
 } {
   const entries = collectFirstPartyEntries();
@@ -247,6 +282,7 @@ export function generateFirstPartyRegistry(): {
     curated: `${JSON.stringify(collectCuratedAppDefinitions(entries), null, 2)}\n`,
     channels: `${JSON.stringify(collectChannelPluginMap(entries), null, 2)}\n`,
     providers: `${JSON.stringify(collectProviderPluginMap(entries), null, 2)}\n`,
+    providerBackends: `${JSON.stringify(collectProviderBackendPluginMap(entries), null, 2)}\n`,
     shortIds: `${JSON.stringify(collectShortIdPluginMap(entries), null, 2)}\n`,
   };
 }
@@ -259,6 +295,10 @@ function main(): void {
     [CURATED_DEFS_PATH, biomeFormatJson(next.curated, CURATED_DEFS_PATH)],
     [CHANNEL_MAP_PATH, biomeFormatJson(next.channels, CHANNEL_MAP_PATH)],
     [PROVIDER_MAP_PATH, biomeFormatJson(next.providers, PROVIDER_MAP_PATH)],
+    [
+      PROVIDER_BACKEND_MAP_PATH,
+      biomeFormatJson(next.providerBackends, PROVIDER_BACKEND_MAP_PATH),
+    ],
     [SHORTID_MAP_PATH, biomeFormatJson(next.shortIds, SHORTID_MAP_PATH)],
   ];
   if (check) {

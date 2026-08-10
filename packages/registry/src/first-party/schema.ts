@@ -292,6 +292,23 @@ const commonFields = {
   // owns its aliases here; the central OPTIONAL_PLUGIN_MAP is generated from
   // these instead of a hand-synced host table. Most entries declare none.
   shortIds: z.array(z.string()).default([]),
+  // Canonical service-route backend ids this package owns. Backend ownership is
+  // deliberately separate from config/env auto-enable metadata: a gateway may
+  // own a backend without owning any upstream provider credential key.
+  providerBackends: z
+    .array(
+      z
+        .string()
+        .min(1)
+        .regex(
+          /^[a-z0-9][a-z0-9-]*$/,
+          "provider backend must be kebab-case ascii",
+        ),
+    )
+    .refine((values) => new Set(values).size === values.length, {
+      message: "provider backends must be unique within an entry",
+    })
+    .optional(),
   // Curated-app marker: when present, this entry is one of the curated apps the
   // agent can resolve by name (NL matching). `slug` is the short curated name,
   // `order` fixes its catalog position, `aliases` are extra match terms. The

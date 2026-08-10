@@ -13,7 +13,11 @@ export function buildStaticFirstRunOptions(
   return {
     names: [],
     styles: getStylePresets(uiLanguage),
-    providers: [...FIRST_RUN_PROVIDER_CATALOG] as FirstRunOptions["providers"],
+    providers: FIRST_RUN_PROVIDER_CATALOG.filter(
+      (provider) =>
+        !("onboardingVisible" in provider) ||
+        provider.onboardingVisible !== false,
+    ) as FirstRunOptions["providers"],
     cloudProviders: [],
     models: {
       nano: [],

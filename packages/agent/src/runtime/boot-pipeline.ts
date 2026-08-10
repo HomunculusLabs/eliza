@@ -5,6 +5,8 @@
  * reinterpret mutable `process.env` state.
  */
 
+import { LLM_TEXT_ROUTE_RUNTIME_SETTING_BY_FIELD } from "@elizaos/core";
+
 export const BOOT_PHASES = [
   "load-config",
   "resolve-settings",
@@ -39,6 +41,83 @@ export interface BootContext {
   readonly policy: BootPolicy;
   readonly completedPhases: readonly BootPhaseName[];
   enterPhase(phase: BootPhaseName): void;
+}
+
+interface ResolvedProviderPluginForBoot {
+  readonly name: string;
+  readonly plugin: {
+    readonly name: string;
+    priority?: number;
+    config?: Record<string, unknown>;
+  };
+}
+
+interface PreferredProviderBaseState {
+  readonly config: Record<string, unknown> | undefined;
+  readonly hadConfig: boolean;
+  readonly hadPriority: boolean;
+  readonly priority: number | undefined;
+}
+
+const preferredProviderBaseStates = new WeakMap<
+  object,
+  PreferredProviderBaseState
+>();
+
+/**
+ * Prepare the selected provider by package identity before runtime plugin init.
+ * Cached plugin singletons are first restored to their recorded base priority
+ * and config so cold restarts cannot retain a previous provider's route settings.
+ * Resolution records carry package names while Plugin.name carries the runtime
+ * provider id, so comparing only Plugin.name silently skips the boost.
+ */
+export function preparePreferredProviderPluginForBoot<
+  Resolved extends ResolvedProviderPluginForBoot,
+>(args: {
+  resolvedPlugins: readonly Resolved[];
+  preferredPackageName?: string;
+  priorityBoost: number;
+  configProjection?: Readonly<Record<string, string>>;
+}): Resolved["plugin"] | undefined {
+  for (const candidate of args.resolvedPlugins) {
+    const baseState = preferredProviderBaseStates.get(candidate.plugin) ?? {
+      priority: candidate.plugin.priority,
+      config: candidate.plugin.config
+        ? { ...candidate.plugin.config }
+        : undefined,
+      hadConfig: Object.hasOwn(candidate.plugin, "config"),
+      hadPriority: Object.hasOwn(candidate.plugin, "priority"),
+    };
+    preferredProviderBaseStates.set(candidate.plugin, baseState);
+    if (baseState.hadPriority) candidate.plugin.priority = baseState.priority;
+    else delete candidate.plugin.priority;
+    if (baseState.hadConfig) {
+      candidate.plugin.config = baseState.config
+        ? { ...baseState.config }
+        : undefined;
+    } else {
+      delete candidate.plugin.config;
+    }
+  }
+
+  if (!args.preferredPackageName) return undefined;
+  const resolved = args.resolvedPlugins.find(
+    (candidate) => candidate.name === args.preferredPackageName,
+  );
+  if (!resolved) return undefined;
+
+  const projectedConfig = { ...(resolved.plugin.config ?? {}) };
+  for (const settingKey of Object.values(
+    LLM_TEXT_ROUTE_RUNTIME_SETTING_BY_FIELD,
+  )) {
+    delete projectedConfig[settingKey];
+  }
+  Object.assign(projectedConfig, args.configProjection ?? {});
+  resolved.plugin.config = projectedConfig;
+  resolved.plugin.priority =
+    (preferredProviderBaseStates.get(resolved.plugin)?.priority ?? 0) +
+    args.priorityBoost;
+  return resolved.plugin;
 }
 
 export type BootPhaseObserver = (phase: BootPhaseName) => void;

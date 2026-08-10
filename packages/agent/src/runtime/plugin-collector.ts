@@ -20,6 +20,9 @@ import {
 import channelPluginMap from "@elizaos/registry/first-party/channel-plugin-map.json" with {
   type: "json",
 };
+import providerBackendPluginMap from "@elizaos/registry/first-party/provider-backend-plugin-map.json" with {
+  type: "json",
+};
 import providerPluginMap from "@elizaos/registry/first-party/provider-plugin-map.json" with {
   type: "json",
 };
@@ -193,7 +196,22 @@ function packageNameFromPluginConfigId(pluginId: string): string {
   return `@elizaos/plugin-${pluginId}`;
 }
 
-function providerPluginNameFromBackend(backend: string): string {
+function canonicalBackendPluginName(backend: string): string | undefined {
+  const canonicalBackend = backend.trim();
+  return PROVIDER_BACKEND_PLUGIN_MAP[canonicalBackend];
+}
+
+function providerPluginNameFromBackend(backend: string): string | undefined {
+  const canonicalOwner = canonicalBackendPluginName(backend);
+  if (canonicalOwner) return resolvePluginPackageAlias(canonicalOwner);
+
+  const providerId = normalizeFirstRunProviderId(backend);
+  if (providerId && PROVIDER_BACKEND_PLUGIN_MAP[providerId]) {
+    // Backend-owned gateways require their exact canonical backend id. Aliases,
+    // package names, and installation records must never activate them.
+    return undefined;
+  }
+
   const explicitPluginName = resolvePluginPackageAlias(
     packageNameFromPluginConfigId(backend),
   );
@@ -203,7 +221,6 @@ function providerPluginNameFromBackend(backend: string): string {
   ) {
     return explicitPluginName;
   }
-  const providerId = normalizeFirstRunProviderId(backend);
   if (providerId && providerId !== "elizacloud") {
     const provider = getFirstRunProviderOption(providerId);
     if (provider) {
@@ -217,6 +234,7 @@ function isDirectlyRoutableProviderPlugin(
   backend: string,
   pluginName: string,
 ): boolean {
+  if (canonicalBackendPluginName(backend) === pluginName) return true;
   if (
     DIRECT_MODEL_PROVIDER_PLUGINS.has(pluginName) ||
     LOCAL_MODEL_PROVIDER_PLUGINS.has(pluginName)
@@ -227,6 +245,7 @@ function isDirectlyRoutableProviderPlugin(
   return (
     provider !== null &&
     provider.id !== "elizacloud" &&
+    PROVIDER_BACKEND_PLUGIN_MAP[provider.id] === undefined &&
     resolvePluginPackageAlias(provider.pluginName) === pluginName
   );
 }
@@ -262,8 +281,13 @@ export const CHANNEL_PLUGIN_MAP: Readonly<Record<string, string>> =
 export const PROVIDER_PLUGIN_MAP: Readonly<Record<string, string>> =
   providerPluginMap;
 
+/** Canonical service-route backend ids and the plugin packages that own them. */
+export const PROVIDER_BACKEND_PLUGIN_MAP: Readonly<Record<string, string>> =
+  providerBackendPluginMap;
+
 /**
- * Every model-provider plugin package (the values of {@link PROVIDER_PLUGIN_MAP}).
+ * Every model-provider plugin package (the values of the generated environment
+ * and canonical-backend ownership maps).
  * A configured provider is first-turn capability — chat cannot answer without a
  * TEXT_GENERATION handler — so the boot phase split treats these as blocking:
  * a provider that made it into the load set registers BEFORE the runtime
@@ -271,9 +295,10 @@ export const PROVIDER_PLUGIN_MAP: Readonly<Record<string, string>> =
  * wave. Otherwise the readiness signal flips while the first chat turns still
  * answer "no LLM provider configured" (#14038 wake-status lag).
  */
-export const MODEL_PROVIDER_PLUGIN_NAMES: ReadonlySet<string> = new Set(
-  Object.values(PROVIDER_PLUGIN_MAP),
-);
+export const MODEL_PROVIDER_PLUGIN_NAMES: ReadonlySet<string> = new Set([
+  ...Object.values(PROVIDER_PLUGIN_MAP),
+  ...Object.values(PROVIDER_BACKEND_PLUGIN_MAP),
+]);
 
 const LOCAL_MODEL_PROVIDER_PLUGINS = new Set<string>([
   "@elizaos/plugin-local-inference",
@@ -281,7 +306,10 @@ const LOCAL_MODEL_PROVIDER_PLUGINS = new Set<string>([
 ]);
 
 const REMOTE_MODEL_PROVIDER_PLUGINS = new Set(
-  Object.values(PROVIDER_PLUGIN_MAP).filter(
+  [
+    ...Object.values(PROVIDER_PLUGIN_MAP),
+    ...Object.values(PROVIDER_BACKEND_PLUGIN_MAP),
+  ].filter(
     (pluginName) =>
       pluginName !== "@elizaos/plugin-elizacloud" &&
       !LOCAL_MODEL_PROVIDER_PLUGINS.has(pluginName),
@@ -289,9 +317,10 @@ const REMOTE_MODEL_PROVIDER_PLUGINS = new Set(
 );
 
 const DIRECT_MODEL_PROVIDER_PLUGINS = new Set(
-  Object.values(PROVIDER_PLUGIN_MAP).filter(
-    (pluginName) => pluginName !== "@elizaos/plugin-elizacloud",
-  ),
+  [
+    ...Object.values(PROVIDER_PLUGIN_MAP),
+    ...Object.values(PROVIDER_BACKEND_PLUGIN_MAP),
+  ].filter((pluginName) => pluginName !== "@elizaos/plugin-elizacloud"),
 );
 
 function removeLocalModelSurfaces(pluginsToLoad: Set<string>): void {
@@ -606,6 +635,22 @@ export function collectPluginNames(
       "gitpathologist (auto-on when .git/ present; gate ELIZA_GITPATHOLOGIST)",
     );
   }
+  const directCanonicalTextPlugin =
+    serviceRouting?.llmText?.transport === "direct" &&
+    serviceRouting.llmText.backend
+      ? canonicalBackendPluginName(serviceRouting.llmText.backend)
+      : undefined;
+  if (
+    directCanonicalTextPlugin &&
+    !isPluginExplicitlyDisabled(directCanonicalTextPlugin)
+  ) {
+    pluginsToLoad.add(directCanonicalTextPlugin);
+    track(
+      directCanonicalTextPlugin,
+      `serviceRouting.llmText.backend: ${serviceRouting?.llmText?.backend}`,
+    );
+  }
+
   // Allow list is additive — extra plugins on top of auto-detection,
   // not an exclusive whitelist that blocks everything else.
   if (allowList && allowList.length > 0) {
@@ -698,7 +743,8 @@ export function collectPluginNames(
         Object.values(serviceRouting ?? {}).flatMap((route) => {
           if (route?.transport !== "direct" || !route.backend) return [];
           const pluginName = providerPluginNameFromBackend(route.backend);
-          return isDirectlyRoutableProviderPlugin(route.backend, pluginName)
+          return pluginName &&
+            isDirectlyRoutableProviderPlugin(route.backend, pluginName)
             ? [pluginName]
             : [];
         }),
@@ -819,6 +865,17 @@ export function collectPluginNames(
   // Re-apply provider precedence so later additive paths (entries, features,
   // installs) cannot accidentally re-introduce suppressed providers.
   applyProviderPrecedence();
+
+  // Backend-owned gateways are canonical-route-only. An allow-list, install
+  // record, feature entry, or upstream credential may make the package
+  // available, but only the exact direct llmText backend may keep it active.
+  for (const backendPluginName of new Set(
+    Object.values(PROVIDER_BACKEND_PLUGIN_MAP),
+  )) {
+    if (backendPluginName !== directCanonicalTextPlugin) {
+      pluginsToLoad.delete(backendPluginName);
+    }
+  }
 
   // Enforce feature gating last so allow-list entries cannot bypass it.
   if (shellPluginDisabled) {

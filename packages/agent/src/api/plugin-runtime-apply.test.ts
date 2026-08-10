@@ -6,7 +6,7 @@
  * in-memory graph is never left half-torn-down. Deterministic: the runtime and
  * its lifecycle methods are vi.fn stubs; no live plugins are loaded.
  */
-import type { AgentRuntime } from "@elizaos/core";
+import { AgentRuntime, ModelType, type Plugin } from "@elizaos/core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ElizaConfig } from "../config/config.ts";
 import type { ResolvedPlugin } from "../runtime/plugin-types.ts";
@@ -100,6 +100,48 @@ describe("applyPluginRuntimeMutation", () => {
     expect(result.reloadedPackages).toEqual(["@elizaos/plugin-x"]);
     expect(runtime.unloadPlugin).toHaveBeenCalledWith("x");
     expect(runtime.registerPlugin).toHaveBeenCalledWith(next.plugin);
+  });
+
+  it("falls back from failed generic apply without duplicating model registrations", async () => {
+    const plugin: Plugin = {
+      name: "x",
+      description: "real lifecycle fixture",
+      applyConfig: () => {
+        throw new Error("invalid config");
+      },
+      models: {
+        [ModelType.TEXT_SMALL]: async () => "ok",
+      },
+    };
+    const runtime = new AgentRuntime({ logLevel: "fatal" });
+    await runtime.registerPlugin(plugin);
+    const resolvedPlugin = resolved("@elizaos/plugin-x", plugin);
+
+    const result = await applyPluginRuntimeMutation({
+      runtime,
+      previousConfig: EMPTY_CONFIG,
+      nextConfig: EMPTY_CONFIG,
+      previousResolvedPlugins: [resolvedPlugin],
+      nextResolvedPlugins: [resolvedPlugin],
+      changedPluginPackage: "@elizaos/plugin-x",
+      config: { KEY: "invalid" },
+      reason: "failed apply",
+    });
+
+    expect(result.mode).toBe("plugin_reload");
+    expect(result.reloadedPackages).toEqual(["@elizaos/plugin-x"]);
+    expect(
+      runtime
+        .getModelRegistrations()
+        .filter(
+          (registration) =>
+            registration.provider === "x" &&
+            registration.modelType === ModelType.TEXT_SMALL,
+        ),
+    ).toHaveLength(1);
+    expect(runtime.getPluginOwnership("x")).not.toBeNull();
+    expect(runtime.plugins.filter(({ name }) => name === "x")).toHaveLength(1);
+    await runtime.unloadPlugin("x");
   });
 
   it("rolls back to the previous plugin graph when registerPlugin throws mid-reload", async () => {

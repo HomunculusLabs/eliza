@@ -10,11 +10,12 @@
  *   1. restart                                 → cold (explicit user intent)
  *   2. plugin-enable / plugin-disable          → cold (loaded plugin set changes)
  *   3. provider-switch:
- *        a. same provider, key only            → hot
- *        b. same provider, primaryModel only   → hot
- *        c. same provider, both                → hot (still same plugin family)
- *        d. different provider, same family    → warm
- *        e. otherwise (cross-family / first-time provider with no current)
+ *        a. switching to/from canonical Pi     → cold (route ownership changes)
+ *        b. same provider, key only            → hot
+ *        c. same provider, primaryModel only   → hot
+ *        d. same provider, both                → hot (still same plugin family)
+ *        e. different provider, same family    → warm
+ *        f. otherwise (cross-family / first-time provider with no current)
  *                                              → cold
  *   4. config-reload:
  *        - all changedPaths under env./vars./models. → hot
@@ -48,6 +49,12 @@ function classifyProviderSwitch(
 
   if (!current) {
     // First-time provider setup with no current provider — cold.
+    return "cold";
+  }
+
+  if (current === "pi" || target === "pi") {
+    // Pi owns a distinct set of model registrations. Any switch to, from, or
+    // within Pi must rebuild the chat runtime rather than notify a live graph.
     return "cold";
   }
 

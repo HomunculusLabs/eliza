@@ -16,6 +16,7 @@ import type {
   Provider,
 } from "@earendil-works/pi-ai";
 import {
+  AgentRuntime,
   EventType,
   type IAgentRuntime,
   ModelType,
@@ -241,6 +242,30 @@ describe("Pi executor lifecycle and observability", () => {
     await plugin.dispose?.(runtime);
   });
 
+  it("rejects invalid config atomically and preserves the active route", async () => {
+    const harness = await initializedPlugin({
+      streamFactory: () => successStream(),
+    });
+
+    let applyError: unknown;
+    try {
+      await harness.plugin.applyConfig?.(
+        { ELIZA_LLM_TEXT_PRIMARY_MODEL: "not-qualified" },
+        harness.runtime,
+      );
+    } catch (error) {
+      applyError = error;
+    }
+    expect(applyError).toMatchObject({ code: "PI_INVALID_MODEL_ID" });
+
+    await expect(
+      harness.plugin.models?.[ModelType.TEXT_SMALL]?.(harness.runtime, {
+        prompt: "x",
+      }),
+    ).resolves.toBe("ok");
+    await harness.plugin.dispose?.(harness.runtime);
+  });
+
   it("keeps all buffered upstream activity pre-commit for fallback", async () => {
     const pre = await initializedPlugin({
       streamFactory: () =>
@@ -280,9 +305,10 @@ describe("Pi executor lifecycle and observability", () => {
       post.runtime,
       { prompt: "x" },
     ).catch((error: unknown) => error);
-    expect(postError).toMatchObject({ code: "PI_PROVIDER_UNAVAILABLE" });
+    expect(postError).toMatchObject({ code: "PI_STREAM_TERMINATED" });
+    expect(postError.context).toMatchObject({ committed: true });
     expect(isModelProviderFallbackError(postError, ModelType.TEXT_SMALL)).toBe(
-      true,
+      false,
     );
     await post.plugin.dispose?.(post.runtime);
   });
@@ -358,6 +384,83 @@ describe("Pi executor lifecycle and observability", () => {
     await expect(result.toolCalls as Promise<unknown>).rejects.toMatchObject({
       code: "PI_DISPOSED",
     });
+  });
+
+  it("runtime unload removes all Pi model registrations and aborts active work", async () => {
+    let resolvePending:
+      | ((value: IteratorResult<AssistantMessageEvent>) => void)
+      | undefined;
+    const returnStarted = vi.fn();
+    const plugin = createPiPlugin({
+      modelsFactory: () =>
+        fakeModels(() => {
+          const partial = message([]);
+          const events: AssistantMessageEvent[] = [
+            { type: "start", partial },
+            { type: "text_start", contentIndex: 0, partial },
+            {
+              type: "text_delta",
+              contentIndex: 0,
+              delta: "partial",
+              partial,
+            },
+          ];
+          return {
+            [Symbol.asyncIterator]() {
+              let index = 0;
+              return {
+                next: async (): Promise<
+                  IteratorResult<AssistantMessageEvent>
+                > => {
+                  const event = events[index++];
+                  if (event !== undefined) return { value: event, done: false };
+                  return new Promise((resolve) => {
+                    resolvePending = resolve;
+                  });
+                },
+                return: async (): Promise<
+                  IteratorResult<AssistantMessageEvent>
+                > => {
+                  returnStarted();
+                  return { value: undefined, done: true };
+                },
+              };
+            },
+            async result() {
+              return new Promise<AssistantMessage>(() => {});
+            },
+          } as unknown as AssistantMessageEventStream;
+        }),
+      credentialStoreFactory: () => new FakeCredentials(),
+    });
+    plugin.config = {
+      ELIZA_LLM_TEXT_BACKEND: "pi",
+      ELIZA_LLM_TEXT_PRIMARY_MODEL: "openai/gpt-5.4-mini",
+    };
+    const runtime = new AgentRuntime({ logLevel: "fatal" });
+    await runtime.registerPlugin(plugin);
+    expect(
+      runtime
+        .getModelRegistrations()
+        .filter((registration) => registration.provider === "pi"),
+    ).toHaveLength(10);
+
+    const result = (await plugin.models?.[ModelType.TEXT_SMALL]?.(runtime, {
+      prompt: "x",
+      stream: true,
+    })) as TextStreamResult;
+    await vi.waitFor(() => expect(resolvePending).toBeTypeOf("function"));
+
+    await runtime.unloadPlugin("pi");
+
+    expect(returnStarted).toHaveBeenCalledOnce();
+    expect(
+      runtime
+        .getModelRegistrations()
+        .filter((registration) => registration.provider === "pi"),
+    ).toEqual([]);
+    expect(runtime.getPluginOwnership("pi")).toBeNull();
+    await expect(result.text).rejects.toMatchObject({ code: "PI_DISPOSED" });
   });
 
   it("omits request metadata and redacts private content while preserving attribution", async () => {

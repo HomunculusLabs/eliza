@@ -2,10 +2,21 @@
  * Table-driven error taxonomy coverage proves only transient pre-commit
  * failures enter the generic runtime fallback seam.
  */
-import { ModelType } from "@elizaos/core";
-import { describe, expect, it } from "vitest";
+import {
+  AgentRuntime,
+  InMemoryDatabaseAdapter,
+  ModelType,
+} from "@elizaos/core";
+import { describe, expect, it, vi } from "vitest";
 import { isModelProviderFallbackError } from "../../../packages/core/src/services/message/fallback-reply.js";
 import { mapPiError } from "../models/errors.js";
+
+function fallbackRuntime(): AgentRuntime {
+  return new AgentRuntime({
+    adapter: new InMemoryDatabaseAdapter(),
+    logLevel: "fatal",
+  });
+}
 
 function mapped(
   error: unknown,
@@ -106,6 +117,70 @@ describe("Pi error fallback taxonomy", () => {
       false,
     );
   });
+
+  it("uses the real runtime chain only for eligible pre-commit Pi failures", async () => {
+    const fallback = vi.fn(async () => "direct-fallback");
+    const runtime = fallbackRuntime();
+    runtime.registerModel(
+      ModelType.TEXT_SMALL,
+      async () => {
+        throw mapped(Object.assign(new Error("HTTP 503"), { status: 503 }));
+      },
+      "pi",
+      10,
+    );
+    runtime.registerModel(ModelType.TEXT_SMALL, fallback, "openai", 0);
+
+    await expect(
+      runtime.useModel(ModelType.TEXT_SMALL, { prompt: "hello" }),
+    ).resolves.toBe("direct-fallback");
+    expect(fallback).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    [
+      "post-commit",
+      () =>
+        mapped(Object.assign(new Error("HTTP 503"), { status: 503 }), {
+          committed: true,
+        }),
+      "PI_STREAM_TERMINATED",
+    ],
+    [
+      "authentication",
+      () => mapped(Object.assign(new Error("HTTP 401"), { status: 401 })),
+      "PI_PROVIDER_AUTH_FAILED",
+    ],
+    [
+      "cancellation",
+      () => {
+        const controller = new AbortController();
+        controller.abort(new Error("caller stopped"));
+        return mapped(new Error("HTTP 503"), { signal: controller.signal });
+      },
+      "PI_CANCELLED",
+    ],
+  ] as const)(
+    "does not advance the real runtime chain for %s failures",
+    async (_label, errorFactory, code) => {
+      const fallback = vi.fn(async () => "must-not-run");
+      const runtime = fallbackRuntime();
+      runtime.registerModel(
+        ModelType.TEXT_SMALL,
+        async () => {
+          throw errorFactory();
+        },
+        "pi",
+        10,
+      );
+      runtime.registerModel(ModelType.TEXT_SMALL, fallback, "openai", 0);
+
+      await expect(
+        runtime.useModel(ModelType.TEXT_SMALL, { prompt: "hello" }),
+      ).rejects.toMatchObject({ code });
+      expect(fallback).not.toHaveBeenCalled();
+    },
+  );
 
   it("preserves structural diagnostics without copying request-bearing error bodies", () => {
     const cause = Object.assign(new Error("secret request body"), {

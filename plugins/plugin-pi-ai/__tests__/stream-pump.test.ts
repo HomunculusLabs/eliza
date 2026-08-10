@@ -231,7 +231,7 @@ describe("Pi stream pump", () => {
     );
   });
 
-  it("keeps buffered upstream deltas pre-commit and never calls stream callbacks", async () => {
+  it("commits buffered semantic deltas without calling stream callbacks", async () => {
     const controller = new AbortController();
     const callbacks: string[] = [];
     const params = {
@@ -270,9 +270,14 @@ describe("Pi stream pump", () => {
       disposed: () => false,
     });
 
-    const error = await attempt.ready.catch((reason: unknown) => reason);
+    await attempt.ready;
+    const error = await attempt.result.text.catch((reason: unknown) => reason);
+    expect(error).toMatchObject({
+      code: "PI_STREAM_TERMINATED",
+      context: expect.objectContaining({ committed: true }),
+    });
     expect(isModelProviderFallbackError(error, ModelType.TEXT_SMALL)).toBe(
-      true,
+      false,
     );
     expect(callbacks).toEqual([]);
     await expect(attempt.result.text).rejects.toBe(error);
@@ -342,12 +347,17 @@ describe("Pi stream pump", () => {
       signal: thinkingController.signal,
       disposed: () => false,
     });
-    const thinkingError = await thinkingAttempt.ready.catch(
+    await thinkingAttempt.ready;
+    const thinkingError = await thinkingAttempt.result.text.catch(
       (error: unknown) => error,
     );
+    expect(thinkingError).toMatchObject({
+      code: "PI_STREAM_TERMINATED",
+      context: expect.objectContaining({ committed: true }),
+    });
     expect(
       isModelProviderFallbackError(thinkingError, ModelType.TEXT_SMALL),
-    ).toBe(true);
+    ).toBe(false);
 
     const postController = new AbortController();
     const post = prepared(postController.signal);

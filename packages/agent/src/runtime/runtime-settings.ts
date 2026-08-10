@@ -9,6 +9,7 @@ import {
   collectConfigEnvVars,
   collectConnectorEnvVars,
 } from "../config/env-vars.ts";
+import { resolveLlmTextRuntimeSettings } from "./model-resolution.ts";
 import { isVaultRef } from "./operations/vault-bridge.ts";
 
 export interface RuntimeSettingsProjectionOptions {
@@ -95,6 +96,7 @@ export function buildRuntimeSettingsProjection(
       ),
     ),
     ...(options.connectorSecretsOverlay ?? {}),
+    ...resolveLlmTextRuntimeSettings(config),
     ...(options.preferredProviderId
       ? { MODEL_PROVIDER: options.preferredProviderId }
       : {}),

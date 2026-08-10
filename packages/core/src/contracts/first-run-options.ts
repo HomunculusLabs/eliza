@@ -69,6 +69,7 @@ export type FirstRunProviderFamily =
 	| "ollama"
 	| "openai"
 	| "openrouter"
+	| "pi"
 	| "together"
 	| "zai"
 	| (string & {});
@@ -92,6 +93,7 @@ export type FirstRunProviderId =
 	| "openai"
 	| "openai-subscription"
 	| "openrouter"
+	| "pi"
 	| "together"
 	| "zai"
 	| "zai-coding-subscription"
@@ -126,6 +128,7 @@ export interface ProviderOption {
 	labelKey?: string;
 	storedProvider?: string;
 	supportsPrimaryModelOverride?: boolean;
+	onboardingVisible?: boolean;
 }
 
 export interface CloudProviderOption {
@@ -376,6 +379,20 @@ export const FIRST_RUN_PROVIDER_CATALOG = [
 		authMode: "api-key",
 		group: "local",
 		order: 60,
+	},
+	{
+		id: "pi",
+		name: "Pi AI",
+		envKey: null,
+		pluginName: "@elizaos/plugin-pi-ai",
+		keyPrefix: null,
+		description: "Provider-neutral text generation through the Pi AI gateway.",
+		family: "pi",
+		authMode: "credentials",
+		group: "local",
+		order: 65,
+		supportsPrimaryModelOverride: true,
+		onboardingVisible: false,
 	},
 	{
 		id: "openrouter",
@@ -744,6 +761,10 @@ const FIRST_RUN_PROVIDER_ALIASES: Record<string, FirstRunProviderId> = {
 	cerebras: "cerebras",
 	// Tolerate the linked-account form so env/integration callers normalize too.
 	"cerebras-api": "cerebras",
+	pi: "pi",
+	"pi-ai": "pi",
+	"plugin-pi-ai": "pi",
+	"@elizaos/plugin-pi-ai": "pi",
 };
 
 export function isSubscriptionProviderSelectionId(

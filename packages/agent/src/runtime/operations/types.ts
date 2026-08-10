@@ -110,7 +110,9 @@ export type PhaseName =
   | "cold-restart"
   | "apply-env"
   | "notify-plugins"
-  | "health-check";
+  | "health-check"
+  | "restore-config"
+  | "rollback-restart";
 
 export type OperationErrorCode =
   | "abandoned"
@@ -242,6 +244,16 @@ export interface ReloadStrategy {
 // Manager / use case
 // ---------------------------------------------------------------------------
 
+export interface OperationCompensation {
+  /** Restores process-local state mutated by prepare(). */
+  restore: () => Promise<void>;
+  /**
+   * After restoration, reuse the registered cold strategy once so the
+   * previous config gets one runtime-recovery attempt.
+   */
+  restartPreviousRuntime?: boolean;
+}
+
 export interface StartOperationRequest {
   intent: OperationIntent;
   idempotencyKey?: string;
@@ -251,6 +263,11 @@ export interface StartOperationRequest {
    * effects that must complete before the strategy can run.
    */
   prepare?: () => Promise<OperationIntent | undefined>;
+  /**
+   * Process-local compensation retained only while an accepted operation is
+   * running. It is never serialized into the operation repository.
+   */
+  compensation?: OperationCompensation;
 }
 
 export type StartOperationOutcome =
