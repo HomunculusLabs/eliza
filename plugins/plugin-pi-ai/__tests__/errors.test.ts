@@ -9,7 +9,7 @@ import {
 } from "@elizaos/core";
 import { describe, expect, it, vi } from "vitest";
 import { isModelProviderFallbackError } from "../../../packages/core/src/services/message/fallback-reply.js";
-import { mapPiError } from "../models/errors.js";
+import { mapPiError, PiTextError } from "../models/errors.js";
 
 function fallbackRuntime(): AgentRuntime {
   return new AgentRuntime({
@@ -145,6 +145,18 @@ describe("Pi error fallback taxonomy", () => {
           committed: true,
         }),
       "PI_STREAM_TERMINATED",
+    ],
+    [
+      "missing credential",
+      () =>
+        new PiTextError("Pi upstream provider credential is missing", {
+          code: "PI_CREDENTIAL_MISSING",
+          context: {
+            provider: "openai",
+            qualifiedModel: "openai/gpt-5.4-mini",
+          },
+        }),
+      "PI_CREDENTIAL_MISSING",
     ],
     [
       "authentication",

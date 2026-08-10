@@ -43,9 +43,14 @@ import {
   normalizeFirstRunProviderId,
   normalizeServiceRoutingConfig,
   normalizeSubscriptionProviderSelectionId,
+  type PiCredentialProvider,
   requiresAdditionalRuntimeProvider,
 } from "@elizaos/shared";
 import type { ElizaConfig } from "../config/types.eliza.ts";
+import {
+  formatVaultRef,
+  vaultKeyForProviderApiKey,
+} from "../runtime/operations/vault-bridge.ts";
 
 type MutableElizaConfig = Partial<ElizaConfig> & {
   cloud?: Record<string, unknown>;
@@ -59,6 +64,20 @@ type MutableElizaConfig = Partial<ElizaConfig> & {
 const trimToUndefined = asNonEmptyString;
 
 const PI_SUPPORTED_UPSTREAM_PROVIDERS = new Set(["openai", "anthropic"]);
+
+export const PI_CREDENTIAL_TARGETS = {
+  openai: {
+    environmentKey: "OPENAI_API_KEY",
+    apiKeyRef: "providers.openai.api-key",
+  },
+  anthropic: {
+    environmentKey: "ANTHROPIC_API_KEY",
+    apiKeyRef: "providers.anthropic.api-key",
+  },
+} as const satisfies Record<
+  PiCredentialProvider,
+  { environmentKey: string; apiKeyRef: string }
+>;
 
 function hasValidPiModelComponents(primaryModel: string): boolean {
   for (const character of primaryModel) {
@@ -107,18 +126,31 @@ export const PI_PROVIDER_SWITCH_ENV_KEYS = [
   "ANTHROPIC_API_KEY",
 ] as const;
 
-function validatePiConnection(args: {
-  apiKey?: string;
-  primaryModel?: string;
-}): string {
+function validatePiConnection(
+  args: {
+    apiKey?: string;
+    primaryModel?: string;
+    credentialProvider?: PiCredentialProvider;
+  },
+  options: { allowApiKeySubmission?: boolean } = {},
+): string {
   if (args.apiKey !== undefined) {
-    throw new ElizaError(
-      "Secure Pi API-key onboarding is not available yet; omit apiKey and use a preconfigured runtime credential.",
-      {
-        code: "PI_SECURE_ONBOARDING_NOT_AVAILABLE",
+    const apiKey = trimToUndefined(args.apiKey);
+    if (!options.allowApiKeySubmission) {
+      throw new ElizaError(
+        "Pi plaintext credentials must be persisted by the provider-switch boundary before configuration is applied.",
+        {
+          code: "PI_PLAINTEXT_CREDENTIAL_FORBIDDEN",
+          context: { provider: "pi" },
+        },
+      );
+    }
+    if (!apiKey) {
+      throw new ElizaError("Pi API key is missing.", {
+        code: "PI_CREDENTIAL_MISSING",
         context: { provider: "pi" },
-      },
-    );
+      });
+    }
   }
 
   const primaryModel = trimToUndefined(args.primaryModel);
@@ -136,13 +168,48 @@ function validatePiConnection(args: {
     );
   }
 
+  const separatorIndex = primaryModel.indexOf("/");
+  const modelProvider = primaryModel.slice(
+    0,
+    separatorIndex,
+  ) as PiCredentialProvider;
+  if (
+    args.credentialProvider !== undefined &&
+    args.credentialProvider !== modelProvider
+  ) {
+    throw new ElizaError(
+      "Pi credentialProvider must match the provider prefix of primaryModel.",
+      {
+        code: "PI_CREDENTIAL_PROVIDER_MISMATCH",
+        context: {
+          credentialProvider: args.credentialProvider,
+          modelProvider,
+        },
+      },
+    );
+  }
+
   return primaryModel;
 }
 
-export interface ProviderSwitchStateSnapshot {
+const PROVIDER_SWITCH_STATE_VALUE = Symbol("provider-switch-state-value");
+
+type ProviderSwitchSnapshotValue = {
   config: MutableElizaConfig;
   environment: Record<string, string | undefined>;
+};
+
+/**
+ * Redacted process-local snapshot. Secret-bearing config/environment values are
+ * held behind a non-enumerable closure and cannot enter operation JSON.
+ */
+export interface ProviderSwitchStateSnapshot {
+  readonly managedEnvironmentKeys: readonly string[];
 }
+
+type InternalProviderSwitchStateSnapshot = ProviderSwitchStateSnapshot & {
+  readonly [PROVIDER_SWITCH_STATE_VALUE]: () => ProviderSwitchSnapshotValue;
+};
 
 /** Captures full config plus only environment keys a Pi switch can mutate. */
 export function snapshotProviderSwitchState(
@@ -153,10 +220,18 @@ export function snapshotProviderSwitchState(
   for (const key of PI_PROVIDER_SWITCH_ENV_KEYS) {
     environmentSnapshot[key] = environment[key];
   }
-  return {
-    config: structuredClone(config),
-    environment: environmentSnapshot,
-  };
+  const configSnapshot = structuredClone(config);
+  const snapshot = {
+    managedEnvironmentKeys: Object.freeze([...PI_PROVIDER_SWITCH_ENV_KEYS]),
+  } as InternalProviderSwitchStateSnapshot;
+  Object.defineProperty(snapshot, PROVIDER_SWITCH_STATE_VALUE, {
+    enumerable: false,
+    value: (): ProviderSwitchSnapshotValue => ({
+      config: structuredClone(configSnapshot),
+      environment: { ...environmentSnapshot },
+    }),
+  });
+  return Object.freeze(snapshot);
 }
 
 /** Restores captured state without clobbering unrelated concurrent env updates. */
@@ -165,17 +240,80 @@ export function restoreProviderSwitchState(
   snapshot: ProviderSwitchStateSnapshot,
   environment: NodeJS.ProcessEnv = process.env,
 ): void {
+  const value = (snapshot as InternalProviderSwitchStateSnapshot)[
+    PROVIDER_SWITCH_STATE_VALUE
+  ]?.();
+  if (!value) {
+    throw new ElizaError("Provider-switch compensation snapshot is invalid", {
+      code: "PI_SWITCH_SNAPSHOT_INVALID",
+      context: { provider: "pi" },
+    });
+  }
+
   const mutableConfig = config as Record<string, unknown>;
   for (const key of Object.keys(mutableConfig)) delete mutableConfig[key];
-  Object.assign(mutableConfig, structuredClone(snapshot.config));
+  Object.assign(mutableConfig, value.config);
 
-  for (const [key, value] of Object.entries(snapshot.environment)) {
-    if (value === undefined) {
+  for (const [key, environmentValue] of Object.entries(value.environment)) {
+    if (environmentValue === undefined) {
       delete environment[key];
     } else {
-      environment[key] = value;
+      environment[key] = environmentValue;
     }
   }
+}
+
+/** Resolve the selected upstream from an already validated qualified model. */
+export function resolvePiCredentialProvider(
+  primaryModel: string,
+): PiCredentialProvider {
+  return primaryModel.slice(
+    0,
+    primaryModel.indexOf("/"),
+  ) as PiCredentialProvider;
+}
+
+/** Remove both managed upstream credentials from a pending Pi config clone. */
+export function sanitizePiProviderCredentialConfig(
+  config: MutableElizaConfig,
+): void {
+  const env = config.env as
+    | (Record<string, unknown> & { vars?: Record<string, unknown> })
+    | undefined;
+  const vars =
+    env?.vars && typeof env.vars === "object" && !Array.isArray(env.vars)
+      ? env.vars
+      : undefined;
+  for (const target of Object.values(PI_CREDENTIAL_TARGETS)) {
+    if (env) delete env[target.environmentKey];
+    if (vars) delete vars[target.environmentKey];
+  }
+  pruneEnv(config);
+}
+
+/** Persist only the canonical upstream vault reference into cloned config. */
+export function applyPiProviderApiKeyReference(
+  config: MutableElizaConfig,
+  credentialProvider: PiCredentialProvider,
+  apiKeyRef: string,
+): void {
+  const target = PI_CREDENTIAL_TARGETS[credentialProvider];
+  const derivedRef = vaultKeyForProviderApiKey(credentialProvider);
+  if (apiKeyRef !== target.apiKeyRef || apiKeyRef !== derivedRef) {
+    throw new ElizaError(
+      "Pi credential reference does not match its upstream",
+      {
+        code: "PI_CREDENTIAL_REFERENCE_MISMATCH",
+        context: { credentialProvider, apiKeyRef },
+      },
+    );
+  }
+  sanitizePiProviderCredentialConfig(config);
+  const sentinel = formatVaultRef(apiKeyRef);
+  const env = ensureEnv(config);
+  const vars = ensureEnvVars(config);
+  env[target.environmentKey] = sentinel;
+  vars[target.environmentKey] = sentinel;
 }
 
 function ensureEnv(config: MutableElizaConfig): Record<string, unknown> {
@@ -937,6 +1075,7 @@ export function createProviderSwitchConnection(args: {
   provider: string;
   apiKey?: string;
   primaryModel?: string;
+  credentialProvider?: PiCredentialProvider;
 }): FirstRunConnection | null {
   const provider = normalizeFirstRunProviderId(args.provider);
   if (!provider) {
@@ -954,8 +1093,23 @@ export function createProviderSwitchConnection(args: {
     return {
       kind: "local-provider",
       provider,
-      primaryModel: validatePiConnection(args),
+      primaryModel: validatePiConnection(args, {
+        allowApiKeySubmission: true,
+      }),
+      ...(args.credentialProvider
+        ? { credentialProvider: args.credentialProvider }
+        : {}),
     };
+  }
+
+  if (args.credentialProvider !== undefined) {
+    throw new ElizaError(
+      "credentialProvider is only supported when provider is pi.",
+      {
+        code: "CREDENTIAL_PROVIDER_REQUIRES_PI",
+        context: { provider },
+      },
+    );
   }
 
   return {

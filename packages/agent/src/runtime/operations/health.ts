@@ -32,6 +32,11 @@ interface CheckOutcome {
   result: HealthCheckResult;
 }
 
+export interface HealthCheckRunOptions {
+  /** Replace arbitrary check reasons before they reach logs or operation JSON. */
+  redactFailureDetail?: boolean;
+}
+
 export class HealthChecker {
   private readonly checks = new Map<string, HealthCheck>();
 
@@ -61,7 +66,10 @@ export class HealthChecker {
     return Array.from(this.checks.values());
   }
 
-  async runForRuntime(runtime: AgentRuntime): Promise<HealthCheckReport> {
+  async runForRuntime(
+    runtime: AgentRuntime,
+    options: HealthCheckRunOptions = {},
+  ): Promise<HealthCheckReport> {
     const registered = Array.from(this.checks.values());
     if (registered.length === 0) {
       return { passed: [], failed: [], ok: true };
@@ -89,7 +97,9 @@ export class HealthChecker {
           failed.push({
             name,
             required,
-            reason: result.reason,
+            reason: options.redactFailureDetail
+              ? "Runtime health check failed"
+              : result.reason,
             durationMs,
           });
         }
@@ -98,7 +108,9 @@ export class HealthChecker {
         failed.push({
           name: check.name,
           required: check.required,
-          reason: `internal: ${describeError(res.reason)}`,
+          reason: options.redactFailureDetail
+            ? "Runtime health check failed"
+            : `internal: ${describeError(res.reason)}`,
           durationMs: 0,
         });
       }

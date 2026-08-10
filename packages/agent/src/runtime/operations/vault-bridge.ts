@@ -62,6 +62,42 @@ export function parseVaultRef(value: string): string | null {
 /** Narrow surface of `Vault` used by the boot resolver and test fakes. */
 export type VaultLike = Pick<Vault, "get" | "has">;
 
+/** Vault mutation surface used by provider-switch compensation and reset. */
+export type ProviderApiKeyVault = Pick<Vault, "get" | "has" | "set" | "remove">;
+
+const PROVIDER_API_KEY_SNAPSHOT_VALUE = Symbol(
+  "provider-api-key-snapshot-value",
+);
+
+/**
+ * Redacted provider-secret snapshot. Only stable identity and prior presence
+ * are enumerable; the prior value remains in a process-local closure so
+ * operation records, logs, and JSON diagnostics cannot serialize it.
+ */
+export interface ProviderApiKeySnapshot {
+  readonly apiKeyRef: string;
+  readonly existed: boolean;
+}
+
+type InternalProviderApiKeySnapshot = ProviderApiKeySnapshot & {
+  readonly [PROVIDER_API_KEY_SNAPSHOT_VALUE]: () => string | undefined;
+};
+
+export class ProviderApiKeyMutationError extends Error {
+  readonly code = "provider-api-key-mutation-failed";
+
+  constructor(
+    action: "snapshot" | "restore" | "remove",
+    apiKeyRef: string,
+    caller: string,
+  ) {
+    super(
+      `[runtime-ops:vault] provider API key ${action} failed for ${apiKeyRef} (caller=${caller})`,
+    );
+    this.name = "ProviderApiKeyMutationError";
+  }
+}
+
 const OPTIMIZED_PROMPT_HMAC_VAULT_KEY = "system.optimized-prompt.hmac-key";
 
 /**
@@ -210,6 +246,76 @@ export async function persistProviderApiKey(opts: {
     caller: opts.caller,
   });
   return ref;
+}
+
+/** Capture prior provider-secret presence/value without exposing it to JSON. */
+export async function snapshotProviderApiKey(opts: {
+  vault: ProviderApiKeyVault;
+  normalizedProvider: string;
+  caller: string;
+}): Promise<ProviderApiKeySnapshot> {
+  const apiKeyRef = vaultKeyForProviderApiKey(opts.normalizedProvider);
+  try {
+    const existed = await opts.vault.has(apiKeyRef);
+    const value = existed ? await opts.vault.get(apiKeyRef) : undefined;
+    const snapshot = { apiKeyRef, existed } as InternalProviderApiKeySnapshot;
+    Object.defineProperty(snapshot, PROVIDER_API_KEY_SNAPSHOT_VALUE, {
+      enumerable: false,
+      value: () => value,
+    });
+    return Object.freeze(snapshot);
+  } catch {
+    // error-policy:J1 provider-switch boundary receives redacted identity only;
+    // vault/storage errors may contain secret-bearing backend diagnostics.
+    throw new ProviderApiKeyMutationError("snapshot", apiKeyRef, opts.caller);
+  }
+}
+
+/** Restore the exact prior value or prior absence captured by a snapshot. */
+export async function restoreProviderApiKey(opts: {
+  vault: ProviderApiKeyVault;
+  snapshot: ProviderApiKeySnapshot;
+  caller: string;
+}): Promise<void> {
+  const internal = opts.snapshot as InternalProviderApiKeySnapshot;
+  try {
+    if (!opts.snapshot.existed) {
+      await opts.vault.remove(opts.snapshot.apiKeyRef);
+      return;
+    }
+    const value = internal[PROVIDER_API_KEY_SNAPSHOT_VALUE]?.();
+    if (value === undefined) {
+      throw new Error("provider API key snapshot value unavailable");
+    }
+    await opts.vault.set(opts.snapshot.apiKeyRef, value, {
+      sensitive: true,
+      caller: opts.caller,
+    });
+  } catch {
+    // error-policy:J1 discard the underlying error so compensation status and
+    // logs can never inherit a backend message containing credential material.
+    throw new ProviderApiKeyMutationError(
+      "restore",
+      opts.snapshot.apiKeyRef,
+      opts.caller,
+    );
+  }
+}
+
+/** Remove a provider API key through the vault's idempotent removal policy. */
+export async function removeProviderApiKey(opts: {
+  vault: Pick<Vault, "remove">;
+  normalizedProvider: string;
+  caller: string;
+}): Promise<string> {
+  const apiKeyRef = vaultKeyForProviderApiKey(opts.normalizedProvider);
+  try {
+    await opts.vault.remove(apiKeyRef);
+    return apiKeyRef;
+  } catch {
+    // error-policy:J1 reset/transport boundaries receive redacted key identity.
+    throw new ProviderApiKeyMutationError("remove", apiKeyRef, opts.caller);
+  }
 }
 
 /**

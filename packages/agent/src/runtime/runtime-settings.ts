@@ -3,6 +3,7 @@
  * `runtime.getSetting()`. The projection is intentionally pure so cold boot and
  * hot reload can share it without reintroducing drift between startup paths.
  */
+import { ElizaError } from "@elizaos/core";
 import { resolveServiceRoutingInConfig } from "@elizaos/shared";
 import type { ElizaConfig } from "../config/config.ts";
 import {
@@ -10,7 +11,135 @@ import {
   collectConnectorEnvVars,
 } from "../config/env-vars.ts";
 import { resolveLlmTextRuntimeSettings } from "./model-resolution.ts";
+import type {
+  ProviderCredentialSettingKey,
+  RuntimeCredentialOverlay,
+} from "./operations/types.ts";
 import { isVaultRef } from "./operations/vault-bridge.ts";
+
+export const HOST_PROVIDER_CREDENTIAL_SETTING_KEYS = [
+  "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+] as const satisfies readonly ProviderCredentialSettingKey[];
+
+const PI_CREDENTIAL_REF_BY_SETTING = {
+  OPENAI_API_KEY: "providers.openai.api-key",
+  ANTHROPIC_API_KEY: "providers.anthropic.api-key",
+} as const satisfies Record<ProviderCredentialSettingKey, string>;
+
+export function createRuntimeCredentialOverlay(
+  settingKey: ProviderCredentialSettingKey,
+  value: string,
+): RuntimeCredentialOverlay {
+  return Object.freeze({ settingKey, read: () => value });
+}
+
+export function resolvePiRuntimeCredentialSettingKey(
+  config: ElizaConfig,
+): ProviderCredentialSettingKey | undefined {
+  const route = resolveServiceRoutingInConfig(
+    config as Record<string, unknown>,
+  )?.llmText;
+  if (route?.transport !== "direct" || route.backend !== "pi") {
+    return undefined;
+  }
+  if (route.primaryModel?.startsWith("openai/")) return "OPENAI_API_KEY";
+  if (route.primaryModel?.startsWith("anthropic/")) return "ANTHROPIC_API_KEY";
+  return undefined;
+}
+
+function configCredentialValues(
+  config: ElizaConfig,
+  settingKey: ProviderCredentialSettingKey,
+): unknown[] {
+  const env = config.env as
+    | (Record<string, unknown> & { vars?: Record<string, unknown> })
+    | undefined;
+  const vars =
+    env?.vars && typeof env.vars === "object" && !Array.isArray(env.vars)
+      ? env.vars
+      : undefined;
+  return [env?.[settingKey], vars?.[settingKey]].filter(
+    (value) => value !== undefined,
+  );
+}
+
+function resolvePiRuntimeCredentialSettings(
+  config: ElizaConfig,
+  env: NodeJS.ProcessEnv,
+  overlay: RuntimeCredentialOverlay | undefined,
+): Record<string, string> {
+  const selectedKey = resolvePiRuntimeCredentialSettingKey(config);
+  if (!selectedKey) return {};
+
+  for (const settingKey of HOST_PROVIDER_CREDENTIAL_SETTING_KEYS) {
+    for (const value of configCredentialValues(config, settingKey)) {
+      if (typeof value === "string" && value.trim() && !isVaultRef(value)) {
+        throw new ElizaError(
+          "Pi provider credentials cannot be read from persisted config.",
+          {
+            code: "PI_PLAINTEXT_CREDENTIAL_FORBIDDEN",
+            context: { provider: "pi", settingKey },
+          },
+        );
+      }
+    }
+  }
+
+  const selectedValues = configCredentialValues(config, selectedKey);
+  const selectedVaultRefs = selectedValues.filter(
+    (value): value is string => typeof value === "string" && isVaultRef(value),
+  );
+  const expectedRef = PI_CREDENTIAL_REF_BY_SETTING[selectedKey];
+  if (selectedVaultRefs.some((value) => value !== `vault://${expectedRef}`)) {
+    throw new ElizaError(
+      "Pi credential reference does not match the qualified model provider.",
+      {
+        code: "PI_CREDENTIAL_REFERENCE_MISMATCH",
+        context: { provider: "pi", settingKey: selectedKey },
+      },
+    );
+  }
+
+  if (overlay) {
+    if (overlay.settingKey !== selectedKey) {
+      throw new ElizaError(
+        "Pi runtime credential does not match the qualified model provider.",
+        {
+          code: "PI_CREDENTIAL_PROVIDER_MISMATCH",
+          context: {
+            provider: "pi",
+            expectedSettingKey: selectedKey,
+            actualSettingKey: overlay.settingKey,
+          },
+        },
+      );
+    }
+    const value = overlay.read();
+    return value.trim() ? { [selectedKey]: value } : {};
+  }
+
+  // A persisted vault reference is authoritative and fail-closed: without its
+  // resolved overlay, do not fall back to a stale process-global credential.
+  if (selectedVaultRefs.length > 0) return {};
+  const hostValue = env[selectedKey];
+  return typeof hostValue === "string" && hostValue.trim()
+    ? { [selectedKey]: hostValue }
+    : {};
+}
+
+function collectHostProviderCredentialSettings(
+  env: NodeJS.ProcessEnv,
+): Record<string, string> {
+  const settings: Record<string, string> = {};
+  for (const key of HOST_PROVIDER_CREDENTIAL_SETTING_KEYS) {
+    const value = env[key];
+    if (typeof value === "string" && value.trim().length > 0) {
+      settings[key] = value;
+    }
+  }
+  return settings;
+}
 
 export interface RuntimeSettingsProjectionOptions {
   preferredProviderId?: string;
@@ -29,6 +158,8 @@ export interface RuntimeSettingsProjectionOptions {
    * plugins the plaintext while the environment stays clean.
    */
   connectorSecretsOverlay?: Record<string, string>;
+  /** Opaque selected-provider credential supplied only to this runtime. */
+  runtimeCredentialOverlay?: RuntimeCredentialOverlay;
 }
 
 /**
@@ -75,12 +206,16 @@ export function buildRuntimeSettingsProjection(
   const canonicalRouting = hasCanonicalRouting
     ? resolveServiceRoutingInConfig(config as Record<string, unknown>)
     : undefined;
-  return {
+  const settings: Record<string, string> = {
     VALIDATION_LEVEL: "fast",
     ...(env.SECRET_SALT ? { ENCRYPTION_SALT: env.SECRET_SALT } : {}),
+    // The host explicitly folds only the supported upstream API keys. Plugins
+    // still read them through runtime.getSetting(), never process.env.
+    ...collectHostProviderCredentialSettings(env),
     ...Object.fromEntries(
-      Object.entries(collectConfigEnvVars(config)).filter(([key]) =>
-        isEnvKeyAllowedForForwarding(key),
+      Object.entries(collectConfigEnvVars(config)).filter(
+        ([key, value]) =>
+          isEnvKeyAllowedForForwarding(key) && !isVaultRef(value),
       ),
     ),
     ...(typeof env.EMBEDDING_PROVIDER === "string" &&
@@ -167,4 +302,20 @@ export function buildRuntimeSettingsProjection(
       ? { DISABLE_IMAGE_DESCRIPTION: "true" }
       : {}),
   };
+
+  const selectedPiKey = resolvePiRuntimeCredentialSettingKey(config);
+  if (selectedPiKey) {
+    for (const settingKey of HOST_PROVIDER_CREDENTIAL_SETTING_KEYS) {
+      delete settings[settingKey];
+    }
+    Object.assign(
+      settings,
+      resolvePiRuntimeCredentialSettings(
+        config,
+        env,
+        options.runtimeCredentialOverlay,
+      ),
+    );
+  }
+  return settings;
 }

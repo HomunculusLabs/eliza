@@ -28,6 +28,7 @@ import type {
   OperationPhase,
   ReloadStrategy,
   ReloadTier,
+  RuntimeCredentialOverlay,
   RuntimeOperation,
   RuntimeOperationListOptions,
   RuntimeOperationManager,
@@ -74,6 +75,20 @@ function strategyErrorCode(err: unknown): OperationErrorCode {
   return code === "vault-resolve-failed" ? code : "strategy-failed";
 }
 
+function requiresRedactedFailureDetail(intent: OperationIntent): boolean {
+  return intent.kind === "provider-switch" && intent.provider === "pi";
+}
+
+function sanitizePiStrategyPhase(phase: OperationPhase): OperationPhase {
+  return {
+    name: phase.name,
+    status: phase.status,
+    ...(phase.startedAt === undefined ? {} : { startedAt: phase.startedAt }),
+    ...(phase.finishedAt === undefined ? {} : { finishedAt: phase.finishedAt }),
+    ...(phase.error ? { error: { message: "Runtime phase failed" } } : {}),
+  };
+}
+
 export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
   private readonly repository: RuntimeOperationRepository;
   private readonly runtime: () => AgentRuntime | null;
@@ -88,6 +103,10 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
   private executionChain: Promise<void> = Promise.resolve();
   private startChain: Promise<void> = Promise.resolve();
   private readonly compensations = new Map<string, OperationCompensation>();
+  private readonly runtimeCredentialOverlays = new Map<
+    string,
+    RuntimeCredentialOverlay
+  >();
 
   constructor(opts: DefaultRuntimeOperationManagerOptions) {
     this.repository = opts.repository;
@@ -191,6 +210,12 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
     if (req.compensation) {
       this.compensations.set(op.id, req.compensation);
     }
+    if (
+      req.runtimeCredentialOverlay &&
+      requiresRedactedFailureDetail(preparedIntent)
+    ) {
+      this.runtimeCredentialOverlays.set(op.id, req.runtimeCredentialOverlay);
+    }
     logger.info(
       `[runtime-ops] Accepted op ${op.id} kind=${op.kind} tier=${op.tier}`,
     );
@@ -216,11 +241,58 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
 
   private scheduleExecution(id: string): void {
     this.executionChain = this.executionChain.then(() =>
-      this.executeOperation(id).catch((err) => {
-        logger.error(
-          `[runtime-ops] Unhandled error executing op ${id}: ${err instanceof Error ? err.stack : String(err)}`,
-        );
-      }),
+      this.executeOperation(id)
+        .catch(async (err) => {
+          // error-policy:J1 repository failures after accepted preparation must
+          // still compensate state and attempt the single previous-runtime
+          // restart. Phase/status persistence is best-effort in this path.
+          const piTransaction = this.runtimeCredentialOverlays.has(id);
+          const message = piTransaction
+            ? "Runtime operation persistence failed"
+            : err instanceof Error
+              ? err.message
+              : String(err);
+          if (this.compensations.has(id)) {
+            const reportPhase = async (
+              phase: OperationPhase,
+            ): Promise<void> => {
+              try {
+                await this.repository.appendPhase(
+                  id,
+                  piTransaction ? sanitizePiStrategyPhase(phase) : phase,
+                );
+              } catch {
+                // error-policy:J6 recovery must continue when diagnostic
+                // persistence is the failing subsystem.
+                logger.warn(
+                  `[runtime-ops] Recovery phase could not be persisted for op ${id}`,
+                );
+              }
+            };
+            try {
+              await this.failOperationWithCompensation(
+                id,
+                { message, code: "strategy-failed" },
+                this.runtime(),
+                reportPhase,
+                piTransaction,
+              );
+            } catch {
+              // error-policy:J1 compensation already ran before the terminal
+              // status write; there is no further safe mutation to attempt.
+              logger.warn(
+                `[runtime-ops] Recovery status could not be persisted for op ${id}`,
+              );
+            }
+          }
+          logger.error(
+            `[runtime-ops] Unhandled error executing op ${id}: ${message}`,
+          );
+        })
+        .finally(() => {
+          this.compensations.delete(id);
+          this.runtimeCredentialOverlays.delete(id);
+        }),
     );
   }
 
@@ -243,8 +315,12 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
       finishedAt: validateAt,
     });
 
+    const redactFailureDetail = requiresRedactedFailureDetail(op.intent);
     const reportPhase = (phase: OperationPhase): Promise<void> =>
-      this.repository.appendPhase(id, phase);
+      this.repository.appendPhase(
+        id,
+        redactFailureDetail ? sanitizePiStrategyPhase(phase) : phase,
+      );
     const strategy = this.strategies[op.tier];
     if (!strategy) {
       await this.failOperationWithCompensation(
@@ -255,6 +331,7 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
         },
         null,
         reportPhase,
+        redactFailureDetail,
       );
       return;
     }
@@ -269,25 +346,35 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
         },
         null,
         reportPhase,
+        redactFailureDetail,
       );
       return;
     }
 
+    const runtimeCredentialOverlay = this.runtimeCredentialOverlays.get(id);
     let newRuntime: AgentRuntime;
     try {
       newRuntime = await strategy.apply({
         runtime,
         intent: op.intent,
+        ...(runtimeCredentialOverlay ? { runtimeCredentialOverlay } : {}),
         reportPhase,
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      // error-policy:J1 Pi restart construction can observe submitted
+      // credentials, so its operation record and logs retain only a fixed error.
+      const message = redactFailureDetail
+        ? "Runtime restart failed"
+        : err instanceof Error
+          ? err.message
+          : String(err);
       logger.warn(`[runtime-ops] Strategy failed for op ${id}: ${message}`);
       await this.failOperationWithCompensation(
         id,
         { message, code: strategyErrorCode(err) },
         this.runtime(),
         reportPhase,
+        redactFailureDetail,
       );
       return;
     }
@@ -302,27 +389,34 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
 
     let report: HealthCheckReport;
     try {
-      report = await this.healthChecker.runForRuntime(newRuntime);
+      report = await this.healthChecker.runForRuntime(newRuntime, {
+        redactFailureDetail,
+      });
     } catch (cause) {
-      // error-policy:J1 operation boundary — a broken health gate is a failed
-      // restart and must enter the same restoration path as a negative report.
-      const message = cause instanceof Error ? cause.message : String(cause);
+      // error-policy:J1 operation boundary — Pi health failures may originate
+      // after credential projection, so persist/log only fixed failure text.
+      const detail = redactFailureDetail
+        ? "Runtime health check failed"
+        : cause instanceof Error
+          ? cause.message
+          : String(cause);
       await this.repository.updateLastPhase(id, {
         status: "failed",
         finishedAt: Date.now(),
-        error: { message },
+        error: { message: detail },
       });
-      logger.warn(
-        `[runtime-ops] Health checker threw for op ${id}: ${message}`,
-      );
+      logger.warn(`[runtime-ops] Health checker threw for op ${id}: ${detail}`);
       await this.failOperationWithCompensation(
         id,
         {
-          message: `Health check failed: ${message}`,
+          message: redactFailureDetail
+            ? detail
+            : `Health check failed: ${detail}`,
           code: "health-check-failed",
         },
         newRuntime,
         reportPhase,
+        redactFailureDetail,
       );
       return;
     }
@@ -332,10 +426,20 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
       await this.repository.updateLastPhase(id, {
         status: "failed",
         finishedAt: healthEnd,
-        detail: {
-          passed: report.passed,
-          failed: report.failed,
-        },
+        detail: redactFailureDetail
+          ? {
+              passed: report.passed,
+              failed: report.failed.map(({ name, required, durationMs }) => ({
+                name,
+                required,
+                durationMs,
+                reason: "Runtime health check failed",
+              })),
+            }
+          : {
+              passed: report.passed,
+              failed: report.failed,
+            },
       });
       // The cold strategy has already swapped the runtime by the time we
       // observe a failed health check. Surface the failure; restoring the
@@ -350,6 +454,7 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
         },
         newRuntime,
         reportPhase,
+        redactFailureDetail,
       );
       return;
     }
@@ -368,6 +473,7 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
       finishedAt: Date.now(),
     });
     this.compensations.delete(id);
+    this.runtimeCredentialOverlays.delete(id);
     logger.info(`[runtime-ops] Operation ${id} succeeded`);
   }
 
@@ -376,14 +482,17 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
     error: OperationError,
     runtime: AgentRuntime | null,
     reportPhase: (phase: OperationPhase) => Promise<void>,
+    piTransaction: boolean,
   ): Promise<void> {
     const compensation = this.compensations.get(id);
     this.compensations.delete(id);
+    this.runtimeCredentialOverlays.delete(id);
     if (!compensation) {
       await this.failOperation(id, error);
       return;
     }
 
+    let restorationFailed = false;
     const restoreStartedAt = Date.now();
     try {
       await compensation.restore();
@@ -394,9 +503,14 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
         finishedAt: Date.now(),
       });
     } catch (cause) {
-      // error-policy:J1 operation boundary — retain the original failure and
-      // record restoration failure as the terminal operation cause.
-      const message = cause instanceof Error ? cause.message : String(cause);
+      // error-policy:J1 Pi restoration can cross vault/config boundaries, so
+      // retain only fixed text. Non-Pi operations preserve the PR2 detail.
+      restorationFailed = true;
+      const message = piTransaction
+        ? "Configuration restoration failed"
+        : cause instanceof Error
+          ? cause.message
+          : String(cause);
       await reportPhase({
         name: "restore-config",
         status: "failed",
@@ -404,16 +518,20 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
         finishedAt: Date.now(),
         error: { message },
       });
-      await this.failOperation(id, {
-        ...error,
-        cause: `Configuration restoration failed: ${message}`,
-      });
-      return;
+      if (!piTransaction) {
+        await this.failOperation(id, {
+          ...error,
+          cause: `Configuration restoration failed: ${message}`,
+        });
+        return;
+      }
     }
 
+    let rollbackFailed = false;
     if (compensation.restartPreviousRuntime) {
       const coldStrategy = this.strategies.cold;
       if (!runtime || !coldStrategy) {
+        rollbackFailed = true;
         const message = !runtime
           ? "No runtime available for previous-runtime restart"
           : "No cold strategy registered for previous-runtime restart";
@@ -428,7 +546,7 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
       } else {
         let rollbackFailureReported = false;
         try {
-          await coldStrategy.apply({
+          const rollbackRuntime = await coldStrategy.apply({
             runtime,
             intent: {
               kind: "restart",
@@ -439,11 +557,39 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
               return reportPhase({ ...phase, name: "rollback-restart" });
             },
           });
+          rollbackFailed = rollbackFailureReported;
+          if (piTransaction && !rollbackFailed) {
+            try {
+              const rollbackHealth = await this.healthChecker.runForRuntime(
+                rollbackRuntime,
+                { redactFailureDetail: true },
+              );
+              rollbackFailed = !rollbackHealth.ok;
+            } catch {
+              // error-policy:J1 rollback health errors can originate after
+              // credential projection and are reduced to fixed text.
+              rollbackFailed = true;
+            }
+            if (rollbackFailed) {
+              const now = Date.now();
+              await reportPhase({
+                name: "rollback-restart",
+                status: "failed",
+                startedAt: now,
+                finishedAt: now,
+                error: { message: "Previous-runtime health check failed" },
+              });
+            }
+          }
         } catch (cause) {
-          // error-policy:J1 operation boundary — record a terminal recovery
-          // failure even when the cold strategy throws before reporting one.
-          const message =
-            cause instanceof Error ? cause.message : String(cause);
+          // error-policy:J1 Pi recovery may touch credentials; non-Pi retains
+          // the existing PR2 diagnostic detail and terminal failed status.
+          rollbackFailed = true;
+          const message = piTransaction
+            ? "Previous-runtime restart failed"
+            : cause instanceof Error
+              ? cause.message
+              : String(cause);
           if (!rollbackFailureReported) {
             const now = Date.now();
             await reportPhase({
@@ -461,17 +607,33 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
       }
     }
 
-    // Compensation never turns the requested operation into a success. The
-    // original failure remains the operation outcome even when recovery works.
-    await this.failOperation(id, error);
+    // Pi recovery is fail-closed: restoration and the single rollback restart
+    // are independent attempts, and either failure requires operator restart.
+    const restartRequired =
+      piTransaction && (restorationFailed || rollbackFailed);
+    const recoveryCause = piTransaction
+      ? restorationFailed
+        ? rollbackFailed
+          ? "Configuration restoration and previous runtime restart failed"
+          : "Configuration restoration failed"
+        : rollbackFailed
+          ? "Previous runtime restart failed"
+          : undefined
+      : undefined;
+    await this.failOperation(
+      id,
+      recoveryCause ? { ...error, cause: recoveryCause } : error,
+      restartRequired ? "restart_required" : "failed",
+    );
   }
 
   private async failOperation(
     id: string,
     error: OperationError,
+    status: "failed" | "restart_required" = "failed",
   ): Promise<void> {
     await this.repository.update(id, {
-      status: "failed",
+      status,
       finishedAt: Date.now(),
       error,
     });

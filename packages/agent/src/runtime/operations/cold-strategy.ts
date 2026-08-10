@@ -19,7 +19,10 @@ export interface ColdStrategyOptions {
    * Restart closure injected from the API server boot path. Returns the
    * new runtime on success or null on failure.
    */
-  restartRuntime: (reason: string) => Promise<AgentRuntime | null>;
+  restartRuntime: (
+    reason: string,
+    runtimeCredentialOverlay?: ReloadContext["runtimeCredentialOverlay"],
+  ) => Promise<AgentRuntime | null>;
 }
 
 export function createColdStrategy(opts: ColdStrategyOptions): ReloadStrategy {
@@ -29,7 +32,10 @@ export function createColdStrategy(opts: ColdStrategyOptions): ReloadStrategy {
     tier: "cold",
     async apply(ctx: ReloadContext): Promise<AgentRuntime> {
       const startedAt = Date.now();
-      const newRuntime = await restartRuntime(describeIntent(ctx.intent));
+      const newRuntime = await restartRuntime(
+        describeIntent(ctx.intent),
+        ctx.runtimeCredentialOverlay,
+      );
       const finishedAt = Date.now();
 
       if (!newRuntime) {

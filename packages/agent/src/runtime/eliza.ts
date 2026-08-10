@@ -45,11 +45,13 @@ import { BootTimer } from "./boot-timer.ts";
 import { maybeInjectFault } from "./crash-injection.ts";
 import { runFirstTimeSetup } from "./first-time-setup.ts";
 import { startMemoryWatchdog } from "./memory-watchdog.ts";
+import type { RuntimeCredentialOverlay } from "./operations/types.ts";
 import {
   isVaultRef,
   resolveConfigEnvForProcess,
   resolveConnectorSecretSettings,
   resolveOptimizedPromptIntegrityKey,
+  type VaultLike,
 } from "./operations/vault-bridge.ts";
 import { OPTIONAL_PLUGIN_IMPORTERS } from "./optional-plugin-imports.generated.ts";
 import {
@@ -87,7 +89,10 @@ import {
 import { runRuntimeStartupMaintenance } from "./runtime-maintenance.ts";
 import {
   buildRuntimeSettingsProjection,
+  createRuntimeCredentialOverlay,
+  HOST_PROVIDER_CREDENTIAL_SETTING_KEYS,
   type RuntimeSettingsProjectionOptions,
+  resolvePiRuntimeCredentialSettingKey,
 } from "./runtime-settings.ts";
 import {
   applySandboxCharacterFromEnv,
@@ -2083,9 +2088,50 @@ export async function resolveConnectorSecretsOverlayForBoot(
   return resolved;
 }
 
+/** @internal Exported for Pi cold-boot credential isolation coverage. */
+export async function resolvePiCredentialOverlayForBoot(
+  config: ElizaConfig,
+  vault: VaultLike,
+): Promise<RuntimeCredentialOverlay | undefined> {
+  const settingKey = resolvePiRuntimeCredentialSettingKey(config);
+  if (!settingKey) return undefined;
+  const expectedRef =
+    settingKey === "OPENAI_API_KEY"
+      ? "providers.openai.api-key"
+      : "providers.anthropic.api-key";
+  const env = config.env as
+    | (Record<string, unknown> & { vars?: Record<string, unknown> })
+    | undefined;
+  const vars =
+    env?.vars && typeof env.vars === "object" && !Array.isArray(env.vars)
+      ? env.vars
+      : undefined;
+  if (
+    ![env?.[settingKey], vars?.[settingKey]].includes(`vault://${expectedRef}`)
+  ) {
+    return undefined;
+  }
+
+  try {
+    if (!(await vault.has(expectedRef))) return undefined;
+    return createRuntimeCredentialOverlay(
+      settingKey,
+      await vault.get(expectedRef),
+    );
+  } catch {
+    // error-policy:J4 the Pi plugin will surface typed missing-credential state;
+    // vault backend text is dropped because it may contain sensitive material.
+    logger.warn(
+      `[vault-bootstrap] Pi credential could not be projected for ${settingKey}`,
+    );
+    return undefined;
+  }
+}
+
 /** @internal Exported for vault-backed cloud/provider boot coverage. */
 export async function resolveConfigEnvVaultRefsForBoot(
   config: ElizaConfig,
+  options: { excludedKeys?: ReadonlySet<string> } = {},
 ): Promise<void> {
   if (isMobilePlatform() || readAliasedEnv("ELIZA_CLOUD_PROVISIONED") === "1") {
     return;
@@ -2100,8 +2146,12 @@ export async function resolveConfigEnvVaultRefsForBoot(
 
   const vault = importAppCoreRuntime().sharedVault();
   const configEnv = config.env as Record<string, unknown>;
+  const filterExcluded = (bag: Record<string, unknown>) =>
+    Object.fromEntries(
+      Object.entries(bag).filter(([key]) => !options.excludedKeys?.has(key)),
+    );
   const { resolved, missing } = await resolveConfigEnvForProcess(
-    configEnv,
+    filterExcluded(configEnv),
     vault,
   );
   for (const [key, value] of Object.entries(resolved)) {
@@ -2112,7 +2162,7 @@ export async function resolveConfigEnvVaultRefsForBoot(
   let varsMissing: string[] = [];
   if (varsBag && typeof varsBag === "object" && !Array.isArray(varsBag)) {
     const varsResult = await resolveConfigEnvForProcess(
-      varsBag as Record<string, unknown>,
+      filterExcluded(varsBag as Record<string, unknown>),
       vault,
     );
     varsMissing = varsResult.missing;
@@ -3674,6 +3724,8 @@ export interface StartElizaOptions {
    * The value is cloned because boot normalizes its private config instance.
    */
   configOverride?: ElizaConfig;
+  /** Opaque operation-local provider credential for this runtime only. */
+  runtimeCredentialOverlay?: RuntimeCredentialOverlay;
   /** Reuses a caller-owned context across an extracted boot composition. */
   bootContext?: BootContext;
   /** Receives the connected thin-client proxy when boot resolves to cloud mode. */
@@ -3723,6 +3775,8 @@ export interface BootElizaRuntimeOptions {
 export interface BuildInitializedRuntimeOptions {
   config: ElizaConfig;
   abortSignal?: AbortSignal;
+  /** Opaque operation-local provider credential for this replacement only. */
+  runtimeCredentialOverlay?: RuntimeCredentialOverlay;
   localAgentMode?: boolean;
   onBootPhase?: (phase: BootPhaseName) => void;
   onRuntimeCreated?: (runtime: AgentRuntime) => void;
@@ -3768,6 +3822,7 @@ export async function buildInitializedRuntime(
     headless: true,
     configOverride: options.config,
     abortSignal: options.abortSignal,
+    runtimeCredentialOverlay: options.runtimeCredentialOverlay,
     localAgentMode: options.localAgentMode,
     onBootPhase: options.onBootPhase,
     onRuntimeCreated: options.onRuntimeCreated,
@@ -3980,6 +4035,7 @@ export async function startEliza(
       }
     }
   }
+  let runtimeCredentialOverlay = opts?.runtimeCredentialOverlay;
 
   // 1a. Local / sandbox character override — must run before first-run setup
   //     so character.json (or ELIZA_AGENT_CHARACTER_JSON) sets the agent name
@@ -4092,12 +4148,25 @@ export async function startEliza(
     importAppCoreRuntime().captureWalletEnvBootBaseline();
     const { sharedVault } = await importAppCoreRuntime();
     const vault = sharedVault();
+    const piCredentialSettingKey = resolvePiRuntimeCredentialSettingKey(config);
+    if (piCredentialSettingKey && !runtimeCredentialOverlay) {
+      runtimeCredentialOverlay = await resolvePiCredentialOverlayForBoot(
+        config,
+        vault,
+      );
+    }
 
     if (!process.env.ELIZA_OPTIMIZED_PROMPT_HMAC_KEY) {
       process.env.ELIZA_OPTIMIZED_PROMPT_HMAC_KEY =
         await resolveOptimizedPromptIntegrityKey(vault);
     }
-    await resolveConfigEnvVaultRefsForBoot(config);
+    await resolveConfigEnvVaultRefsForBoot(config, {
+      ...(piCredentialSettingKey
+        ? {
+            excludedKeys: new Set(HOST_PROVIDER_CREDENTIAL_SETTING_KEYS),
+          }
+        : {}),
+    });
   }
 
   // Cloud config is applied once before vault access so plain credentials can
@@ -4107,6 +4176,16 @@ export async function startEliza(
   applyCloudConfigToEnv(config);
 
   // 2f. Propagate arbitrary env vars from config.env into process.env.
+  // Canonical Pi credentials are the exception: persisted refs/plaintext stay
+  // out of the process and are projected only into the selected runtime.
+  const isPiRuntimeConfig = Boolean(
+    resolvePiRuntimeCredentialSettingKey(config),
+  );
+  const shouldSkipPiCredential = (key: string): boolean =>
+    isPiRuntimeConfig &&
+    HOST_PROVIDER_CREDENTIAL_SETTING_KEYS.some(
+      (settingKey) => settingKey === key,
+    );
   // Eliza stores user-defined env vars (plugin settings, API URLs, etc.)
   // in config.env; elizaOS plugins read them via process.env / getSetting.
   // Skip ELIZAOS_CLOUD_* — applyCloudConfigToEnv() owns those; otherwise a
@@ -4117,7 +4196,13 @@ export async function startEliza(
     !Array.isArray(config.env)
   ) {
     for (const [key, value] of Object.entries(config.env)) {
-      if (isElizaCloudManagedProcessEnvKey(key)) continue;
+      if (
+        isElizaCloudManagedProcessEnvKey(key) ||
+        shouldSkipPiCredential(key) ||
+        (typeof value === "string" && isVaultRef(value))
+      ) {
+        continue;
+      }
       if (typeof value === "string" && !process.env[key]) {
         process.env[key] = value;
       }
@@ -4131,7 +4216,13 @@ export async function startEliza(
       for (const [key, value] of Object.entries(
         vars as Record<string, unknown>,
       )) {
-        if (isElizaCloudManagedProcessEnvKey(key)) continue;
+        if (
+          isElizaCloudManagedProcessEnvKey(key) ||
+          shouldSkipPiCredential(key) ||
+          (typeof value === "string" && isVaultRef(value))
+        ) {
+          continue;
+        }
         if (typeof value === "string" && !process.env[key]) {
           process.env[key] = value;
         }
@@ -4753,6 +4844,7 @@ export async function startEliza(
       bundledSkillsDir,
       workspaceSkillsDir,
       connectorSecretsOverlay,
+      runtimeCredentialOverlay,
     }),
   });
   installRuntimeMethodBindings(runtime);
@@ -6079,12 +6171,13 @@ export async function startEliza(
       port: apiPort,
       runtime,
       skipListen: skipApiListen,
-      onRestart: async () => {
+      onRestart: async (restartOptions) => {
         logger.info("[eliza] Hot-reload: building replacement runtime...");
         try {
           const replacement = await buildInitializedRuntime({
             config: loadElizaConfig(),
             localAgentMode: opts?.localAgentMode,
+            runtimeCredentialOverlay: restartOptions?.runtimeCredentialOverlay,
           });
           logger.info("[eliza] Hot-reload: replacement runtime is ready");
           return replacement;

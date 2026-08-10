@@ -1,13 +1,22 @@
 /**
  * Runtime settings projection coverage for cold boot and hot reload. The test
  * pins the persisted config fields plugins read through `runtime.getSetting()`,
- * especially connector credentials saved through chat/settings before a
- * runtime rebuild.
+ * especially connector credentials and the runtime-scoped OpenAI/Anthropic
+ * credential projection used by the Pi gateway after a runtime rebuild.
  */
+import { AgentRuntime } from "@elizaos/core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { ElizaConfig } from "../config/config.ts";
-import { buildRuntimeSettingsProjection } from "./runtime-settings.ts";
+import {
+  formatVaultRef,
+  resolveConfigEnvForProcess,
+  type VaultLike,
+} from "./operations/vault-bridge.ts";
+import {
+  buildRuntimeSettingsProjection,
+  createRuntimeCredentialOverlay,
+} from "./runtime-settings.ts";
 import { applySandboxConnectorOwnership } from "./sandbox-character.ts";
 
 const ENV_KEYS = ["SECRET_SALT", "EMBEDDING_PROVIDER"] as const;
@@ -29,6 +38,238 @@ afterEach(() => {
 });
 
 describe("buildRuntimeSettingsProjection", () => {
+  it("folds only supported host provider credentials", () => {
+    const settings = buildRuntimeSettingsProjection({} as ElizaConfig, {
+      env: {
+        OPENAI_API_KEY: "host-openai",
+        ANTHROPIC_API_KEY: "host-anthropic",
+        GOOGLE_GENERATIVE_AI_API_KEY: "host-google",
+      },
+    });
+
+    expect(settings.OPENAI_API_KEY).toBe("host-openai");
+    expect(settings.ANTHROPIC_API_KEY).toBe("host-anthropic");
+    expect(settings.GOOGLE_GENERATIVE_AI_API_KEY).toBeUndefined();
+  });
+
+  it("keeps manual runtime config ahead of host-folded credentials", () => {
+    const settings = buildRuntimeSettingsProjection(
+      {
+        env: { vars: { OPENAI_API_KEY: "manual-openai" } },
+      } as ElizaConfig,
+      { env: { OPENAI_API_KEY: "host-openai" } },
+    );
+
+    expect(settings.OPENAI_API_KEY).toBe("manual-openai");
+  });
+
+  it("projects a resolved provider vault ref and drops unresolved sentinels", async () => {
+    const vaultValues = new Map([
+      ["providers.openai.api-key", "vault-projected-openai"],
+    ]);
+    const vault: VaultLike = {
+      async has(key) {
+        return vaultValues.has(key);
+      },
+      async get(key) {
+        const value = vaultValues.get(key);
+        if (value === undefined) throw new Error("missing test vault value");
+        return value;
+      },
+    };
+    const config = {
+      env: {
+        vars: {
+          OPENAI_API_KEY: formatVaultRef("providers.openai.api-key"),
+          ANTHROPIC_API_KEY: formatVaultRef("providers.anthropic.api-key"),
+        },
+      },
+    } as ElizaConfig;
+    const { resolved, missing } = await resolveConfigEnvForProcess(
+      config.env?.vars,
+      vault,
+    );
+
+    expect(missing).toEqual(["providers.anthropic.api-key"]);
+    const settings = buildRuntimeSettingsProjection(config, { env: resolved });
+    expect(settings.OPENAI_API_KEY).toBe("vault-projected-openai");
+    expect(settings.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(Object.values(settings)).not.toContain(
+      formatVaultRef("providers.anthropic.api-key"),
+    );
+  });
+
+  it.each([
+    ["openai", "OPENAI_API_KEY"],
+    ["anthropic", "ANTHROPIC_API_KEY"],
+  ] as const)(
+    "reconstructs the exact %s vault value through runtime.getSetting after restart",
+    async (provider, environmentKey) => {
+      const apiKeyRef = `providers.${provider}.api-key`;
+      const apiKey = `${provider}-restart-secret`;
+      const persistedConfig = JSON.stringify({
+        serviceRouting: {
+          llmText: {
+            backend: "pi",
+            transport: "direct",
+            primaryModel: `${provider}/test-model`,
+          },
+        },
+        env: {
+          [environmentKey]: formatVaultRef(apiKeyRef),
+          vars: { [environmentKey]: formatVaultRef(apiKeyRef) },
+        },
+      } satisfies ElizaConfig);
+      expect(persistedConfig).not.toContain(apiKey);
+
+      const restartedConfig = JSON.parse(persistedConfig) as ElizaConfig;
+      const vault: VaultLike = {
+        async has(key) {
+          return key === apiKeyRef;
+        },
+        async get(key) {
+          if (key !== apiKeyRef) throw new Error("unexpected test vault key");
+          return apiKey;
+        },
+      };
+      const topLevel = await resolveConfigEnvForProcess(
+        restartedConfig.env as Record<string, unknown>,
+        vault,
+      );
+      const nested = await resolveConfigEnvForProcess(
+        restartedConfig.env?.vars,
+        vault,
+      );
+      const resolvedValue =
+        topLevel.resolved[environmentKey] ?? nested.resolved[environmentKey];
+      if (!resolvedValue)
+        throw new Error("selected vault value was not resolved");
+      const runtimeCredentialOverlay = createRuntimeCredentialOverlay(
+        environmentKey,
+        resolvedValue,
+      );
+      const settings = buildRuntimeSettingsProjection(restartedConfig, {
+        env: {
+          OPENAI_API_KEY: "ambient-openai-decoy",
+          ANTHROPIC_API_KEY: "ambient-anthropic-decoy",
+        },
+        runtimeCredentialOverlay,
+      });
+      const restartedRuntime = new AgentRuntime({
+        logLevel: "fatal",
+        settings,
+      });
+
+      expect(restartedRuntime.getSetting(environmentKey)).toBe(apiKey);
+      expect(
+        restartedRuntime.getSetting(
+          environmentKey === "OPENAI_API_KEY"
+            ? "ANTHROPIC_API_KEY"
+            : "OPENAI_API_KEY",
+        ),
+      ).toBeNull();
+      expect(JSON.stringify(restartedConfig)).not.toContain(apiKey);
+      expect(JSON.stringify(runtimeCredentialOverlay)).not.toContain(apiKey);
+      expect(topLevel.missing).toEqual([]);
+      expect(nested.missing).toEqual([]);
+    },
+  );
+
+  it("projects only the qualified Pi host credential when no vault ref exists", () => {
+    const settings = buildRuntimeSettingsProjection(
+      {
+        serviceRouting: {
+          llmText: {
+            backend: "pi",
+            transport: "direct",
+            primaryModel: "openai/gpt-5.4-mini",
+          },
+        },
+      } as ElizaConfig,
+      {
+        env: {
+          OPENAI_API_KEY: "selected-host-openai",
+          ANTHROPIC_API_KEY: "stale-host-anthropic",
+        },
+      },
+    );
+
+    expect(settings.OPENAI_API_KEY).toBe("selected-host-openai");
+    expect(settings.ANTHROPIC_API_KEY).toBeUndefined();
+  });
+
+  it("rejects persisted plaintext only for canonical Pi runtime config", () => {
+    const piConfig = {
+      serviceRouting: {
+        llmText: {
+          backend: "pi",
+          transport: "direct",
+          primaryModel: "openai/gpt-5.4-mini",
+        },
+      },
+      env: { vars: { ANTHROPIC_API_KEY: "stale-persisted-secret" } },
+    } as ElizaConfig;
+
+    expect(() =>
+      buildRuntimeSettingsProjection(piConfig, {
+        env: { OPENAI_API_KEY: "legitimate-host-key" },
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "PI_PLAINTEXT_CREDENTIAL_FORBIDDEN" }),
+    );
+
+    const direct = buildRuntimeSettingsProjection(
+      {
+        serviceRouting: {
+          llmText: {
+            backend: "openai",
+            transport: "direct",
+            primaryModel: "gpt-5.4-mini",
+          },
+        },
+        env: { vars: { OPENAI_API_KEY: "direct-config-key" } },
+      } as ElizaConfig,
+      { env: { OPENAI_API_KEY: "host-key" } },
+    );
+    expect(direct.OPENAI_API_KEY).toBe("direct-config-key");
+  });
+
+  it("does not fall back to ambient credentials for an unresolved Pi vault ref", () => {
+    const settings = buildRuntimeSettingsProjection(
+      {
+        serviceRouting: {
+          llmText: {
+            backend: "pi",
+            transport: "direct",
+            primaryModel: "anthropic/claude-sonnet-4-6",
+          },
+        },
+        env: {
+          ANTHROPIC_API_KEY: "vault://providers.anthropic.api-key",
+          vars: {
+            ANTHROPIC_API_KEY: "vault://providers.anthropic.api-key",
+          },
+        },
+      } as ElizaConfig,
+      { env: { ANTHROPIC_API_KEY: "stale-ambient-key" } },
+    );
+    expect(settings.ANTHROPIC_API_KEY).toBeUndefined();
+  });
+
+  it("builds isolated credential projections for separate runtimes", () => {
+    const first = buildRuntimeSettingsProjection({} as ElizaConfig, {
+      env: { OPENAI_API_KEY: "runtime-one" },
+    });
+    const second = buildRuntimeSettingsProjection({} as ElizaConfig, {
+      env: { ANTHROPIC_API_KEY: "runtime-two" },
+    });
+
+    expect(first).toMatchObject({ OPENAI_API_KEY: "runtime-one" });
+    expect(first.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(second).toMatchObject({ ANTHROPIC_API_KEY: "runtime-two" });
+    expect(second.OPENAI_API_KEY).toBeUndefined();
+  });
+
   it("cannot restore gateway-owned credentials from legacy or env config", () => {
     const config = {
       channels: {

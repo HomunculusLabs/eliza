@@ -636,11 +636,15 @@ export interface FirstRunCloudManagedConnection
 	apiKey?: string;
 }
 
+export const PI_CREDENTIAL_PROVIDERS = ["openai", "anthropic"] as const;
+export type PiCredentialProvider = (typeof PI_CREDENTIAL_PROVIDERS)[number];
+
 export interface FirstRunLocalProviderConnection {
 	kind: "local-provider";
 	provider: FirstRunLocalProviderId;
 	apiKey?: string;
 	primaryModel?: string;
+	credentialProvider?: PiCredentialProvider;
 }
 
 export interface FirstRunRemoteProviderConnection {

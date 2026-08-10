@@ -3,7 +3,11 @@
  * and runtime-settings credential boundary without provider network access.
  */
 import type { CredentialStore, Provider } from "@earendil-works/pi-ai";
-import { type IAgentRuntime, TEXT_GENERATION_MODEL_TYPES } from "@elizaos/core";
+import {
+  AgentRuntime,
+  type IAgentRuntime,
+  TEXT_GENERATION_MODEL_TYPES,
+} from "@elizaos/core";
 import { describe, expect, it, vi } from "vitest";
 import {
   CURATED_PI_PROVIDERS,
@@ -66,6 +70,19 @@ function runtimeWithSettings(
 ): IAgentRuntime {
   return {
     getSetting(key: string) {
+      return settings[key] ?? null;
+    },
+  } as IAgentRuntime;
+}
+
+function recordingRuntime(
+  label: string,
+  settings: Readonly<Record<string, string | null>>,
+  reads: string[],
+): IAgentRuntime {
+  return {
+    getSetting(key: string) {
+      reads.push(`${label}:${key}`);
       return settings[key] ?? null;
     },
   } as IAgentRuntime;
@@ -137,6 +154,50 @@ describe("Pi package foundation", () => {
     await expect(blank.read("openai")).resolves.toBeUndefined();
   });
 
+  it("reads only the selected upstream setting from each injected runtime", async () => {
+    const originalOpenAI = process.env.OPENAI_API_KEY;
+    const originalAnthropic = process.env.ANTHROPIC_API_KEY;
+    process.env.OPENAI_API_KEY = "ambient-openai-decoy";
+    process.env.ANTHROPIC_API_KEY = "ambient-anthropic-decoy";
+    try {
+      const reads: string[] = [];
+      const first = new RuntimeSettingsCredentialStore(
+        recordingRuntime(
+          "runtime-one",
+          { OPENAI_API_KEY: "runtime-one-openai" },
+          reads,
+        ),
+        CURATED_PI_PROVIDERS,
+      );
+      const second = new RuntimeSettingsCredentialStore(
+        recordingRuntime(
+          "runtime-two",
+          { ANTHROPIC_API_KEY: "runtime-two-anthropic" },
+          reads,
+        ),
+        CURATED_PI_PROVIDERS,
+      );
+
+      await expect(first.read("openai")).resolves.toEqual({
+        type: "api_key",
+        key: "runtime-one-openai",
+      });
+      await expect(second.read("anthropic")).resolves.toEqual({
+        type: "api_key",
+        key: "runtime-two-anthropic",
+      });
+      expect(reads).toEqual([
+        "runtime-one:OPENAI_API_KEY",
+        "runtime-two:ANTHROPIC_API_KEY",
+      ]);
+    } finally {
+      if (originalOpenAI === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = originalOpenAI;
+      if (originalAnthropic === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = originalAnthropic;
+    }
+  });
+
   it("denies all Pi credential mutation and honors cancellation", async () => {
     const store: CredentialStore = new RuntimeSettingsCredentialStore(
       runtimeWithSettings({ OPENAI_API_KEY: "runtime-openai-key" }),
@@ -166,8 +227,14 @@ describe("Pi package foundation", () => {
       providerManifest: testManifest(load),
       credentialStoreFactory: createStore,
     });
-    const first = runtimeWithSettings({ OPENAI_API_KEY: "first" });
-    const second = runtimeWithSettings({ ANTHROPIC_API_KEY: "second" });
+    const first = new AgentRuntime({
+      logLevel: "fatal",
+      settings: { OPENAI_API_KEY: "first" },
+    });
+    const second = new AgentRuntime({
+      logLevel: "fatal",
+      settings: { ANTHROPIC_API_KEY: "second" },
+    });
 
     expect(Object.keys(plugin.models ?? {}).sort()).toEqual(
       [...TEXT_GENERATION_MODEL_TYPES].sort(),

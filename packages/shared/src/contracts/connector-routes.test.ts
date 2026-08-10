@@ -3,8 +3,8 @@
  * PostConnectorRequestSchema (create/update a connector) and
  * PostProviderSwitchRequestSchema (swap the model provider). Locks in name
  * trimming, rejection of reserved/prototype-pollution keys, strict extra-field
- * rejection, and the provider/apiKey/primaryModel trimming plus apiKey size
- * cap. Pure in-process schema parsing — the exported schemas are exercised
+ * rejection, provider/apiKey/primaryModel trimming, the exact Pi credential
+ * provider union, and the apiKey size cap. Pure in-process schema parsing — the exported schemas are exercised
  * directly, with no HTTP server or mocks in the loop.
  */
 import { describe, expect, it } from "vitest";
@@ -87,6 +87,36 @@ describe("PostProviderSwitchRequestSchema", () => {
       primaryModel: "gpt-5",
     });
   });
+
+  it.each(["openai", "anthropic"] as const)(
+    "accepts exact credentialProvider %s",
+    (credentialProvider) => {
+      expect(
+        PostProviderSwitchRequestSchema.parse({
+          provider: "pi",
+          primaryModel: `${credentialProvider}/model`,
+          credentialProvider,
+        }),
+      ).toEqual({
+        provider: "pi",
+        primaryModel: `${credentialProvider}/model`,
+        credentialProvider,
+      });
+    },
+  );
+
+  it.each(["OpenAI", " openai", "openai ", "", "google", null])(
+    "rejects invalid credentialProvider %j",
+    (credentialProvider) => {
+      expect(() =>
+        PostProviderSwitchRequestSchema.parse({
+          provider: "pi",
+          primaryModel: "openai/gpt-5",
+          credentialProvider,
+        }),
+      ).toThrow(/credentialProvider must be either openai or anthropic/);
+    },
+  );
 
   it("absorbs whitespace-only optional fields as absent", () => {
     expect(

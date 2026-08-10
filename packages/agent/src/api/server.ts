@@ -330,6 +330,7 @@ import {
   defaultClassifier,
   getDefaultHealthChecker,
   getDefaultRepository,
+  type RuntimeCredentialOverlay,
   type RuntimeOperationManager,
 } from "../runtime/operations/index.ts";
 import { classifyRegistryPluginRelease } from "../runtime/release-plugin-policy.ts";
@@ -1255,8 +1256,17 @@ const resolvePluginConfigMutationRejections =
 // Route handler
 // ---------------------------------------------------------------------------
 
+export interface RuntimeRestartOptions {
+  /** Opaque provider credential projected only into the replacement runtime. */
+  runtimeCredentialOverlay?: RuntimeCredentialOverlay;
+}
+
+type RuntimeRestartHandler = (
+  options?: RuntimeRestartOptions,
+) => Promise<AgentRuntime | null>;
+
 interface RequestContext {
-  onRestart: (() => Promise<AgentRuntime | null>) | null;
+  onRestart: RuntimeRestartHandler | null;
   onRuntimeSwapped?: () => void;
   onRuntimeActivated?: (
     previousRuntime: AgentRuntime | null,
@@ -1351,7 +1361,10 @@ let cachedRuntimeOperationManager: RuntimeOperationManager | null = null;
 
 function getOrCreateRuntimeOperationManager(
   state: ServerState,
-  restartRuntime: (reason: string) => Promise<boolean>,
+  restartRuntime: (
+    reason: string,
+    options?: RuntimeRestartOptions,
+  ) => Promise<boolean>,
 ): RuntimeOperationManager {
   if (cachedRuntimeOperationManager) {
     return cachedRuntimeOperationManager;
@@ -1359,8 +1372,11 @@ function getOrCreateRuntimeOperationManager(
   const repository = getDefaultRepository();
   const healthChecker = getDefaultHealthChecker();
   const coldStrategy = createColdStrategy({
-    restartRuntime: async (reason) => {
-      const ok = await restartRuntime(reason);
+    restartRuntime: async (reason, runtimeCredentialOverlay) => {
+      const ok = await restartRuntime(
+        reason,
+        runtimeCredentialOverlay ? { runtimeCredentialOverlay } : undefined,
+      );
       if (!ok) return null;
       return state.runtime;
     },
@@ -1590,7 +1606,10 @@ async function handleRequest(
     });
   };
 
-  const restartRuntime = async (reason: string): Promise<boolean> => {
+  const restartRuntime = async (
+    reason: string,
+    options?: RuntimeRestartOptions,
+  ): Promise<boolean> => {
     if (!ctx?.onRestart) {
       return false;
     }
@@ -1606,7 +1625,7 @@ async function handleRequest(
 
     try {
       const previousRuntime = state.runtime;
-      const newRuntime = await ctx.onRestart();
+      const newRuntime = await ctx.onRestart(options);
       if (!newRuntime) {
         state.agentState = previousState;
         state.broadcastStatus?.();
@@ -3429,7 +3448,7 @@ export async function startApiServer(opts?: {
    * Should stop the current runtime, create a new one, and return it.
    * If omitted the endpoint returns 501 (not supported in this mode).
    */
-  onRestart?: () => Promise<AgentRuntime | null>;
+  onRestart?: RuntimeRestartHandler;
   /** Runs after the server atomically publishes the replacement runtime. */
   onRuntimeActivated?: (
     previousRuntime: AgentRuntime | null,

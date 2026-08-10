@@ -8,10 +8,11 @@
  * Routes covered:
  *   POST /api/connectors           { name: string, config: object }
  *   POST /api/provider/switch
- *     { provider: string, apiKey?, primaryModel? }
+ *     { provider: string, apiKey?, primaryModel?, credentialProvider? }
  */
 
 import z from "zod";
+import { PI_CREDENTIAL_PROVIDERS } from "./first-run-options.js";
 
 /**
  * Reserved object keys we never want to allow as connector names —
@@ -41,6 +42,11 @@ export const PostProviderSwitchRequestSchema = z
     provider: z.string().regex(/\S/, "Missing provider"),
     apiKey: z.string().max(512, "API key is too long").optional(),
     primaryModel: z.string().optional(),
+    credentialProvider: z
+      .enum(PI_CREDENTIAL_PROVIDERS, {
+        error: "credentialProvider must be either openai or anthropic",
+      })
+      .optional(),
   })
   .strict()
   .transform((value) => {
@@ -50,6 +56,9 @@ export const PostProviderSwitchRequestSchema = z
       provider: value.provider.trim(),
       ...(apiKey ? { apiKey } : {}),
       ...(primaryModel ? { primaryModel } : {}),
+      ...(value.credentialProvider
+        ? { credentialProvider: value.credentialProvider }
+        : {}),
     };
   });
 

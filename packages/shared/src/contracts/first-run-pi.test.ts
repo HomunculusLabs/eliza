@@ -6,6 +6,7 @@
 import { describe, expect, it } from "vitest";
 import {
   FIRST_RUN_PROVIDER_CATALOG as CORE_CATALOG,
+  PI_CREDENTIAL_PROVIDERS as CORE_PI_CREDENTIAL_PROVIDERS,
   getFirstRunProviderOption as coreGetFirstRunProviderOption,
   getFirstRunProviderSignalEnvKeys as coreGetFirstRunProviderSignalEnvKeys,
   normalizeFirstRunProviderId as coreNormalizeFirstRunProviderId,
@@ -16,6 +17,7 @@ import {
   getFirstRunProviderOption,
   getFirstRunProviderSignalEnvKeys,
   normalizeFirstRunProviderId,
+  PI_CREDENTIAL_PROVIDERS,
 } from "./first-run-options";
 
 const PI_ALIASES = [
@@ -45,6 +47,11 @@ describe("hidden Pi provider identity", () => {
       onboardingVisible: false,
     });
     expect(coreEntry).toEqual(sharedEntry);
+  });
+
+  it("keeps the exact credential-provider union mirrored", () => {
+    expect(PI_CREDENTIAL_PROVIDERS).toEqual(["openai", "anthropic"]);
+    expect(CORE_PI_CREDENTIAL_PROVIDERS).toEqual(PI_CREDENTIAL_PROVIDERS);
   });
 
   it.each(PI_ALIASES)("normalizes %s to pi in both mirrors", (alias) => {

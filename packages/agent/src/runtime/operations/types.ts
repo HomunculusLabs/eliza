@@ -17,6 +17,7 @@
  */
 
 import type { AgentRuntime } from "@elizaos/core";
+import type { PiCredentialProvider } from "@elizaos/shared";
 
 // ---------------------------------------------------------------------------
 // Discriminated intent payloads
@@ -34,6 +35,8 @@ export interface ProviderSwitchIntent {
    */
   apiKeyRef?: string;
   primaryModel?: string;
+  /** Selected Pi upstream identity; never contains credential material. */
+  credentialProvider?: PiCredentialProvider;
 }
 
 export interface ConfigReloadIntent {
@@ -69,6 +72,21 @@ export type OperationIntent =
 
 export type OperationKind = OperationIntent["kind"];
 
+/** Runtime-only upstream credential setting accepted by provider plugins. */
+export type ProviderCredentialSettingKey =
+  | "OPENAI_API_KEY"
+  | "ANTHROPIC_API_KEY";
+
+/**
+ * Opaque operation-local credential projection. The secret is reachable only
+ * through the closure, so JSON serialization can expose the selected setting
+ * identity but never the credential value.
+ */
+export interface RuntimeCredentialOverlay {
+  readonly settingKey: ProviderCredentialSettingKey;
+  readonly read: () => string;
+}
+
 // ---------------------------------------------------------------------------
 // Tier classification
 // ---------------------------------------------------------------------------
@@ -96,6 +114,7 @@ export type OperationStatus =
   | "running"
   | "succeeded"
   | "failed"
+  | "restart_required"
   | "rolled-back";
 
 export type PhaseStatus =
@@ -226,6 +245,8 @@ export interface HealthCheckReport {
 export interface ReloadContext {
   runtime: AgentRuntime;
   intent: OperationIntent;
+  /** Accepted-only secret projection; never serialized with the operation. */
+  runtimeCredentialOverlay?: RuntimeCredentialOverlay;
   /** Phase reporter — call for every meaningful step inside a strategy. */
   reportPhase: (phase: OperationPhase) => Promise<void>;
 }
@@ -257,6 +278,8 @@ export interface OperationCompensation {
 export interface StartOperationRequest {
   intent: OperationIntent;
   idempotencyKey?: string;
+  /** Process-local credential projection retained only for an accepted op. */
+  runtimeCredentialOverlay?: RuntimeCredentialOverlay;
   /**
    * Runs after the idempotency and active-operation gates pass, but before
    * the operation is persisted and scheduled. Use for accepted-only side

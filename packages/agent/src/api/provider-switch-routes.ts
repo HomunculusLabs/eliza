@@ -2,9 +2,10 @@
  * Mounts POST /api/provider/switch behind the authenticated API gate. Validated
  * provider changes persist secrets through the vault when supported, apply the
  * canonical connection config, and run through the idempotent runtime-operation
- * restart path. Pi is configuration-only until secure onboarding exists: it
- * rejects every submitted key and compensates a failed full restart by restoring
- * config/environment and attempting the previous runtime once.
+ * restart path. Pi key submission persists only the selected upstream vault
+ * reference and carries plaintext only in an opaque operation-local runtime
+ * overlay. Failed restarts restore secret/config state and attempt the previous
+ * runtime exactly once without mutating process-global credentials.
  */
 import type http from "node:http";
 import { ElizaError, logger } from "@elizaos/core";
@@ -17,14 +18,21 @@ import type { SecretsManager } from "@elizaos/vault";
 import type { ElizaConfig } from "../config/config.ts";
 import {
   defaultSecretsManager,
+  type ProviderApiKeySnapshot,
   type ProviderSwitchIntent,
   persistProviderApiKey,
   type RuntimeOperationManager,
+  restoreProviderApiKey,
+  snapshotProviderApiKey,
 } from "../runtime/operations/index.ts";
+import { createRuntimeCredentialOverlay } from "../runtime/runtime-settings.ts";
 import {
   applyFirstRunConnectionConfig,
+  applyPiProviderApiKeyReference,
   createProviderSwitchConnection,
+  PI_CREDENTIAL_TARGETS,
   type ProviderSwitchStateSnapshot,
+  resolvePiCredentialProvider,
   restoreProviderSwitchState,
   snapshotProviderSwitchState,
 } from "./provider-switch-config.ts";
@@ -51,9 +59,8 @@ export interface ProviderSwitchRouteContext {
   runtimeOperationManager: RuntimeOperationManager;
   /**
    * Vault-backed secrets manager. Tests inject; production resolves to the
-   * OS-keychain default. The route writes the API key here BEFORE
-   * constructing the intent so the secret never lands on disk in plaintext
-   * inside an operation record.
+   * OS-keychain default. Accepted-only preparation writes the API key before
+   * returning the persisted intent, so operation records never carry plaintext.
    */
   secretsManager?: SecretsManager;
 }
@@ -84,12 +91,12 @@ export async function handleProviderSwitchRoutes(
       typeof rawBody.provider === "string"
         ? normalizeFirstRunProviderId(rawBody.provider)
         : null;
-    if (rawProvider === "pi" && Object.hasOwn(rawBody, "apiKey")) {
-      error(
-        res,
-        "Secure Pi API-key onboarding is not available yet; omit apiKey and use a preconfigured runtime credential.",
-        400,
-      );
+    if (
+      rawProvider === "pi" &&
+      Object.hasOwn(rawBody, "apiKey") &&
+      (typeof rawBody.apiKey !== "string" || rawBody.apiKey.trim().length === 0)
+    ) {
+      error(res, "Pi API key must be a non-empty string.", 400);
       return true;
     }
     const parsed = PostProviderSwitchRequestSchema.safeParse(rawBody);
@@ -135,6 +142,7 @@ export async function handleProviderSwitchRoutes(
           provider: normalizedProvider,
           apiKey: trimmedApiKey,
           primaryModel: requestedPrimaryModel,
+          credentialProvider: body.credentialProvider,
         });
       }
 
@@ -143,13 +151,29 @@ export async function handleProviderSwitchRoutes(
         return true;
       }
 
+      const piCredentialProvider =
+        normalizedProvider === "pi" && requestedPrimaryModel
+          ? resolvePiCredentialProvider(requestedPrimaryModel)
+          : undefined;
       const intent: ProviderSwitchIntent = {
         kind: "provider-switch",
         provider: normalizedProvider,
         primaryModel: requestedPrimaryModel,
+        ...(piCredentialProvider
+          ? { credentialProvider: piCredentialProvider }
+          : {}),
       };
       const idempotencyKey = readIdempotencyKey(req.headers);
+      const runtimeCredentialOverlay =
+        piCredentialProvider && trimmedApiKey
+          ? createRuntimeCredentialOverlay(
+              PI_CREDENTIAL_TARGETS[piCredentialProvider].environmentKey,
+              trimmedApiKey,
+            )
+          : undefined;
       let piSnapshot: ProviderSwitchStateSnapshot | undefined;
+      let piVaultSnapshot: ProviderApiKeySnapshot | undefined;
+      let piSecrets: SecretsManager | undefined;
       const restorePiState = async (): Promise<void> => {
         if (!piSnapshot) {
           throw new ElizaError("Pi provider-switch snapshot is unavailable", {
@@ -157,13 +181,41 @@ export async function handleProviderSwitchRoutes(
             context: { provider: "pi" },
           });
         }
-        restoreProviderSwitchState(state.config, piSnapshot);
-        ctx.saveElizaConfig(state.config);
+
+        const failedSteps: string[] = [];
+        if (piVaultSnapshot && piSecrets) {
+          try {
+            await restoreProviderApiKey({
+              vault: piSecrets.vault,
+              snapshot: piVaultSnapshot,
+              caller: "provider-switch-compensation",
+            });
+          } catch {
+            // error-policy:J1 compensation continues restoring config/env and
+            // reports only the failed redacted step to the operation boundary.
+            failedSteps.push("vault");
+          }
+        }
+        try {
+          restoreProviderSwitchState(state.config, piSnapshot);
+          ctx.saveElizaConfig(state.config);
+        } catch {
+          // error-policy:J1 config/env restoration errors are reduced to a
+          // redacted step name because config may contain unrelated secrets.
+          failedSteps.push("config-environment");
+        }
+        if (failedSteps.length > 0) {
+          throw new ElizaError("Pi provider-switch compensation failed", {
+            code: "PI_SWITCH_COMPENSATION_FAILED",
+            context: { provider: "pi", failedSteps },
+          });
+        }
       };
 
       const outcome = await ctx.runtimeOperationManager.start({
         intent,
         idempotencyKey,
+        ...(runtimeCredentialOverlay ? { runtimeCredentialOverlay } : {}),
         ...(normalizedProvider === "pi"
           ? {
               compensation: {
@@ -173,10 +225,86 @@ export async function handleProviderSwitchRoutes(
             }
           : {}),
         prepare: async () => {
-          const config = state.config;
           if (normalizedProvider === "pi") {
-            piSnapshot = snapshotProviderSwitchState(config);
+            piSnapshot = snapshotProviderSwitchState(state.config);
+            const nextConfig = structuredClone(state.config);
+            let apiKeyRef: string | undefined;
+            try {
+              if (trimmedApiKey) {
+                if (!piCredentialProvider) {
+                  throw new ElizaError(
+                    "Pi credential provider could not be resolved",
+                    {
+                      code: "PI_CREDENTIAL_PROVIDER_MISSING",
+                      context: { provider: "pi" },
+                    },
+                  );
+                }
+                piSecrets = ctx.secretsManager ?? defaultSecretsManager();
+                piVaultSnapshot = await snapshotProviderApiKey({
+                  vault: piSecrets.vault,
+                  normalizedProvider: piCredentialProvider,
+                  caller: "provider-switch-route:snapshot",
+                });
+                apiKeyRef = await persistProviderApiKey({
+                  secrets: piSecrets,
+                  normalizedProvider: piCredentialProvider,
+                  apiKey: trimmedApiKey,
+                  caller: "provider-switch-route",
+                });
+                const expectedRef =
+                  PI_CREDENTIAL_TARGETS[piCredentialProvider].apiKeyRef;
+                if (apiKeyRef !== expectedRef) {
+                  throw new ElizaError(
+                    "Pi credential reference does not match its upstream",
+                    {
+                      code: "PI_CREDENTIAL_REFERENCE_MISMATCH",
+                      context: {
+                        credentialProvider: piCredentialProvider,
+                        apiKeyRef,
+                      },
+                    },
+                  );
+                }
+              }
+
+              await applyFirstRunConnectionConfig(nextConfig, connection);
+              if (apiKeyRef && trimmedApiKey && piCredentialProvider) {
+                applyPiProviderApiKeyReference(
+                  nextConfig,
+                  piCredentialProvider,
+                  apiKeyRef,
+                );
+              }
+              ctx.saveElizaConfig(nextConfig);
+              state.config = nextConfig;
+            } catch {
+              // error-policy:J1 accepted-only preparation restores every
+              // process-local mutation and surfaces no secret-bearing cause.
+              try {
+                await restorePiState();
+              } catch {
+                throw new ElizaError(
+                  "Pi provider switch preparation and compensation failed",
+                  {
+                    code: "PI_SWITCH_PREPARE_COMPENSATION_FAILED",
+                    context: { provider: "pi" },
+                  },
+                );
+              }
+              throw new ElizaError("Pi provider switch preparation failed", {
+                code: "PI_SWITCH_PREPARE_FAILED",
+                context: { provider: "pi" },
+              });
+            }
+
+            return {
+              ...intent,
+              ...(apiKeyRef ? { apiKeyRef } : {}),
+            };
           }
+
+          const config = state.config;
           let apiKeyRef: string | undefined;
           if (trimmedApiKey) {
             const secrets = ctx.secretsManager ?? defaultSecretsManager();
@@ -187,10 +315,9 @@ export async function handleProviderSwitchRoutes(
                 apiKey: trimmedApiKey,
                 caller: "provider-switch-route",
               });
-            } catch (vaultErr) {
-              logger.error(
-                `[api] Vault write failed for provider=${normalizedProvider}: ${vaultErr instanceof Error ? vaultErr.message : String(vaultErr)}`,
-              );
+            } catch {
+              // error-policy:J1 the HTTP boundary receives a fixed failure;
+              // vault backend errors are not logged because they may echo input.
               throw new Error("Vault write failed");
             }
           }
@@ -207,28 +334,8 @@ export async function handleProviderSwitchRoutes(
             await applyFirstRunConnectionConfig(config, connection);
             ctx.saveElizaConfig(config);
           } catch (cause) {
-            // error-policy:J2 restore accepted-only state before adding
-            // provider-switch context and rethrowing the original cause.
-            if (normalizedProvider === "pi" && piSnapshot) {
-              try {
-                await restorePiState();
-              } catch (restoreCause) {
-                throw new ElizaError(
-                  "Pi provider switch failed and its prior configuration could not be restored",
-                  {
-                    code: "PI_SWITCH_CONFIG_RESTORE_FAILED",
-                    cause,
-                    context: {
-                      provider: "pi",
-                      restoreError:
-                        restoreCause instanceof Error
-                          ? restoreCause.message
-                          : String(restoreCause),
-                    },
-                  },
-                );
-              }
-            }
+            // error-policy:J2 non-Pi provider switching retains its existing
+            // context-adding failure contract.
             throw new ElizaError("Provider switch configuration failed", {
               code: "PROVIDER_SWITCH_CONFIG_FAILED",
               cause,
@@ -265,13 +372,22 @@ export async function handleProviderSwitchRoutes(
         logger.info(
           `[api] Provider switch deduped: provider=${normalizedProvider} op=${op.id} status=${op.status}`,
         );
-        json(res, {
-          success: true,
-          provider: normalizedProvider,
-          restarting: op.status === "running" || op.status === "pending",
-          operationId: op.id,
-          deduped: true,
-        });
+        const dedupedFailure =
+          op.status === "failed" ||
+          op.status === "restart_required" ||
+          op.status === "rolled-back";
+        json(
+          res,
+          {
+            success: !dedupedFailure,
+            provider: normalizedProvider,
+            status: op.status,
+            restarting: op.status === "running" || op.status === "pending",
+            operationId: op.id,
+            deduped: true,
+          },
+          dedupedFailure ? 500 : undefined,
+        );
         return true;
       }
 
@@ -289,12 +405,16 @@ export async function handleProviderSwitchRoutes(
       // error-policy:J1 authenticated HTTP boundary — expose typed validation
       // failures as structured client errors and redact all internal failures.
       logger.error(
-        `[api] Provider switch failed: ${err instanceof Error ? err.stack : err}`,
+        `[api] Provider switch failed: provider=${normalizedProvider} code=${
+          err instanceof ElizaError ? err.code : "untyped"
+        }`,
       );
       if (err instanceof ElizaError) {
         const isClientError =
           err.code === "PI_QUALIFIED_MODEL_REQUIRED" ||
-          err.code === "PI_SECURE_ONBOARDING_NOT_AVAILABLE";
+          err.code === "PI_CREDENTIAL_PROVIDER_MISMATCH" ||
+          err.code === "PI_CREDENTIAL_MISSING" ||
+          err.code === "CREDENTIAL_PROVIDER_REQUIRES_PI";
         error(res, err.message, isClientError ? 400 : 500);
         return true;
       }

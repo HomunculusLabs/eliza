@@ -144,6 +144,7 @@ describe("clearPersistedFirstRunConfig (reset everything)", () => {
 
   afterEach(() => {
     delete process.env.OPENAI_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
     for (const key of [...CLOUD_ENV_KEYS, ...MODEL_ENV_KEYS]) {
       delete process.env[key];
     }
@@ -187,14 +188,34 @@ describe("clearPersistedFirstRunConfig (reset everything)", () => {
     expect(config.serviceRouting).toBeUndefined();
   });
 
-  it("clears provider credentials from both config.env and process.env", async () => {
-    process.env.OPENAI_API_KEY = "sk-config";
+  it("clears exact Pi upstream references from config and process settings", () => {
+    process.env.OPENAI_API_KEY = "openai-runtime-secret";
+    process.env.ANTHROPIC_API_KEY = "anthropic-runtime-secret";
+    const config = {
+      ...buildFullyOnboardedConfig(),
+      serviceRouting: {
+        llmText: {
+          backend: "pi",
+          transport: "direct",
+          primaryModel: "openai/gpt-5.4-mini",
+        },
+      },
+      env: {
+        OPENAI_API_KEY: "vault://providers.openai.api-key",
+        ANTHROPIC_API_KEY: "vault://providers.anthropic.api-key",
+        vars: {
+          OPENAI_API_KEY: "vault://providers.openai.api-key",
+          ANTHROPIC_API_KEY: "vault://providers.anthropic.api-key",
+        },
+      },
+    } as Partial<ElizaConfig>;
 
-    const config = buildFullyOnboardedConfig();
     clearPersistedFirstRunConfig(config, storagePolicy());
 
     expect(config.env).toBeUndefined();
+    expect(config.serviceRouting).toBeUndefined();
     expect(process.env.OPENAI_API_KEY).toBeUndefined();
+    expect(process.env.ANTHROPIC_API_KEY).toBeUndefined();
   });
 
   it("deletes subscription and direct account files as one reset transaction", () => {
@@ -452,16 +473,93 @@ describe("Pi provider-switch config", () => {
     ).toMatchObject({ primaryModel: "openai/models/gpt-5:preview" });
   });
 
-  it("rejects every explicit Pi API-key value until secure onboarding is available", () => {
-    for (const apiKey of ["sk-must-not-be-accepted", "", "   "]) {
+  it.each([
+    ["openai/gpt-5.4-mini", "openai"],
+    ["anthropic/claude-sonnet-4-6", "anthropic"],
+  ] as const)(
+    "accepts matching credential provider %s → %s",
+    (primaryModel, credentialProvider) => {
+      expect(
+        createProviderSwitchConnection({
+          provider: "pi",
+          primaryModel,
+          credentialProvider,
+        }),
+      ).toEqual({
+        kind: "local-provider",
+        provider: "pi",
+        primaryModel,
+        credentialProvider,
+      });
+    },
+  );
+
+  it.each([
+    ["openai/gpt-5.4-mini", "anthropic"],
+    ["anthropic/claude-sonnet-4-6", "openai"],
+  ] as const)(
+    "rejects mismatched credential provider %s → %s",
+    (primaryModel, credentialProvider) => {
       expect(() =>
         createProviderSwitchConnection({
           provider: "pi",
-          primaryModel: "openai/gpt-5.4-mini",
-          apiKey,
+          primaryModel,
+          credentialProvider,
         }),
-      ).toThrow(/Secure Pi API-key onboarding is not available yet/);
-    }
+      ).toThrowError(
+        expect.objectContaining({ code: "PI_CREDENTIAL_PROVIDER_MISMATCH" }),
+      );
+    },
+  );
+
+  it("rejects credentialProvider for non-Pi providers", () => {
+    expect(() =>
+      createProviderSwitchConnection({
+        provider: "openai",
+        primaryModel: "gpt-5",
+        credentialProvider: "openai",
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "CREDENTIAL_PROVIDER_REQUIRES_PI" }),
+    );
+  });
+
+  it("accepts a submitted Pi key only at the route-validation boundary", () => {
+    expect(
+      createProviderSwitchConnection({
+        provider: "pi",
+        primaryModel: "openai/gpt-5.4-mini",
+        credentialProvider: "openai",
+        apiKey: "sk-route-only",
+      }),
+    ).toEqual({
+      kind: "local-provider",
+      provider: "pi",
+      primaryModel: "openai/gpt-5.4-mini",
+      credentialProvider: "openai",
+    });
+    expect(() =>
+      createProviderSwitchConnection({
+        provider: "pi",
+        primaryModel: "openai/gpt-5.4-mini",
+        apiKey: "   ",
+      }),
+    ).toThrowError(expect.objectContaining({ code: "PI_CREDENTIAL_MISSING" }));
+  });
+
+  it("rejects plaintext from direct config callers", async () => {
+    await expect(
+      applyFirstRunConnectionConfig(
+        {},
+        {
+          kind: "local-provider",
+          provider: "pi",
+          primaryModel: "openai/gpt-5.4-mini",
+          credentialProvider: "openai",
+          apiKey: "sk-must-not-reach-config",
+        },
+      ),
+    ).rejects.toMatchObject({ code: "PI_PLAINTEXT_CREDENTIAL_FORBIDDEN" });
   });
 
   it("applies a config-only Pi switch with the qualified model", async () => {
@@ -490,6 +588,24 @@ describe("Pi provider-switch config", () => {
       "anthropic/claude-sonnet-4-6",
     );
     expect(config.env).toBeUndefined();
+    expect(config).not.toHaveProperty("credentialProvider");
+    expect(config.serviceRouting?.llmText).not.toHaveProperty(
+      "credentialProvider",
+    );
+  });
+
+  it("revalidates credentialProvider for direct config callers", async () => {
+    const config: Partial<ElizaConfig> = {};
+
+    await expect(
+      applyFirstRunConnectionConfig(config, {
+        kind: "local-provider",
+        provider: "pi",
+        primaryModel: "openai/gpt-5.4-mini",
+        credentialProvider: "anthropic",
+      }),
+    ).rejects.toMatchObject({ code: "PI_CREDENTIAL_PROVIDER_MISMATCH" });
+    expect(config).toEqual({});
   });
 
   it("restores full config and only Pi-managed environment keys in place", () => {
@@ -505,8 +621,10 @@ describe("Pi provider-switch config", () => {
     };
     const environment: NodeJS.ProcessEnv = {
       ELIZAOS_CLOUD_ENABLED: "true",
+      OPENAI_API_KEY: "prior-secret",
       UNRELATED_CONCURRENT_KEY: "before",
     };
+    const originalConfig = structuredClone(config);
     const snapshot = snapshotProviderSwitchState(config, environment);
 
     config.serviceRouting = {
@@ -526,11 +644,13 @@ describe("Pi provider-switch config", () => {
     restoreProviderSwitchState(config, snapshot, environment);
 
     expect(config).toBe(originalConfigIdentity);
-    expect(config).toEqual(snapshot.config);
-    expect(Object.keys(snapshot.environment)).toEqual(
+    expect(config).toEqual(originalConfig);
+    expect(snapshot.managedEnvironmentKeys).toEqual(
       PI_PROVIDER_SWITCH_ENV_KEYS,
     );
+    expect(JSON.stringify(snapshot)).not.toContain("prior-secret");
     expect(environment.ELIZAOS_CLOUD_ENABLED).toBe("true");
+    expect(environment.OPENAI_API_KEY).toBe("prior-secret");
     expect(environment.OPENAI_BASE_URL).toBeUndefined();
     expect(environment.UNRELATED_CONCURRENT_KEY).toBe("concurrent-update");
     expect(environment.ADDED_CONCURRENT_KEY).toBe("preserved");

@@ -17,6 +17,7 @@ import type { ElizaConfig } from "@elizaos/shared";
 import {
   isElizaSettingsDebugEnabled,
   migrateLegacyRuntimeConfig,
+  resolveServiceRoutingInConfig,
   sanitizeForSettingsDebug,
   settingsDebugCloudSummary,
 } from "@elizaos/shared";
@@ -243,12 +244,27 @@ export function loadElizaConfig(): ElizaConfig {
 
   const envVars = collectConfigEnvVars(resolved);
   const connectorEnvVars = collectConnectorEnvVars(resolved);
+  const isPiRuntimeConfig =
+    resolveServiceRoutingInConfig(resolved as Record<string, unknown>)?.llmText
+      ?.backend === "pi";
+  const withoutPiCredentials = (values: Record<string, string>) =>
+    Object.fromEntries(
+      Object.entries(values).filter(
+        ([key]) => key !== "OPENAI_API_KEY" && key !== "ANTHROPIC_API_KEY",
+      ),
+    );
+  const processEnvVars = isPiRuntimeConfig
+    ? withoutPiCredentials(envVars)
+    : envVars;
+  const processPersistedConfigEnv = isPiRuntimeConfig
+    ? withoutPiCredentials(persistedConfigEnv)
+    : persistedConfigEnv;
   // Saved config is the source of truth for settings edited in the app.
   // If a key is persisted here, it should override any stale value that
   // arrived from .env or the parent shell.
-  applyConfigEnvToProcessEnv(envVars);
+  applyConfigEnvToProcessEnv(processEnvVars);
   applyConfigEnvToProcessEnv(connectorEnvVars);
-  applyConfigEnvToProcessEnv(persistedConfigEnv);
+  applyConfigEnvToProcessEnv(processPersistedConfigEnv);
 
   const discordToken =
     process.env.DISCORD_API_TOKEN?.trim() ||
