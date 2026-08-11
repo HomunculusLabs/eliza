@@ -3,13 +3,13 @@
 import http from "node:http";
 import { Socket } from "node:net";
 import { runInNewContext } from "node:vm";
+import { logger } from "@elizaos/core";
 import {
   CLOUD_PAIR_LEGACY_STORAGE_KEY,
   CLOUD_PAIR_LOCAL_OWNER_HINT_KEY,
   cloudPairTokenKeyForAgent,
 } from "@elizaos/shared/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { logger } from "@elizaos/core";
 import {
   __resetCloudPairRateLimitForTests,
   handleStandaloneCloudPairRoute,
@@ -391,7 +391,9 @@ describe("handleStandaloneCloudPairRoute", () => {
         "fetch",
         vi
           .fn()
-          .mockResolvedValue(new Response(JSON.stringify({}), { status: rejectStatus })),
+          .mockResolvedValue(
+            new Response(JSON.stringify({}), { status: rejectStatus }),
+          ),
       );
 
       const harness = fakeRes();
@@ -488,9 +490,7 @@ describe("handleStandaloneCloudPairRoute", () => {
     expect(harness.body()).not.toContain("staging.elizacloud.ai");
   });
 
-  it("resolves the recovery link to the staging console for a staging-provisioned agent", async () => {
-    process.env.ELIZAOS_CLOUD_BASE_URL =
-      "https://api-staging.elizacloud.ai/api/v1";
+  it("resolves the recovery link to the staging console for every staging control-plane alias", async () => {
     vi.stubGlobal(
       "fetch",
       vi
@@ -498,16 +498,23 @@ describe("handleStandaloneCloudPairRoute", () => {
         .mockResolvedValue(new Response(JSON.stringify({}), { status: 410 })),
     );
 
-    const harness = fakeRes();
-    await handleStandaloneCloudPairRoute(
-      fakeReq({ pathname: "/pair", search: "?token=pair-token" }),
-      harness.res,
-    );
+    for (const cloudBaseUrl of [
+      "https://api-staging.elizacloud.ai/api/v1",
+      "https://app-staging.elizacloud.ai",
+      "https://staging.elizacloud.ai",
+    ]) {
+      process.env.ELIZAOS_CLOUD_BASE_URL = cloudBaseUrl;
+      const harness = fakeRes();
+      await handleStandaloneCloudPairRoute(
+        fakeReq({ pathname: "/pair", search: "?token=pair-token" }),
+        harness.res,
+      );
 
-    expect(harness.body()).toContain(
-      "https://staging.elizacloud.ai/dashboard/agents",
-    );
-    expect(harness.body()).not.toContain("www.elizacloud.ai");
+      expect(harness.body()).toContain(
+        "https://staging.elizacloud.ai/dashboard/agents",
+      );
+      expect(harness.body()).not.toContain("www.elizacloud.ai");
+    }
   });
 
   it("resolves the recovery link to staging for wildcard staging hostnames", async () => {

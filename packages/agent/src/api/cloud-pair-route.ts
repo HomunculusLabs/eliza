@@ -16,6 +16,11 @@ import {
 const RELAY_TIMEOUT_MS = 15_000;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_MAX = 20;
+const STAGING_CLOUD_CONTROL_PLANE_HOSTS = new Set([
+  "api-staging.elizacloud.ai",
+  "app-staging.elizacloud.ai",
+  "staging.elizacloud.ai",
+]);
 
 interface RateBucket {
   count: number;
@@ -92,13 +97,7 @@ function canUseManagedDirectRelay(req: http.IncomingMessage): boolean {
 
 function escapeHtml(value: string): string {
   return value.replace(/[<>&"]/g, (c) =>
-    c === "<"
-      ? "&lt;"
-      : c === ">"
-        ? "&gt;"
-        : c === "&"
-          ? "&amp;"
-          : "&quot;",
+    c === "<" ? "&lt;" : c === ">" ? "&gt;" : c === "&" ? "&amp;" : "&quot;",
   );
 }
 
@@ -113,7 +112,7 @@ function resolveCloudConsoleUrl(): string {
   try {
     const hostname = new URL(resolveCloudAuthRoot()).hostname.toLowerCase();
     if (
-      hostname === "api-staging.elizacloud.ai" ||
+      STAGING_CLOUD_CONTROL_PLANE_HOSTS.has(hostname) ||
       hostname.endsWith(".staging.elizacloud.ai")
     ) {
       return "https://staging.elizacloud.ai/dashboard/agents";
