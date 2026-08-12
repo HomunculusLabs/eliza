@@ -11,7 +11,14 @@ export interface ReusablePgliteManager {
 export interface PgliteManagerCache<TManager extends ReusablePgliteManager> {
   pgLiteClientManager?: TManager;
   pgLiteClientManagers?: Map<string, TManager>;
+  pgLiteManagerLeaseCounts?: Map<TManager, number>;
   activePgliteManagerKey?: string;
+}
+
+export interface PgliteManagerLease<TManager> {
+  manager: TManager;
+  /** Releases this owner and returns true only when it closed the manager. */
+  release(): Promise<boolean>;
 }
 
 /**
@@ -70,6 +77,49 @@ export function getOrCreatePgliteManagerForAgent<TManager extends ReusablePglite
   return manager;
 }
 
+/**
+ * Acquire one adapter-owned lease on the cached manager. Distinct runtimes may
+ * overlap during replacement, so adapter teardown closes the manager only when
+ * the final lease is released.
+ */
+export function acquirePgliteManagerForAgent<
+  TManager extends ReusablePgliteManager & { close(): Promise<void> },
+>(
+  cache: PgliteManagerCache<TManager>,
+  dataDir: string | undefined,
+  agentId: string,
+  createManager: () => TManager
+): PgliteManagerLease<TManager> {
+  const manager = getOrCreatePgliteManagerForAgent(cache, dataDir, agentId, createManager);
+  cache.pgLiteManagerLeaseCounts ??= new Map();
+  cache.pgLiteManagerLeaseCounts.set(
+    manager,
+    (cache.pgLiteManagerLeaseCounts.get(manager) ?? 0) + 1
+  );
+  let released = false;
+
+  return {
+    manager,
+    async release(): Promise<boolean> {
+      if (released) return false;
+      released = true;
+      const count = cache.pgLiteManagerLeaseCounts?.get(manager);
+      if (count === undefined) {
+        return false;
+      }
+      if (count > 1) {
+        cache.pgLiteManagerLeaseCounts?.set(manager, count - 1);
+        return false;
+      }
+
+      cache.pgLiteManagerLeaseCounts?.delete(manager);
+      dropActivePgliteManager(cache, manager);
+      await manager.close();
+      return true;
+    },
+  };
+}
+
 export function getActivePgliteManager<TManager extends ReusablePgliteManager>(
   cache: PgliteManagerCache<TManager>
 ): TManager | undefined {
@@ -99,4 +149,5 @@ export function dropActivePgliteManager<TManager extends ReusablePgliteManager>(
   if (cache.pgLiteClientManager === manager) {
     delete cache.pgLiteClientManager;
   }
+  cache.pgLiteManagerLeaseCounts?.delete(manager);
 }

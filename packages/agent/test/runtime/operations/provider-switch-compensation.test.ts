@@ -13,6 +13,7 @@ import {
   defaultClassifier,
 } from "../../../src/runtime/operations/classifier.ts";
 import { HealthChecker } from "../../../src/runtime/operations/health.ts";
+import { providerSmokeCheck } from "../../../src/runtime/operations/health-checks.ts";
 import { DefaultRuntimeOperationManager } from "../../../src/runtime/operations/manager.ts";
 import { FilesystemRuntimeOperationRepository } from "../../../src/runtime/operations/repository.ts";
 import type { ReloadStrategy } from "../../../src/runtime/operations/types.ts";
@@ -324,6 +325,239 @@ describe("Pi provider-switch restart policy", () => {
     ).not.toContain(submittedSecret);
     expect(JSON.stringify(warn.mock.calls)).not.toContain(submittedSecret);
     warn.mockRestore();
+  });
+
+  it("rejects an unhealthy cold candidate without restarting the surviving runtime", async () => {
+    const oldRuntime = { marker: "old" } as unknown as AgentRuntime;
+    const candidateRuntime = {
+      marker: "candidate",
+    } as unknown as AgentRuntime;
+    let currentRuntime = oldRuntime;
+    let restartAttempts = 0;
+    let published = false;
+    const coldStrategy: ReloadStrategy = {
+      tier: "cold",
+      apply: async (context) => {
+        restartAttempts += 1;
+        await context.validateCandidate?.(candidateRuntime);
+        currentRuntime = candidateRuntime;
+        published = true;
+        return candidateRuntime;
+      },
+    };
+    const healthChecker = new HealthChecker();
+    healthChecker.register({
+      name: "candidate-health",
+      required: true,
+      timeoutMs: 100,
+      run: async () => ({
+        ok: false,
+        code: "provider-credential-missing",
+        reason: "credential detail must be redacted",
+      }),
+    });
+    const restore = vi.fn(async () => {});
+    const manager = new DefaultRuntimeOperationManager({
+      repository,
+      runtime: () => currentRuntime,
+      classifyContext: () => ({ currentProvider: "openai" }),
+      classifier: defaultClassifier,
+      healthChecker,
+      strategies: { cold: coldStrategy },
+    });
+
+    const outcome = await manager.start({
+      intent: {
+        kind: "provider-switch",
+        provider: "pi",
+        primaryModel: "openai/gpt-5.4-mini",
+      },
+      compensation: {
+        restore,
+        restartPreviousRuntime: true,
+        previousRuntimeExpectedTextProvider: true,
+      },
+    });
+    expect(outcome.kind).toBe("accepted");
+    if (outcome.kind !== "accepted") return;
+
+    await waitForStatus(manager, outcome.operation.id, "failed");
+
+    const operation = await manager.get(outcome.operation.id);
+    expect(restartAttempts).toBe(1);
+    expect(published).toBe(false);
+    expect(currentRuntime).toBe(oldRuntime);
+    expect(restore).toHaveBeenCalledTimes(1);
+    expect(operation?.status).toBe("failed");
+    expect(operation?.phases).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "health-check",
+          status: "failed",
+          detail: expect.objectContaining({
+            failed: [
+              expect.objectContaining({
+                code: "provider-credential-missing",
+                reason: "Runtime health check failed",
+              }),
+            ],
+          }),
+        }),
+      ]),
+    );
+    expect(operation?.phases).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "rollback-restart" }),
+      ]),
+    );
+    expect(JSON.stringify(operation)).not.toContain(
+      "credential detail must be redacted",
+    );
+  });
+
+  it("treats a post-validation swap failure as a strategy failure", async () => {
+    const oldRuntime = { marker: "old" } as unknown as AgentRuntime;
+    const candidateRuntime = {
+      marker: "candidate",
+    } as unknown as AgentRuntime;
+    const recoveredRuntime = {
+      marker: "recovered",
+    } as unknown as AgentRuntime;
+    const strategyInputs: AgentRuntime[] = [];
+    let restartAttempts = 0;
+    const coldStrategy: ReloadStrategy = {
+      tier: "cold",
+      apply: async (context) => {
+        restartAttempts += 1;
+        strategyInputs.push(context.runtime);
+        if (restartAttempts === 1) {
+          await context.validateCandidate?.(candidateRuntime);
+          throw new Error("swap failed after candidate validation");
+        }
+        await context.reportPhase({
+          name: "cold-restart",
+          status: "succeeded",
+          startedAt: restartAttempts,
+          finishedAt: restartAttempts,
+        });
+        return recoveredRuntime;
+      },
+    };
+    const restore = vi.fn(async () => {});
+    const manager = new DefaultRuntimeOperationManager({
+      repository,
+      runtime: () => oldRuntime,
+      classifyContext: () => ({ currentProvider: "openai" }),
+      classifier: defaultClassifier,
+      healthChecker: new HealthChecker(),
+      strategies: { cold: coldStrategy },
+    });
+
+    const outcome = await manager.start({
+      intent: {
+        kind: "provider-switch",
+        provider: "pi",
+        primaryModel: "openai/gpt-5.4-mini",
+      },
+      compensation: {
+        restore,
+        restartPreviousRuntime: true,
+      },
+    });
+    expect(outcome.kind).toBe("accepted");
+    if (outcome.kind !== "accepted") return;
+
+    await waitForStatus(manager, outcome.operation.id, "failed");
+
+    const operation = await manager.get(outcome.operation.id);
+    expect(restartAttempts).toBe(2);
+    expect(strategyInputs).toEqual([oldRuntime, oldRuntime]);
+    expect(restore).toHaveBeenCalledTimes(1);
+    expect(operation?.error).toMatchObject({
+      code: "strategy-failed",
+      message: "Runtime restart failed",
+    });
+    expect(operation?.phases).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "health-check", status: "succeeded" }),
+        expect.objectContaining({
+          name: "rollback-restart",
+          status: "succeeded",
+        }),
+      ]),
+    );
+  });
+
+  it("does not require provider smoke for a provider-less restored configuration", async () => {
+    const oldRuntime = { marker: "old" } as unknown as AgentRuntime;
+    const targetUseModel = vi.fn(async () => "target-ok");
+    const rollbackUseModel = vi.fn(async () => {
+      throw new Error("rollback intentionally has no text provider");
+    });
+    const targetRuntime = {
+      marker: "target",
+      getSetting: () => "pi",
+      useModel: targetUseModel,
+    } as unknown as AgentRuntime;
+    const rollbackRuntime = {
+      marker: "rollback",
+      useModel: rollbackUseModel,
+    } as unknown as AgentRuntime;
+    let restartAttempts = 0;
+    const coldStrategy: ReloadStrategy = {
+      tier: "cold",
+      apply: async (context) => {
+        restartAttempts += 1;
+        await context.reportPhase({
+          name: "cold-restart",
+          status: "succeeded",
+          startedAt: restartAttempts,
+          finishedAt: restartAttempts,
+        });
+        return restartAttempts === 1 ? targetRuntime : rollbackRuntime;
+      },
+    };
+    const healthChecker = new HealthChecker();
+    healthChecker.register(providerSmokeCheck);
+    healthChecker.register({
+      name: "target-only-failure",
+      required: true,
+      timeoutMs: 100,
+      run: async (runtime) =>
+        runtime === targetRuntime
+          ? { ok: false, reason: "force compensation" }
+          : { ok: true },
+    });
+    const manager = new DefaultRuntimeOperationManager({
+      repository,
+      runtime: () => oldRuntime,
+      classifyContext: () => ({ currentProvider: undefined }),
+      classifier: defaultClassifier,
+      healthChecker,
+      strategies: { cold: coldStrategy },
+    });
+
+    const outcome = await manager.start({
+      intent: {
+        kind: "provider-switch",
+        provider: "pi",
+        primaryModel: "openai/gpt-5.4-mini",
+      },
+      compensation: {
+        restore: async () => {},
+        restartPreviousRuntime: true,
+        previousRuntimeExpectedTextProvider: false,
+      },
+    });
+    expect(outcome.kind).toBe("accepted");
+    if (outcome.kind !== "accepted") return;
+
+    await waitForStatus(manager, outcome.operation.id, "failed");
+
+    expect(restartAttempts).toBe(2);
+    expect(targetUseModel).toHaveBeenCalledTimes(1);
+    expect(rollbackUseModel).not.toHaveBeenCalled();
+    expect((await manager.get(outcome.operation.id))?.status).toBe("failed");
   });
 
   it("preserves a persistence failure when restoring unaccepted config also fails", async () => {

@@ -6,7 +6,11 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { getElizaCoreEntry, getUiSourceRoot } from "./eliza-package-paths.ts";
+import {
+	getElizaCoreEntry,
+	getSharedSourceRoot,
+	getUiSourceRoot,
+} from "./eliza-package-paths.ts";
 
 const temporaryRoots: string[] = [];
 const repoRoot = path.resolve(
@@ -51,6 +55,22 @@ describe("getElizaCoreEntry", () => {
 });
 
 describe("workspace package source discovery", () => {
+	it("prefers the shared package in the supplied monorepo over a sibling checkout", async () => {
+		const isolatedRepoRoot = await mkdtemp(
+			path.join(os.tmpdir(), "eliza-shared-paths-"),
+		);
+		temporaryRoots.push(isolatedRepoRoot);
+		const sourceRoot = path.join(isolatedRepoRoot, "packages", "shared", "src");
+
+		await mkdir(sourceRoot, { recursive: true });
+		await writeFile(
+			path.join(isolatedRepoRoot, "packages", "shared", "package.json"),
+			'{"name":"@elizaos/shared"}\n',
+		);
+
+		expect(getSharedSourceRoot(isolatedRepoRoot)).toBe(sourceRoot);
+	});
+
 	it("resolves @elizaos/ui to packages/ui/src", () => {
 		expect(realpathSync(getUiSourceRoot(repoRoot) ?? "")).toBe(
 			realpathSync(path.join(repoRoot, "packages/ui/src")),

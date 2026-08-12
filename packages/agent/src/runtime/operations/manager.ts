@@ -352,15 +352,85 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
     }
 
     const runtimeCredentialOverlay = this.runtimeCredentialOverlays.get(id);
+    const healthOptions = {
+      redactFailureDetail,
+      ...(op.intent.kind === "provider-switch"
+        ? { expectedTextProvider: true }
+        : {}),
+    };
+    let candidateHealthStartedAt: number | undefined;
+    let candidateHealthReport: HealthCheckReport | undefined;
+    let candidateHealthError: unknown;
+    const validateCandidate = async (
+      candidateRuntime: AgentRuntime,
+    ): Promise<void> => {
+      candidateHealthStartedAt = Date.now();
+      try {
+        candidateHealthReport = await this.healthChecker.runForRuntime(
+          candidateRuntime,
+          healthOptions,
+        );
+      } catch (cause) {
+        // error-policy:J2 the host must receive only a fixed candidate-rejection
+        // error while the operation boundary records the redacted health phase.
+        candidateHealthError = cause;
+        throw new ElizaError("Replacement runtime health check failed", {
+          code: "RUNTIME_CANDIDATE_HEALTH_FAILED",
+        });
+      }
+      if (!candidateHealthReport.ok) {
+        throw new ElizaError("Replacement runtime health check failed", {
+          code: "RUNTIME_CANDIDATE_HEALTH_FAILED",
+        });
+      }
+    };
     let newRuntime: AgentRuntime;
     try {
       newRuntime = await strategy.apply({
         runtime,
         intent: op.intent,
         ...(runtimeCredentialOverlay ? { runtimeCredentialOverlay } : {}),
+        ...(op.tier === "cold" ? { validateCandidate } : {}),
         reportPhase,
       });
     } catch (err) {
+      if (candidateHealthStartedAt !== undefined) {
+        if (candidateHealthReport) {
+          await this.persistHealthReport(
+            id,
+            candidateHealthStartedAt,
+            candidateHealthReport,
+            redactFailureDetail,
+          );
+        } else {
+          await this.persistThrownHealthFailure(
+            id,
+            candidateHealthStartedAt,
+            candidateHealthError,
+            redactFailureDetail,
+          );
+        }
+      }
+      const candidateRejected =
+        candidateHealthError !== undefined ||
+        candidateHealthReport?.ok === false;
+      if (candidateRejected) {
+        logger.warn(`[runtime-ops] Candidate health check failed for op ${id}`);
+        await this.failOperationWithCompensation(
+          id,
+          {
+            message: candidateHealthError
+              ? "Runtime health check failed"
+              : "Required health checks failed",
+            code: "health-check-failed",
+          },
+          this.runtime() ?? runtime,
+          reportPhase,
+          redactFailureDetail,
+          { previousRuntimeSurvived: true },
+        );
+        return;
+      }
       // error-policy:J1 Pi restart construction can observe submitted
       // credentials, so its operation record and logs retain only a fixed error.
       const message = redactFailureDetail
@@ -379,72 +449,60 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
       return;
     }
 
-    // Health-check gate.
-    const healthStart = Date.now();
-    await this.repository.appendPhase(id, {
-      name: "health-check",
-      status: "running",
-      startedAt: healthStart,
-    });
-
     let report: HealthCheckReport;
-    try {
-      report = await this.healthChecker.runForRuntime(newRuntime, {
-        redactFailureDetail,
-      });
-    } catch (cause) {
-      // error-policy:J1 operation boundary — Pi health failures may originate
-      // after credential projection, so persist/log only fixed failure text.
-      const detail = redactFailureDetail
-        ? "Runtime health check failed"
-        : cause instanceof Error
-          ? cause.message
-          : String(cause);
-      await this.repository.updateLastPhase(id, {
-        status: "failed",
-        finishedAt: Date.now(),
-        error: { message: detail },
-      });
-      logger.warn(`[runtime-ops] Health checker threw for op ${id}: ${detail}`);
-      await this.failOperationWithCompensation(
+    if (candidateHealthReport) {
+      report = candidateHealthReport;
+      await this.persistHealthReport(
         id,
-        {
-          message: redactFailureDetail
-            ? detail
-            : `Health check failed: ${detail}`,
-          code: "health-check-failed",
-        },
-        newRuntime,
-        reportPhase,
+        candidateHealthStartedAt ?? Date.now(),
+        report,
         redactFailureDetail,
       );
-      return;
+    } else {
+      const healthStart = Date.now();
+      try {
+        report = await this.healthChecker.runForRuntime(
+          newRuntime,
+          healthOptions,
+        );
+      } catch (cause) {
+        await this.persistThrownHealthFailure(
+          id,
+          healthStart,
+          cause,
+          redactFailureDetail,
+        );
+        const detail = redactFailureDetail
+          ? "Runtime health check failed"
+          : cause instanceof Error
+            ? cause.message
+            : String(cause);
+        logger.warn(
+          `[runtime-ops] Health checker threw for op ${id}: ${detail}`,
+        );
+        await this.failOperationWithCompensation(
+          id,
+          {
+            message: redactFailureDetail
+              ? detail
+              : `Health check failed: ${detail}`,
+            code: "health-check-failed",
+          },
+          newRuntime,
+          reportPhase,
+          redactFailureDetail,
+        );
+        return;
+      }
+      await this.persistHealthReport(
+        id,
+        healthStart,
+        report,
+        redactFailureDetail,
+      );
     }
-    const healthEnd = Date.now();
 
     if (!report.ok) {
-      await this.repository.updateLastPhase(id, {
-        status: "failed",
-        finishedAt: healthEnd,
-        detail: redactFailureDetail
-          ? {
-              passed: report.passed,
-              failed: report.failed.map(({ name, required, durationMs }) => ({
-                name,
-                required,
-                durationMs,
-                reason: "Runtime health check failed",
-              })),
-            }
-          : {
-              passed: report.passed,
-              failed: report.failed,
-            },
-      });
-      // The cold strategy has already swapped the runtime by the time we
-      // observe a failed health check. Surface the failure; restoring the
-      // previous runtime requires a two-phase restart contract with the API
-      // server restart closure.
       logger.warn(`[runtime-ops] Health check failed for op ${id}`);
       await this.failOperationWithCompensation(
         id,
@@ -459,15 +517,6 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
       return;
     }
 
-    await this.repository.updateLastPhase(id, {
-      status: "succeeded",
-      finishedAt: healthEnd,
-      detail: {
-        passed: report.passed,
-        failed: report.failed,
-      },
-    });
-
     await this.repository.update(id, {
       status: "succeeded",
       finishedAt: Date.now(),
@@ -477,12 +526,66 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
     logger.info(`[runtime-ops] Operation ${id} succeeded`);
   }
 
+  private async persistThrownHealthFailure(
+    id: string,
+    startedAt: number,
+    cause: unknown,
+    redactFailureDetail: boolean,
+  ): Promise<void> {
+    const detail = redactFailureDetail
+      ? "Runtime health check failed"
+      : cause instanceof Error
+        ? cause.message
+        : String(cause);
+    await this.repository.appendPhase(id, {
+      name: "health-check",
+      status: "failed",
+      startedAt,
+      finishedAt: Date.now(),
+      error: { message: detail },
+    });
+  }
+
+  private async persistHealthReport(
+    id: string,
+    startedAt: number,
+    report: HealthCheckReport,
+    redactFailureDetail: boolean,
+  ): Promise<void> {
+    await this.repository.appendPhase(id, {
+      name: "health-check",
+      status: report.ok ? "succeeded" : "failed",
+      startedAt,
+      finishedAt: Date.now(),
+      detail: redactFailureDetail
+        ? {
+            passed: report.passed,
+            skipped: report.skipped,
+            failed: report.failed.map(
+              ({ name, required, code, durationMs }) => ({
+                name,
+                required,
+                ...(code ? { code } : {}),
+                durationMs,
+                reason: "Runtime health check failed",
+              }),
+            ),
+          }
+        : {
+            passed: report.passed,
+            skipped: report.skipped,
+            failed: report.failed,
+          },
+    });
+  }
+
   private async failOperationWithCompensation(
     id: string,
     error: OperationError,
     runtime: AgentRuntime | null,
     reportPhase: (phase: OperationPhase) => Promise<void>,
     piTransaction: boolean,
+    recoveryOptions: { previousRuntimeSurvived?: boolean } = {},
   ): Promise<void> {
     const compensation = this.compensations.get(id);
     this.compensations.delete(id);
@@ -528,7 +631,10 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
     }
 
     let rollbackFailed = false;
-    if (compensation.restartPreviousRuntime) {
+    if (
+      compensation.restartPreviousRuntime &&
+      !recoveryOptions.previousRuntimeSurvived
+    ) {
       const coldStrategy = this.strategies.cold;
       if (!runtime || !coldStrategy) {
         rollbackFailed = true;
@@ -562,7 +668,11 @@ export class DefaultRuntimeOperationManager implements RuntimeOperationManager {
             try {
               const rollbackHealth = await this.healthChecker.runForRuntime(
                 rollbackRuntime,
-                { redactFailureDetail: true },
+                {
+                  redactFailureDetail: true,
+                  expectedTextProvider:
+                    compensation.previousRuntimeExpectedTextProvider ?? true,
+                },
               );
               rollbackFailed = !rollbackHealth.ok;
             } catch {

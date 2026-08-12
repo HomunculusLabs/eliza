@@ -212,10 +212,30 @@ export interface RuntimeOperationRepository {
 
 export type HealthCheckResult =
   | { ok: true }
-  | { ok: false; reason: string; cause?: unknown };
+  | {
+      ok: false;
+      reason: string;
+      /** Stable health-owned category safe to persist across redaction. */
+      code?: HealthCheckFailureCode;
+      cause?: unknown;
+    };
+
+export type HealthCheckFailureCode =
+  | "runtime-invalid"
+  | "service-failed"
+  | "database-unavailable"
+  | "provider-credential-missing"
+  | "provider-configuration-invalid"
+  | "provider-policy-rejected"
+  | "provider-quota-exhausted"
+  | "provider-unreachable";
+
+export type HealthCheckCapability = "text-generation";
 
 export interface HealthCheck {
   name: string;
+  /** Capability this check validates, when applicability is policy-driven. */
+  capability?: HealthCheckCapability;
   /**
    * Required checks block promotion. Optional checks are reported in the
    * operation phase detail but do not fail the operation.
@@ -228,9 +248,11 @@ export interface HealthCheck {
 
 export interface HealthCheckReport {
   passed: readonly { name: string; durationMs: number }[];
+  skipped: readonly { name: string; reason: string }[];
   failed: readonly {
     name: string;
     required: boolean;
+    code?: HealthCheckFailureCode;
     reason: string;
     durationMs: number;
   }[];
@@ -247,9 +269,15 @@ export interface ReloadContext {
   intent: OperationIntent;
   /** Accepted-only secret projection; never serialized with the operation. */
   runtimeCredentialOverlay?: RuntimeCredentialOverlay;
+  /** Validates a cold candidate before the host publishes it. */
+  validateCandidate?: RuntimeCandidateValidator;
   /** Phase reporter — call for every meaningful step inside a strategy. */
   reportPhase: (phase: OperationPhase) => Promise<void>;
 }
+
+export type RuntimeCandidateValidator = (
+  runtime: AgentRuntime,
+) => Promise<void>;
 
 export interface ReloadStrategy {
   tier: ReloadTier;
@@ -273,6 +301,8 @@ export interface OperationCompensation {
    * previous config gets one runtime-recovery attempt.
    */
   restartPreviousRuntime?: boolean;
+  /** Whether the restored configuration promises a text-generation provider. */
+  previousRuntimeExpectedTextProvider?: boolean;
 }
 
 export interface StartOperationRequest {

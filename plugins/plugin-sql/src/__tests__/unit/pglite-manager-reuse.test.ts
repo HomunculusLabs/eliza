@@ -7,6 +7,8 @@
  */
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  acquirePgliteManagerForAgent,
+  dropActivePgliteManager,
   getActivePgliteManager,
   getOrCreatePgliteManagerForAgent,
   type PgliteManagerCache,
@@ -16,9 +18,15 @@ class FakeManager {
   constructor(readonly label: string) {}
 
   shuttingDown = false;
+  closeCalls = 0;
 
   isShuttingDown(): boolean {
     return this.shuttingDown;
+  }
+
+  async close(): Promise<void> {
+    this.closeCalls += 1;
+    this.shuttingDown = true;
   }
 }
 
@@ -69,5 +77,41 @@ describe("PGlite manager reuse", () => {
     expect(second).not.toBe(first);
     expect(getActivePgliteManager(cache)).toBe(second);
     expect(created).toHaveLength(2);
+  });
+
+  it("keeps a shared manager alive until the final adapter lease releases", async () => {
+    const agentId = "00000000-0000-4000-8000-000000000001";
+    const createManager = () => {
+      const manager = new FakeManager(`:memory::${agentId}`);
+      created.push(manager);
+      return manager;
+    };
+    const first = acquirePgliteManagerForAgent(cache, ":memory:", agentId, createManager);
+    const second = acquirePgliteManagerForAgent(cache, ":memory:", agentId, createManager);
+
+    expect(second.manager).toBe(first.manager);
+    await expect(first.release()).resolves.toBe(false);
+    expect(first.manager.closeCalls).toBe(0);
+    expect(getActivePgliteManager(cache)).toBe(first.manager);
+
+    await expect(second.release()).resolves.toBe(true);
+    expect(first.manager.closeCalls).toBe(1);
+    expect(getActivePgliteManager(cache)).toBeUndefined();
+    await expect(second.release()).resolves.toBe(false);
+    expect(first.manager.closeCalls).toBe(1);
+  });
+
+  it("does not close a force-dropped manager again when leases release", async () => {
+    const agentId = "00000000-0000-4000-8000-000000000001";
+    const createManager = () => new FakeManager(`:memory::${agentId}`);
+    const first = acquirePgliteManagerForAgent(cache, ":memory:", agentId, createManager);
+    const second = acquirePgliteManagerForAgent(cache, ":memory:", agentId, createManager);
+
+    await first.manager.close();
+    dropActivePgliteManager(cache, first.manager);
+
+    await expect(first.release()).resolves.toBe(false);
+    await expect(second.release()).resolves.toBe(false);
+    expect(first.manager.closeCalls).toBe(1);
   });
 });

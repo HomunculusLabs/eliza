@@ -13,6 +13,7 @@ import type { ReadJsonBodyOptions } from "@elizaos/shared";
 import {
   normalizeFirstRunProviderId,
   PostProviderSwitchRequestSchema,
+  resolveServiceRoutingInConfig,
 } from "@elizaos/shared";
 import type { SecretsManager } from "@elizaos/vault";
 import type { ElizaConfig } from "../config/config.ts";
@@ -172,6 +173,10 @@ export async function handleProviderSwitchRoutes(
             )
           : undefined;
       let piSnapshot: ProviderSwitchStateSnapshot | undefined;
+      const previousRuntimeExpectedTextProvider = Boolean(
+        resolveServiceRoutingInConfig(state.config as Record<string, unknown>)
+          ?.llmText,
+      );
       let piVaultSnapshot: ProviderApiKeySnapshot | undefined;
       let piSecrets: SecretsManager | undefined;
       const restorePiState = async (): Promise<void> => {
@@ -221,6 +226,7 @@ export async function handleProviderSwitchRoutes(
               compensation: {
                 restore: restorePiState,
                 restartPreviousRuntime: true,
+                previousRuntimeExpectedTextProvider,
               },
             }
           : {}),

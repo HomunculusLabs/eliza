@@ -20,9 +20,9 @@ import {
 import { PgliteDatabaseAdapter } from "./pglite/adapter";
 import { PGliteClientManager } from "./pglite/manager";
 import {
+  acquirePgliteManagerForAgent,
   type ClosePgliteSingletonResult,
   dropActivePgliteManager,
-  getOrCreatePgliteManagerForAgent,
   type PgliteManagerCache,
   type PgliteSingletonCache,
 } from "./pglite/manager-cache";
@@ -43,17 +43,17 @@ if (!globalSymbols[GLOBAL_SINGLETONS]) {
 }
 const globalSingletons = globalSymbols[GLOBAL_SINGLETONS];
 
-function getOrCreatePgliteManager(agentId: UUID): PGliteClientManager {
-  return getOrCreatePgliteManagerForAgent(globalSingletons, undefined, agentId, () => {
-    return new PGliteClientManager({ agentId });
-  });
-}
-
 export function createDatabaseAdapter(
   _config: { dataDir?: string },
   agentId: UUID
 ): IDatabaseAdapter {
-  return new PgliteDatabaseAdapter(agentId, getOrCreatePgliteManager(agentId));
+  const lease = acquirePgliteManagerForAgent(
+    globalSingletons,
+    undefined,
+    agentId,
+    () => new PGliteClientManager({ agentId })
+  );
+  return new PgliteDatabaseAdapter(agentId, lease.manager, lease.release);
 }
 
 /**

@@ -299,12 +299,30 @@ describe("POST /api/provider/switch for Pi", () => {
     expect(harness.saveElizaConfig).toHaveBeenCalledTimes(1);
     expect(harness.capturedRequest()?.compensation).toMatchObject({
       restartPreviousRuntime: true,
+      previousRuntimeExpectedTextProvider: true,
     });
     expect(harness.preparedIntent()).toEqual({
       kind: "provider-switch",
       provider: "pi",
       primaryModel: "openai/models/gpt-5:preview",
       credentialProvider: "openai",
+    });
+  });
+
+  it("marks a provider-less previous configuration for rollback health policy", async () => {
+    const harness = createHarness({
+      body: {
+        provider: "pi",
+        primaryModel: "openai/gpt-5.4-mini",
+        credentialProvider: "openai",
+      },
+      config: {} as ElizaConfig,
+    });
+
+    expect(await handleProviderSwitchRoutes(harness.context)).toBe(true);
+    expect(harness.capturedRequest()?.compensation).toMatchObject({
+      restartPreviousRuntime: true,
+      previousRuntimeExpectedTextProvider: false,
     });
   });
 

@@ -1,10 +1,10 @@
 /**
  * HealthChecker — the runtime-operations health gate.
  *
- * Reload strategies (hot/warm/cold) call `runForRuntime(newRuntime)` after
- * applying their change. Promotion to primary is allowed only when every
- * REQUIRED check passes. Optional checks surface in the report's `failed[]`
- * but never flip `ok` to false.
+ * Hot/warm strategies call `runForRuntime(newRuntime)` after applying their
+ * change. Cold hosts invoke it against an initialized candidate before
+ * publication. Promotion is allowed only when every REQUIRED check passes.
+ * Optional checks surface in `failed[]` but never flip `ok` to false.
  *
  * Execution model:
  *   - All registered checks run in parallel (Promise.allSettled).
@@ -19,6 +19,7 @@ import { type AgentRuntime, logger } from "@elizaos/core";
 import { builtInHealthChecks, describeError } from "./health-checks.ts";
 import type {
   HealthCheck,
+  HealthCheckFailureCode,
   HealthCheckReport,
   HealthCheckResult,
 } from "./types.ts";
@@ -35,6 +36,8 @@ interface CheckOutcome {
 export interface HealthCheckRunOptions {
   /** Replace arbitrary check reasons before they reach logs or operation JSON. */
   redactFailureDetail?: boolean;
+  /** Whether the configuration being validated promises a text provider. */
+  expectedTextProvider?: boolean;
 }
 
 export class HealthChecker {
@@ -70,9 +73,22 @@ export class HealthChecker {
     runtime: AgentRuntime,
     options: HealthCheckRunOptions = {},
   ): Promise<HealthCheckReport> {
-    const registered = Array.from(this.checks.values());
+    const skipped: { name: string; reason: string }[] = [];
+    const registered = Array.from(this.checks.values()).filter((check) => {
+      if (
+        check.capability === "text-generation" &&
+        options.expectedTextProvider === false
+      ) {
+        skipped.push({
+          name: check.name,
+          reason: "text provider is not expected by this configuration",
+        });
+        return false;
+      }
+      return true;
+    });
     if (registered.length === 0) {
-      return { passed: [], failed: [], ok: true };
+      return { passed: [], skipped, failed: [], ok: true };
     }
 
     const settled = await Promise.allSettled(
@@ -83,6 +99,7 @@ export class HealthChecker {
     const failed: {
       name: string;
       required: boolean;
+      code?: HealthCheckFailureCode;
       reason: string;
       durationMs: number;
     }[] = [];
@@ -97,6 +114,7 @@ export class HealthChecker {
           failed.push({
             name,
             required,
+            ...(result.code ? { code: result.code } : {}),
             reason: options.redactFailureDetail
               ? "Runtime health check failed"
               : result.reason,
@@ -133,7 +151,7 @@ export class HealthChecker {
       );
     }
 
-    return { passed, failed, ok };
+    return { passed, skipped, failed, ok };
   }
 }
 

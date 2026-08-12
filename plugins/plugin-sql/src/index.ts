@@ -44,10 +44,10 @@ import {
   type PgliteSyncTableStatus,
 } from "./pglite/manager";
 import {
+  acquirePgliteManagerForAgent,
   type ClosePgliteSingletonResult,
   dropActivePgliteManager,
   getActivePgliteManager,
-  getOrCreatePgliteManagerForAgent,
   type PgliteManagerCache,
   type PgliteSingletonCache,
 } from "./pglite/manager-cache";
@@ -162,11 +162,14 @@ export function createDatabaseAdapter(
     mkdirSync(dataDir, { recursive: true });
   }
 
-  const manager = getOrCreatePgliteManagerForAgent(globalSingletons, dataDir, agentId, () => {
-    return new PGliteClientManager({ dataDir, agentId });
-  });
+  const lease = acquirePgliteManagerForAgent(
+    globalSingletons,
+    dataDir,
+    agentId,
+    () => new PGliteClientManager({ dataDir, agentId })
+  );
 
-  return new PgliteDatabaseAdapter(agentId, manager);
+  return new PgliteDatabaseAdapter(agentId, lease.manager, lease.release);
 }
 
 export const plugin: Plugin = {

@@ -330,6 +330,7 @@ import {
   defaultClassifier,
   getDefaultHealthChecker,
   getDefaultRepository,
+  type RuntimeCandidateValidator,
   type RuntimeCredentialOverlay,
   type RuntimeOperationManager,
 } from "../runtime/operations/index.ts";
@@ -1259,6 +1260,8 @@ const resolvePluginConfigMutationRejections =
 export interface RuntimeRestartOptions {
   /** Opaque provider credential projected only into the replacement runtime. */
   runtimeCredentialOverlay?: RuntimeCredentialOverlay;
+  /** Required cold-candidate gate that runs before publication. */
+  validateCandidate?: RuntimeCandidateValidator;
 }
 
 type RuntimeRestartHandler = (
@@ -1372,10 +1375,19 @@ function getOrCreateRuntimeOperationManager(
   const repository = getDefaultRepository();
   const healthChecker = getDefaultHealthChecker();
   const coldStrategy = createColdStrategy({
-    restartRuntime: async (reason, runtimeCredentialOverlay) => {
+    restartRuntime: async (
+      reason,
+      runtimeCredentialOverlay,
+      validateCandidate,
+    ) => {
       const ok = await restartRuntime(
         reason,
-        runtimeCredentialOverlay ? { runtimeCredentialOverlay } : undefined,
+        runtimeCredentialOverlay || validateCandidate
+          ? {
+              ...(runtimeCredentialOverlay ? { runtimeCredentialOverlay } : {}),
+              ...(validateCandidate ? { validateCandidate } : {}),
+            }
+          : undefined,
       );
       if (!ok) return null;
       return state.runtime;
@@ -1642,7 +1654,16 @@ async function handleRequest(
       state.model = detectRuntimeModel(newRuntime, state.config);
       state.startedAt = Date.now();
       state.pendingRestartReasons = [];
-      ctx.onRuntimeSwapped?.();
+      try {
+        ctx.onRuntimeSwapped?.();
+      } catch (err) {
+        // error-policy:J7 publication already succeeded; diagnostic callback
+        // failure must not make callers compensate a healthy active runtime.
+        newRuntime.reportError("api.restart.runtimeSwappedCallback", err);
+        logger.warn(
+          `[eliza-api] Runtime-swapped callback failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
       try {
         await ctx.onRuntimeActivated?.(previousRuntime, newRuntime);
       } catch (err) {

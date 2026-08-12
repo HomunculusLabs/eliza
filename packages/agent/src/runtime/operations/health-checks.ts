@@ -15,7 +15,11 @@
 import { type AgentRuntime, logger, ModelType } from "@elizaos/core";
 import { isInsufficientCreditsError } from "../../api/credit-detection.ts";
 import { probeRuntimeDatabaseLiveness } from "../../api/database-liveness.ts";
-import type { HealthCheck, HealthCheckResult } from "./types.ts";
+import type {
+  HealthCheck,
+  HealthCheckFailureCode,
+  HealthCheckResult,
+} from "./types.ts";
 
 const LOG_PREFIX = "[runtime-ops:health-checks]";
 
@@ -44,6 +48,27 @@ export function describeError(err: unknown): string {
   }
 }
 
+function providerFailureCode(
+  err: unknown,
+): Extract<HealthCheckFailureCode, `provider-${string}`> {
+  const code = (err as { code?: unknown } | null)?.code;
+  if (code === "PI_CREDENTIAL_MISSING") {
+    return "provider-credential-missing";
+  }
+  if (
+    code === "PI_MODEL_NOT_CONFIGURED" ||
+    code === "PI_INVALID_MODEL_ID" ||
+    code === "PI_UNKNOWN_PROVIDER"
+  ) {
+    return "provider-configuration-invalid";
+  }
+  const message = describeError(err);
+  if (message.includes("[trajectory-strict]")) {
+    return "provider-policy-rejected";
+  }
+  return "provider-unreachable";
+}
+
 // ---------------------------------------------------------------------------
 // runtimeReadyCheck — character + agentId populated.
 // ---------------------------------------------------------------------------
@@ -54,20 +79,36 @@ export const runtimeReadyCheck: HealthCheck = {
   timeoutMs: 1000,
   async run(runtime: AgentRuntime): Promise<HealthCheckResult> {
     if (!runtime || typeof runtime !== "object") {
-      return { ok: false, reason: "runtime is not an object" };
+      return {
+        ok: false,
+        code: "runtime-invalid",
+        reason: "runtime is not an object",
+      };
     }
     const agentId = runtime.agentId;
     if (typeof agentId !== "string" || agentId.length === 0) {
-      return { ok: false, reason: "runtime.agentId is empty" };
+      return {
+        ok: false,
+        code: "runtime-invalid",
+        reason: "runtime.agentId is empty",
+      };
     }
     const character = runtime.character;
     if (!character || typeof character !== "object") {
-      return { ok: false, reason: "runtime.character is missing" };
+      return {
+        ok: false,
+        code: "runtime-invalid",
+        reason: "runtime.character is missing",
+      };
     }
     const name =
       typeof character.name === "string" ? character.name.trim() : "";
     if (name.length === 0) {
-      return { ok: false, reason: "runtime.character.name is empty" };
+      return {
+        ok: false,
+        code: "runtime-invalid",
+        reason: "runtime.character.name is empty",
+      };
     }
     return { ok: true };
   },
@@ -106,6 +147,7 @@ export const essentialServicesCheck: HealthCheck = {
       if (status === "failed") {
         return {
           ok: false,
+          code: "service-failed",
           reason: `service ${type} is in failed state`,
         };
       }
@@ -128,6 +170,7 @@ export const dbConnectionCheck: HealthCheck = {
     if (liveness.status === "unknown") return { ok: true };
     return {
       ok: false,
+      code: "database-unavailable",
       reason: `${liveness.status}: ${liveness.message ?? "database probe failed"}`,
     };
   },
@@ -140,6 +183,7 @@ export const dbConnectionCheck: HealthCheck = {
 
 export const providerSmokeCheck: HealthCheck = {
   name: "provider-smoke",
+  capability: "text-generation",
   required: true,
   timeoutMs: 5000,
   async run(runtime: AgentRuntime): Promise<HealthCheckResult> {
@@ -148,18 +192,29 @@ export const providerSmokeCheck: HealthCheck = {
       return { ok: true };
     }
     try {
+      const configuredProvider = runtime.getSetting("ELIZA_BRAIN_PROVIDER");
+      const expectedProvider =
+        typeof configuredProvider === "string" &&
+        configuredProvider.trim().length > 0
+          ? configuredProvider.trim()
+          : undefined;
       // Tiny, deterministic prompt with a hard 1-token cap. Empty completions
       // still count as "model responded" — we only need transport health.
-      await runtime.useModel(ModelType.TEXT_SMALL, {
-        prompt: "ping",
-        maxTokens: 1,
-        temperature: 0,
-      });
+      await runtime.useModel(
+        ModelType.TEXT_SMALL,
+        {
+          prompt: "ping",
+          maxTokens: 1,
+          temperature: 0,
+        },
+        expectedProvider,
+      );
       return { ok: true };
     } catch (err) {
       if (isInsufficientCreditsError(err)) {
         return {
           ok: false,
+          code: "provider-quota-exhausted",
           reason: "provider quota exhausted",
           cause: err,
         };
@@ -173,6 +228,7 @@ export const providerSmokeCheck: HealthCheck = {
       }
       return {
         ok: false,
+        code: providerFailureCode(err),
         reason: `provider unreachable: ${describeError(err)}`,
         cause: err,
       };

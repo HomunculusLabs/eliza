@@ -1611,6 +1611,11 @@ type RuntimeAdapterWithClose = {
   close?: () => Promise<void> | void;
 };
 
+type ShutdownRuntimeOptions = RuntimeStopOptions & {
+  /** Candidate disposal must not stop process-owned telemetry for the live runtime. */
+  preserveHostResources?: boolean;
+};
+
 // Discord's bounded connector teardown may use 10 s for turn drain and 2 s
 // for reaction reconciliation. Keep signal shutdown fast/concurrent while
 // granting that contract a small cleanup margin under the dev supervisor's
@@ -1627,17 +1632,19 @@ const SIGNAL_SERVICE_STOP_TIMEOUT_MS = 13_000;
 export async function shutdownRuntime(
   runtime: AgentRuntime | null | undefined,
   context: string,
-  options: RuntimeStopOptions = {},
+  options: ShutdownRuntimeOptions = {},
 ): Promise<void> {
   let firstError: unknown = null;
 
-  try {
-    await stopMemorySampler();
-  } catch (err) {
-    firstError = err;
-    logger.warn(
-      `[eliza] ${context}: memory telemetry flush failed: ${formatError(err)}`,
-    );
+  if (!options.preserveHostResources) {
+    try {
+      await stopMemorySampler();
+    } catch (err) {
+      firstError = err;
+      logger.warn(
+        `[eliza] ${context}: memory telemetry flush failed: ${formatError(err)}`,
+      );
+    }
   }
 
   if (!runtime) {
@@ -3818,25 +3825,51 @@ export async function bootEliza(
 export async function buildInitializedRuntime(
   options: BuildInitializedRuntimeOptions,
 ): Promise<AgentRuntime> {
-  const result = await bootEliza({
+  let createdRuntime: AgentRuntime | undefined;
+  const boot = bootEliza({
     headless: true,
     configOverride: options.config,
     abortSignal: options.abortSignal,
     runtimeCredentialOverlay: options.runtimeCredentialOverlay,
     localAgentMode: options.localAgentMode,
     onBootPhase: options.onBootPhase,
-    onRuntimeCreated: options.onRuntimeCreated,
+    onRuntimeCreated: (runtime) => {
+      createdRuntime = runtime;
+      options.onRuntimeCreated?.(runtime);
+    },
   });
-  if (result.mode === "cloud") {
-    throw new ElizaError(
-      "A local runtime replacement cannot switch to cloud thin-client mode",
-      {
-        code: "LOCAL_RUNTIME_REPLACEMENT_RESOLVED_TO_CLOUD",
-        severity: "fatal",
-      },
-    );
+  try {
+    const result = await boot;
+    if (result.mode === "cloud") {
+      throw new ElizaError(
+        "A local runtime replacement cannot switch to cloud thin-client mode",
+        {
+          code: "LOCAL_RUNTIME_REPLACEMENT_RESOLVED_TO_CLOUD",
+          severity: "fatal",
+        },
+      );
+    }
+    return result.runtime;
+  } catch (bootError) {
+    if (createdRuntime) {
+      try {
+        await shutdownRuntime(createdRuntime, "incomplete replacement boot", {
+          fast: true,
+          preserveHostResources: true,
+        });
+      } catch (shutdownError) {
+        // error-policy:J2 preserve both candidate boot and cleanup failures.
+        throw new ElizaError(
+          "Replacement runtime boot and cleanup both failed",
+          {
+            code: "RUNTIME_REPLACEMENT_BOOT_CLEANUP_FAILED",
+            cause: new AggregateError([bootError, shutdownError]),
+          },
+        );
+      }
+    }
+    throw bootError;
   }
-  return result.runtime;
 }
 
 /** Starts an agent at a process boundary and owns SIGINT/SIGTERM translation. */
@@ -6173,15 +6206,36 @@ export async function startEliza(
       skipListen: skipApiListen,
       onRestart: async (restartOptions) => {
         logger.info("[eliza] Hot-reload: building replacement runtime...");
+        let replacement: AgentRuntime | null = null;
         try {
-          const replacement = await buildInitializedRuntime({
+          replacement = await buildInitializedRuntime({
             config: loadElizaConfig(),
             localAgentMode: opts?.localAgentMode,
             runtimeCredentialOverlay: restartOptions?.runtimeCredentialOverlay,
           });
+          await restartOptions?.validateCandidate?.(replacement);
           logger.info("[eliza] Hot-reload: replacement runtime is ready");
           return replacement;
         } catch (err) {
+          if (replacement) {
+            try {
+              await shutdownRuntime(
+                replacement,
+                "rejected replacement cleanup",
+                { fast: true, preserveHostResources: true },
+              );
+            } catch (cleanupError) {
+              // error-policy:J6 candidate rejection must preserve the active
+              // runtime even when best-effort candidate cleanup reports an error.
+              runtime.reportError(
+                "eliza.hotReload.disposeRejectedReplacement",
+                cleanupError,
+              );
+              logger.warn(
+                `[eliza] Rejected replacement cleanup failed: ${formatError(cleanupError)}`,
+              );
+            }
+          }
           runtime.reportError("eliza.hotReload.buildReplacement", err);
           logger.error(`[eliza] Hot-reload failed: ${formatError(err)}`);
           return null;

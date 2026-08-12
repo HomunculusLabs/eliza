@@ -12,6 +12,7 @@ import type {
   OperationIntent,
   ReloadContext,
   ReloadStrategy,
+  RuntimeCandidateValidator,
 } from "./types.ts";
 
 export interface ColdStrategyOptions {
@@ -22,6 +23,7 @@ export interface ColdStrategyOptions {
   restartRuntime: (
     reason: string,
     runtimeCredentialOverlay?: ReloadContext["runtimeCredentialOverlay"],
+    validateCandidate?: RuntimeCandidateValidator,
   ) => Promise<AgentRuntime | null>;
 }
 
@@ -35,6 +37,7 @@ export function createColdStrategy(opts: ColdStrategyOptions): ReloadStrategy {
       const newRuntime = await restartRuntime(
         describeIntent(ctx.intent),
         ctx.runtimeCredentialOverlay,
+        ctx.validateCandidate,
       );
       const finishedAt = Date.now();
 

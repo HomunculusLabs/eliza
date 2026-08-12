@@ -27,12 +27,19 @@ import type { PGliteClientManager } from "./manager";
 
 export class PgliteDatabaseAdapter extends BaseDrizzleAdapter {
   private manager: PGliteClientManager;
+  private readonly releaseManager?: () => Promise<unknown>;
+  private closed = false;
   protected embeddingDimension: EmbeddingDimensionColumn = DIMENSION_MAP[384];
   protected readonly databaseBackend = "pglite";
 
-  constructor(agentId: UUID, manager: PGliteClientManager) {
+  constructor(
+    agentId: UUID,
+    manager: PGliteClientManager,
+    releaseManager?: () => Promise<unknown>
+  ) {
     super(agentId);
     this.manager = manager;
+    this.releaseManager = releaseManager;
     // The PGlite class identity differs across @electric-sql/pglite minor
     // versions when this workspace is nested under a parent that pins an
     // older copy. Type the call site explicitly; the runtime
@@ -137,6 +144,12 @@ export class PgliteDatabaseAdapter extends BaseDrizzleAdapter {
   }
 
   async close() {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.releaseManager) {
+      await this.releaseManager();
+      return;
+    }
     await this.manager.close();
   }
 
