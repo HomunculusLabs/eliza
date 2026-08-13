@@ -1,6 +1,9 @@
-// Exercises the gateway-webhook internal auth path with deterministic cloud service fixtures.
+/**
+ * Exercises gateway-webhook internal auth with deterministic request and environment fixtures.
+ */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  assertForwarderSecretConfigured,
   enforceForwarderSecret,
   validateInternalSecret,
 } from "../src/internal-auth";
@@ -72,8 +75,8 @@ describe("validateInternalSecret", () => {
 
 // enforceForwarderSecret gates the public webhook routes (finding L3, #12878).
 // Uses the DEDICATED ELIZA_APP_WEBHOOK_GATEWAY_SECRET (decoupled from the
-// internal-event GATEWAY_INTERNAL_SECRET). Fail-closed when the dedicated secret
-// is configured; backward-compatible no-op when not.
+// internal-event GATEWAY_INTERNAL_SECRET). The forwarded project always fails
+// closed, including when the dedicated secret is absent.
 describe("enforceForwarderSecret", () => {
   const originalForwarder = process.env.ELIZA_APP_WEBHOOK_GATEWAY_SECRET;
   const originalInternal = process.env.GATEWAY_INTERNAL_SECRET;
@@ -107,24 +110,39 @@ describe("enforceForwarderSecret", () => {
     });
   }
 
-  test("no forwarder secret configured => gate is a no-op (allows traffic)", () => {
+  test("no forwarder secret configured => forwarded project is rejected", () => {
     delete process.env.ELIZA_APP_WEBHOOK_GATEWAY_SECRET;
     expect(enforceForwarderSecret(webhookRequest(), FORWARDED_PROJECT)).toBe(
-      true,
+      false,
     );
     expect(
       enforceForwarderSecret(webhookRequest("anything"), FORWARDED_PROJECT),
-    ).toBe(true);
+    ).toBe(false);
   });
 
-  test("internal-event secret alone does NOT enable the gate (decoupled)", () => {
-    // Deployments that only set GATEWAY_INTERNAL_SECRET (for /internal/event)
-    // must keep serving direct provider webhooks unchanged.
+  test("internal-event secret alone does not satisfy the forwarder gate", () => {
     delete process.env.ELIZA_APP_WEBHOOK_GATEWAY_SECRET;
     process.env.GATEWAY_INTERNAL_SECRET = "internal-only";
     expect(enforceForwarderSecret(webhookRequest(), FORWARDED_PROJECT)).toBe(
-      true,
+      false,
     );
+  });
+
+  test("startup assertion rejects missing and blank forwarder secrets", () => {
+    delete process.env.ELIZA_APP_WEBHOOK_GATEWAY_SECRET;
+    expect(() => assertForwarderSecretConfigured()).toThrow(
+      "ELIZA_APP_WEBHOOK_GATEWAY_SECRET is required",
+    );
+
+    process.env.ELIZA_APP_WEBHOOK_GATEWAY_SECRET = "  \n";
+    expect(() => assertForwarderSecretConfigured()).toThrow(
+      "ELIZA_APP_WEBHOOK_GATEWAY_SECRET is required",
+    );
+  });
+
+  test("startup assertion accepts a nonblank forwarder secret", () => {
+    process.env.ELIZA_APP_WEBHOOK_GATEWAY_SECRET = " forwarder-secret ";
+    expect(() => assertForwarderSecretConfigured()).not.toThrow();
   });
 
   test("forwarder secret configured + valid header => allowed", () => {

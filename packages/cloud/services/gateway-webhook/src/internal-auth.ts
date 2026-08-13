@@ -1,4 +1,6 @@
-// Handles webhook gateway internal auth behavior for authenticated connector fan-in.
+/**
+ * Enforces internal-event and BFF-forwarder authentication for webhook gateway ingress.
+ */
 import { timingSafeEqual } from "node:crypto";
 import { logger } from "./logger";
 
@@ -83,7 +85,7 @@ const FORWARDED_PROJECT =
   (process.env.ELIZA_APP_WEBHOOK_PROJECT ?? "eliza-app").trim() || "eliza-app";
 
 /**
- * Optional BFF-forwarder gate for the public webhook routes (finding L3,
+ * BFF-forwarder gate for the public webhook routes (finding L3,
  * #12878 / #12227). The eliza-app BFF forwarder stamps
  * `X-Eliza-Webhook-Forwarder-Secret` (from `ELIZA_APP_WEBHOOK_GATEWAY_SECRET`)
  * on every forwarded webhook call. When that secret is configured the gateway
@@ -97,11 +99,9 @@ const FORWARDED_PROJECT =
  * gated. Other projects/tenants that post directly with valid provider auth are
  * never blocked.
  *
- * Backward-compatible by design: when `ELIZA_APP_WEBHOOK_GATEWAY_SECRET` is NOT
- * set the gate is a no-op (returns true), so existing deployments — including
- * ones that already use `GATEWAY_INTERNAL_SECRET` for internal events — keep
- * working unchanged. Setting the dedicated secret is the opt-in that turns on
- * fail-closed BFF-only enforcement for the forwarded project.
+ * The service validates `ELIZA_APP_WEBHOOK_GATEWAY_SECRET` during startup. This
+ * function also rejects the forwarded project when the value is absent so a
+ * direct module caller cannot silently downgrade the trust boundary.
  *
  * The comparison is constant-time and always runs (even with empty inputs) to
  * avoid leaking, via timing, whether the secret is configured.
@@ -118,13 +118,15 @@ export function enforceForwarderSecret(
   // (readStringEnv() -> value.trim()). Comparing the raw env here would 401
   // every forward when the secret mount has a trailing newline/whitespace.
   const secret = (process.env.ELIZA_APP_WEBHOOK_GATEWAY_SECRET ?? "").trim();
-  // No dedicated secret configured ⇒ feature off ⇒ do not break existing traffic.
-  if (!secret) {
-    return true;
-  }
   // Only the forwarded project is gated; other tenants pass through untouched.
   if (project !== FORWARDED_PROJECT) {
     return true;
+  }
+  if (!secret) {
+    logger.warn(
+      "Forwarder auth rejected: ELIZA_APP_WEBHOOK_GATEWAY_SECRET not configured",
+    );
+    return false;
   }
 
   // The header is stamped by us (already trimmed), but trim defensively so a
@@ -155,4 +157,13 @@ export function enforceForwarderSecret(
   }
 
   return true;
+}
+
+/**
+ * Fails gateway startup unless the BFF forwarder trust secret is configured.
+ */
+export function assertForwarderSecretConfigured(): void {
+  if (!(process.env.ELIZA_APP_WEBHOOK_GATEWAY_SECRET ?? "").trim()) {
+    throw new Error("ELIZA_APP_WEBHOOK_GATEWAY_SECRET is required");
+  }
 }

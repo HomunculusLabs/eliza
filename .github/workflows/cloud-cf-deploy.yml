@@ -566,6 +566,14 @@ jobs:
           echo "::error::Could not confirm staging session exchange is off before cutover"
           exit 1
 
+      - name: Validate webhook gateway trust boundary
+        if: steps.cf.outputs.configured == 'true' && steps.freshness.outputs.should_deploy == 'true'
+        working-directory: ${{ env.CHECKOUT_DIR }}
+        env:
+          ELIZA_APP_WEBHOOK_GATEWAY_URL: ${{ vars.ELIZA_APP_WEBHOOK_GATEWAY_URL }}
+          ELIZA_APP_WEBHOOK_GATEWAY_SECRET: ${{ secrets.ELIZA_APP_WEBHOOK_GATEWAY_SECRET }}
+        run: node packages/cloud/shared/scripts/messaging-gateway-preflight.mjs --strict --channels=webhook
+
       - name: Publish Worker AI secrets
         if: steps.cf.outputs.configured == 'true' && steps.freshness.outputs.should_deploy == 'true'
         working-directory: ${{ env.CHECKOUT_DIR }}/packages/cloud/api

@@ -1,14 +1,34 @@
 #!/usr/bin/env node
+/**
+ * Validates messaging gateway environment contracts for local checks and trusted deploy gates.
+ */
 
 const args = new Set(process.argv.slice(2));
 const strict = args.has("--strict");
 const channelsArg = process.argv.find((arg) => arg.startsWith("--channels="));
+const supportedChannels = new Set([
+  "shared",
+  "webhook",
+  "telegram",
+  "discord",
+  "whatsapp",
+  "imessage",
+]);
 const selectedChannels = new Set(
-  (channelsArg?.split("=")[1] ?? "shared,telegram,discord,whatsapp,imessage")
+  (channelsArg?.slice("--channels=".length) ?? "shared,webhook,telegram,discord,whatsapp,imessage")
     .split(",")
     .map((channel) => channel.trim())
     .filter(Boolean),
 );
+const selectionErrors = [];
+if (channelsArg && selectedChannels.size === 0) {
+  selectionErrors.push("--channels must select at least one channel");
+}
+for (const channel of selectedChannels) {
+  if (!supportedChannels.has(channel)) {
+    selectionErrors.push(`unknown channel: ${channel}`);
+  }
+}
 
 const checks = [];
 
@@ -134,25 +154,25 @@ function checkShared() {
     "Cerebras API key is configured",
     "Set CEREBRAS_API_KEY for the stateless onboarding worker.",
   );
+}
+
+function checkWebhookGateway() {
   // The BFF forwarder in packages/cloud/api/eliza-app/webhook/_forward.ts reads
   // these as a pair: the URL is the upstream webhook gateway it proxies to, and
   // the secret is the shared "came from the BFF" proof the gateway validates
   // (x-eliza-webhook-forwarder-secret). _forward.ts only stamps the header when
   // the secret is set, so an absent secret silently downgrades the gateway's
-  // trust boundary — surface that here rather than at deploy time.
+  // trust boundary. Keep this as a dedicated channel so each consumer can
+  // validate the pair at its own deployment/configuration boundary.
   addCheck(
-    "shared",
+    "webhook",
     "webhook gateway URL",
-    hasAny([
-      "ELIZA_APP_WEBHOOK_GATEWAY_URL",
-      "WEBHOOK_GATEWAY_URL",
-      "GATEWAY_WEBHOOK_URL",
-    ]),
+    hasAny(["ELIZA_APP_WEBHOOK_GATEWAY_URL", "WEBHOOK_GATEWAY_URL", "GATEWAY_WEBHOOK_URL"]),
     "Webhook gateway upstream URL is configured",
     "Set ELIZA_APP_WEBHOOK_GATEWAY_URL (or WEBHOOK_GATEWAY_URL / GATEWAY_WEBHOOK_URL) to the gateway-webhook service URL.",
   );
   addCheck(
-    "shared",
+    "webhook",
     "webhook gateway forwarder secret",
     hasAny(["ELIZA_APP_WEBHOOK_GATEWAY_SECRET"]),
     "Webhook gateway forwarder secret is configured",
@@ -161,6 +181,7 @@ function checkShared() {
 }
 
 if (selectedChannels.has("shared")) checkShared();
+if (selectedChannels.has("webhook")) checkWebhookGateway();
 if (selectedChannels.has("telegram")) checkTelegram();
 if (selectedChannels.has("discord")) checkDiscord();
 if (selectedChannels.has("whatsapp")) checkWhatsApp();
@@ -168,6 +189,9 @@ if (selectedChannels.has("imessage")) checkIMessage();
 
 console.log("Eliza messaging gateway preflight");
 console.log(`Channels: ${[...selectedChannels].join(", ")}`);
+for (const error of selectionErrors) {
+  console.log(`- [${strict ? "fail" : "invalid"}] selection: ${error}`);
+}
 for (const check of checks) {
   const mark = check.ok ? "ok" : strict ? "fail" : "missing";
   console.log(`- [${mark}] ${check.channel}: ${check.name} - ${check.detail}`);
@@ -177,13 +201,16 @@ for (const check of checks) {
 }
 
 const failed = checks.filter((check) => !check.ok);
-if (strict && failed.length > 0) {
-  console.error(`\n${failed.length} gateway preflight check(s) failed.`);
+const failureCount = failed.length + selectionErrors.length;
+if (strict && failureCount > 0) {
+  console.error(`\n${failureCount} gateway preflight check(s) failed.`);
   process.exit(1);
 }
 
-if (failed.length > 0) {
-  console.log(`\n${failed.length} check(s) missing. Re-run with --strict in CI to fail closed.`);
+if (failureCount > 0) {
+  console.log(
+    `\n${failureCount} check(s) missing or invalid. Re-run with --strict in CI to fail closed.`,
+  );
 } else {
   console.log("\nAll gateway preflight checks passed.");
 }

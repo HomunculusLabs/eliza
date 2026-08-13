@@ -92,6 +92,8 @@ Required (the process throws on startup if these are missing):
 - `ELIZA_CLOUD_URL` — base URL of the cloud API (identity resolve, webhook
   config, onboarding chat, auth token endpoints).
 - `GATEWAY_BOOTSTRAP_SECRET` — bootstrap secret used to acquire the gateway JWT.
+- `ELIZA_APP_WEBHOOK_GATEWAY_SECRET` — shared BFF-to-gateway secret required
+  for forwarded `eliza-app` webhooks.
 
 Redis (at least one of these must resolve, or `createRedis()` throws):
 

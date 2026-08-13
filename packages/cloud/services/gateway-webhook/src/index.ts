@@ -1,4 +1,6 @@
-// Handles webhook gateway index behavior for authenticated connector fan-in.
+/**
+ * Boots the authenticated multi-platform webhook gateway and its request routes.
+ */
 import { Hono } from "hono";
 import { blooioAdapter } from "./adapters/blooio";
 import { telegramAdapter } from "./adapters/telegram";
@@ -6,7 +8,10 @@ import { twilioAdapter } from "./adapters/twilio";
 import type { Platform, PlatformAdapter } from "./adapters/types";
 import { whatsappAdapter } from "./adapters/whatsapp";
 import { getAuthHeader, initAuth, shutdownAuth } from "./auth";
-import { enforceForwarderSecret } from "./internal-auth";
+import {
+  assertForwarderSecretConfigured,
+  enforceForwarderSecret,
+} from "./internal-auth";
 import { handleInternalEvent } from "./internal-event-handler";
 import { logger } from "./logger";
 import { initProjectConfig, shutdownProjectConfig } from "./project-config";
@@ -31,6 +36,7 @@ function requireEnv(name: string): string {
 
 const ELIZA_CLOUD_URL = requireEnv("ELIZA_CLOUD_URL");
 const GATEWAY_BOOTSTRAP_SECRET = requireEnv("GATEWAY_BOOTSTRAP_SECRET");
+assertForwarderSecretConfigured();
 
 const adapters: Record<Platform, PlatformAdapter> = {
   telegram: telegramAdapter,
@@ -115,9 +121,8 @@ app.post("/webhook/:project/:platform", async (c) => {
     return c.json({ error: "unsupported platform" }, 400);
   }
 
-  // L3: when ELIZA_APP_WEBHOOK_GATEWAY_SECRET is set, only accept requests for
-  // the forwarded project that carry the BFF forwarder's dedicated header.
-  // No-op when the secret is unset, and never gates other projects/tenants.
+  // L3: only accept requests for the forwarded project that carry the BFF
+  // forwarder's dedicated header. Other projects/tenants remain independent.
   if (!enforceForwarderSecret(c.req.raw, c.req.param("project"))) {
     return c.json({ error: "unauthorized" }, 401);
   }

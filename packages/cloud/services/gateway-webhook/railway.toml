@@ -4,6 +4,7 @@
 # Hono HTTP handler on port 3000 (PORT env overrides).
 #
 # Required env vars / secrets:
+#   ELIZA_APP_WEBHOOK_GATEWAY_SECRET  Shared BFF-to-gateway forwarder secret.
 #   GATEWAY_INTERNAL_SECRET     Shared secret for internal routes from cloud-api.
 #   AGENT_SERVER_SHARED_SECRET  Shared secret for forwards to agent-server.
 #   REDIS_URL                   Upstash Redis REST URL (or KV_REST_API_URL).
