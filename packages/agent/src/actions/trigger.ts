@@ -745,6 +745,7 @@ async function opCreate(
     enabled: true,
     wakeMode,
     createdBy: creatorId,
+    notifyOnOutcome: true,
     timezone: messageTimeZone,
     runCount: 0,
     intervalMs: triggerType === "interval" ? intervalMs : undefined,
@@ -1005,7 +1006,12 @@ async function opList(
     // that never will, so the paused state travels with the line.
     const paused = trigger.enabled === false ? " (paused)" : "";
     lines.push(
-      `- "${displayLabel(trigger.displayName)}" — ${describeSchedule(trigger, messageTimeZone)}${paused}`,
+      `- "${displayLabel(trigger.displayName)}" — ${describeSchedule(
+        trigger,
+        messageTimeZone,
+        Date.now(),
+        trigger.nextRunAtMs,
+      )}${paused}`,
     );
   }
   if (lines.length === 0) {
