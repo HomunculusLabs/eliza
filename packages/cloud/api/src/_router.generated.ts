@@ -69,6 +69,7 @@ import _route_cron_auto_top_up_route from "../cron/auto-top-up/route";
 import _route_cron_cleanup_anonymous_sessions_route from "../cron/cleanup-anonymous-sessions/route";
 import _route_cron_cleanup_cli_sessions_route from "../cron/cleanup-cli-sessions/route";
 import _route_cron_cleanup_expired_crypto_payments_route from "../cron/cleanup-expired-crypto-payments/route";
+import _route_cron_cleanup_expired_payment_requests_route from "../cron/cleanup-expired-payment-requests/route";
 import _route_cron_cleanup_priorities_route from "../cron/cleanup-priorities/route";
 import _route_cron_cleanup_stuck_provisioning_route from "../cron/cleanup-stuck-provisioning/route";
 import _route_cron_cleanup_webhook_events_route from "../cron/cleanup-webhook-events/route";
@@ -84,6 +85,7 @@ import _route_cron_process_stripe_queue_route from "../cron/process-stripe-queue
 import _route_cron_reclaim_stale_domains_route from "../cron/reclaim-stale-domains/route";
 import _route_cron_reconcile_video_generations_route from "../cron/reconcile-video-generations/route";
 import _route_cron_sample_eliza_price_route from "../cron/sample-eliza-price/route";
+import _route_cron_shared_scheduled_tasks_route from "../cron/shared-scheduled-tasks/route";
 import _route_cron_social_automation_route from "../cron/social-automation/route";
 import _route_cron_sweep_credit_reservations_route from "../cron/sweep-credit-reservations/route";
 import _route_cron_sweep_inference_charges_route from "../cron/sweep-inference-charges/route";
@@ -806,6 +808,10 @@ export function mountRoutes(app: Hono<AppEnv>): void {
     _route_cron_cleanup_expired_crypto_payments_route,
   );
   app.route(
+    "/api/cron/cleanup-expired-payment-requests",
+    _route_cron_cleanup_expired_payment_requests_route,
+  );
+  app.route(
     "/api/cron/cleanup-priorities",
     _route_cron_cleanup_priorities_route,
   );
@@ -852,6 +858,10 @@ export function mountRoutes(app: Hono<AppEnv>): void {
   app.route(
     "/api/cron/sample-eliza-price",
     _route_cron_sample_eliza_price_route,
+  );
+  app.route(
+    "/api/cron/shared-scheduled-tasks",
+    _route_cron_shared_scheduled_tasks_route,
   );
   app.route("/api/cron/social-automation", _route_cron_social_automation_route);
   app.route(

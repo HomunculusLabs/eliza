@@ -20,6 +20,14 @@ const services = [
 ];
 
 describe("provisioning worker deployment contract", () => {
+  it("routes both jobs only to the healthy Hetzner fleet", () => {
+    expect(
+      workflow.match(
+        /^\s+runs-on: \$\{\{ fromJSON\(vars\.HETZNER_FLEET_ONLINE != 'true' && '\["ubuntu-24\.04"\]' \|\| '\["self-hosted","hetzner-robot"\]'\) \}\}$/gm,
+      ),
+    ).toHaveLength(2);
+  });
+
   it("resolves one immutable SHA and deploys exactly that snapshot", () => {
     expect(workflow).toContain('deployment_sha="$PUSH_SHA"');
     expect(workflow).toContain(
@@ -68,6 +76,17 @@ describe("provisioning worker deployment contract", () => {
     expect(workflow).toContain("git reset --hard HEAD\n");
     expect(workflow).not.toContain("git reset --hard HEAD 2>/dev/null || true");
     expect(workflow).toContain("- 'packages/shared/**'");
+  });
+
+  it("serializes the SSH mutation on the target host after runner cancellation", () => {
+    const lock = "exec 9>/tmp/eliza-provisioning-worker-deploy.lock";
+    expect(workflow).toContain(lock);
+    expect(workflow).toContain("flock -w 1200 9");
+    expect(workflow.indexOf(lock)).toBeLessThan(
+      workflow.indexOf("cd /opt/eliza"),
+    );
+    expect(workflow).toContain("command_timeout: 40m");
+    expect(workflow).toContain("timeout-minutes: 55");
   });
 
   it("regenerates before deploy and self-heals both services", () => {
