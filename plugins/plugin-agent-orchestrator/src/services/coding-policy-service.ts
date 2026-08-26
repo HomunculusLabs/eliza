@@ -13,7 +13,7 @@
  */
 
 import type { IAgentRuntime } from "@elizaos/core";
-import { logger } from "@elizaos/core";
+import { ElizaError, logger } from "@elizaos/core";
 import {
   CODING_POLICY_SETTING_KEY,
   type CodingAgentBackend,
@@ -76,6 +76,9 @@ export function loadCodingPolicy(
   try {
     parsed = JSON.parse(raw);
   } catch {
+    // error-policy:J3 untrusted-input sanitizing — a corrupt stored document
+    // is surfaced as an explicit invalid result (repairable via PUT), never
+    // fabricated into a healthy-looking default policy.
     return {
       policy: null,
       issues: [
@@ -193,7 +196,19 @@ export function writeCodingPolicy(
   if (blocking.length > 0) {
     return { policy: null, issues: [...issues, ...authority] };
   }
-  runtime.setSetting(CODING_POLICY_SETTING_KEY, JSON.stringify(policy));
+  try {
+    runtime.setSetting(CODING_POLICY_SETTING_KEY, JSON.stringify(policy));
+  } catch (error) {
+    // error-policy:J2 context-adding rethrow — persistence failures are a
+    // coded, actionable error for the PUT boundary to translate, never a
+    // silent no-op that would let a "validated" write vanish.
+    throw new ElizaError("Failed to persist the coding policy", {
+      code: "CODING_POLICY_PERSIST_FAILED",
+      context: { settingKey: CODING_POLICY_SETTING_KEY },
+      cause: error,
+      severity: "fatal",
+    });
+  }
   return { policy, issues: [...issues, ...authority] };
 }
 

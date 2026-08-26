@@ -129,6 +129,12 @@ export const CODING_AGENT_ROUTE_PATHS: Array<{ type: string; path: string }> = [
   { type: "GET", path: "/api/coding-agents/metrics" },
   { type: "GET", path: "/api/coding-agents/workspace-files" },
   { type: "GET", path: "/api/coding-agents/approval-presets" },
+  // Coding policy (#24099) — must be declared here or the route registry
+  // never mounts them: the rawPath router only dispatches requests whose
+  // (method, path) matches a template in this list, and without the GET
+  // entry "/api/coding-agents/:agentId" would shadow the policy read.
+  { type: "GET", path: "/api/coding-agents/policy" },
+  { type: "PUT", path: "/api/coding-agents/policy" },
   { type: "GET", path: "/api/coding-agents/settings" },
   { type: "POST", path: "/api/coding-agents/settings" },
   { type: "GET", path: "/api/coding-agents/approval-config" },

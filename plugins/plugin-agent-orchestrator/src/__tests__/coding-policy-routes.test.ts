@@ -313,3 +313,25 @@ describe("writeCodingPolicy bridge fault tolerance (#24099)", () => {
     expect(res.status()).toBe(200);
   });
 });
+
+describe("coding policy route registration (#24099)", () => {
+  it("declares GET+PUT /api/coding-agents/policy in CODING_AGENT_ROUTE_PATHS so the runtime registry mounts them", async () => {
+    const { CODING_AGENT_ROUTE_PATHS } = await import("../setup-routes.js");
+    const declared = CODING_AGENT_ROUTE_PATHS.filter(
+      (r) => r.path === "/api/coding-agents/policy",
+    ).map((r) => r.type);
+    expect(declared).toContain("GET");
+    expect(declared).toContain("PUT");
+    // GET must precede the /:agentId template in registration order or the
+    // parameterized route shadows the static policy read.
+    const agentIdIdx = CODING_AGENT_ROUTE_PATHS.findIndex(
+      (r) => r.path === "/api/coding-agents/:agentId",
+    );
+    const policyGetIdx = CODING_AGENT_ROUTE_PATHS.findIndex(
+      (r) => r.path === "/api/coding-agents/policy" && r.type === "GET",
+    );
+    expect(policyGetIdx).toBeGreaterThanOrEqual(0);
+    expect(agentIdIdx).toBeGreaterThanOrEqual(0);
+    expect(policyGetIdx).toBeLessThan(agentIdIdx);
+  });
+});
