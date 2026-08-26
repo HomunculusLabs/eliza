@@ -9,7 +9,11 @@ import {
 	MOCK_AGENT_ID,
 } from "../../../testing/mock-runtime.ts";
 import type { IAgentRuntime } from "../../../types/index.ts";
-import type { SecretChangeCallback, SecretContext } from "../types.ts";
+import type {
+	PluginSecretRequirement,
+	SecretChangeCallback,
+	SecretContext,
+} from "../types.ts";
 import {
 	PluginActivatorService,
 	type PluginWithSecrets,
@@ -42,15 +46,27 @@ interface ActivatorHarness {
 
 async function createHarness(
 	getMissingSecrets: (keys: string[]) => Promise<string[]>,
+	checkPluginRequirements?: (
+		pluginId: string,
+		requirements: Record<string, PluginSecretRequirement>,
+	) => Promise<{
+		ready: boolean;
+		missingRequired: string[];
+		missingOptional: string[];
+		invalid: string[];
+	}>,
 ): Promise<ActivatorHarness> {
 	let secretChangeCallback: SecretChangeCallback | undefined;
 	const secretsService = {
-		checkPluginRequirements: vi.fn(async () => ({
-			ready: false,
-			missingRequired: ["TOKEN"],
-			missingOptional: [],
-			invalid: [],
-		})),
+		checkPluginRequirements: vi.fn(
+			checkPluginRequirements ??
+				(async () => ({
+					ready: false,
+					missingRequired: ["TOKEN"],
+					missingOptional: [],
+					invalid: [],
+				})),
+		),
 		getMissingSecrets: vi.fn(getMissingSecrets),
 		onAnySecretChanged: vi.fn((callback: SecretChangeCallback) => {
 			secretChangeCallback = callback;
@@ -180,5 +196,203 @@ describe("PluginActivatorService concurrency", () => {
 		expect(activation).toHaveBeenCalledTimes(2);
 		expect(harness.service.isActivated(PLUGIN.name)).toBe(true);
 		expect(maxConcurrentPolls).toBe(1);
+	});
+
+	it("does not activate a plugin after stop is requested during a poll lookup", async () => {
+		let releaseLookup: ((missing: string[]) => void) | undefined;
+		const lookupGate = new Promise<string[]>((resolve) => {
+			releaseLookup = resolve;
+		});
+		const activation = vi.fn(async () => undefined);
+		const harness = await createHarness(() => lookupGate);
+		activeService = harness.service;
+		expect(await harness.service.registerPlugin(PLUGIN, activation)).toBe(
+			false,
+		);
+
+		// One poll tick suspends inside getMissingSecrets.
+		await vi.advanceTimersByTimeAsync(1);
+
+		// Shutdown begins while the lookup is suspended; secrets resolve only
+		// after stop was requested.
+		const stopping = harness.service.stop();
+		releaseLookup?.([]);
+		await stopping;
+		await vi.advanceTimersByTimeAsync(0);
+
+		expect(activation).not.toHaveBeenCalled();
+		expect(harness.service.isPending(PLUGIN.name)).toBe(false);
+	});
+
+	it("does not activate a plugin after stop is requested during a secret-change lookup", async () => {
+		let releasePoll: ((missing: string[]) => void) | undefined;
+		const pollGate = new Promise<string[]>((resolve) => {
+			releasePoll = resolve;
+		});
+		let releaseChange: ((missing: string[]) => void) | undefined;
+		const changeGate = new Promise<string[]>((resolve) => {
+			releaseChange = resolve;
+		});
+		let lookupCalls = 0;
+		const activation = vi.fn(async () => undefined);
+		const harness = await createHarness(() => {
+			lookupCalls += 1;
+			return lookupCalls === 1 ? pollGate : changeGate;
+		});
+		activeService = harness.service;
+		expect(await harness.service.registerPlugin(PLUGIN, activation)).toBe(
+			false,
+		);
+
+		// A poll suspends on its lookup, then a secret change suspends on its own.
+		await vi.advanceTimersByTimeAsync(1);
+		const secretChange = harness.emitSecretChange();
+
+		// stop() drains the active poll, so the pending map is still live when
+		// the secret-change lookup resolves — activation must still be refused.
+		const stopping = harness.service.stop();
+		releaseChange?.([]);
+		await vi.advanceTimersByTimeAsync(0);
+		expect(activation).not.toHaveBeenCalled();
+
+		releasePoll?.(["TOKEN"]);
+		await secretChange;
+		await stopping;
+
+		expect(activation).not.toHaveBeenCalled();
+	});
+
+	it("does not activate an unregistered plugin after its poll lookup resolves", async () => {
+		let releaseLookup: ((missing: string[]) => void) | undefined;
+		const lookupGate = new Promise<string[]>((resolve) => {
+			releaseLookup = resolve;
+		});
+		const activation = vi.fn(async () => undefined);
+		const harness = await createHarness(() => lookupGate);
+		activeService = harness.service;
+		expect(await harness.service.registerPlugin(PLUGIN, activation)).toBe(
+			false,
+		);
+		await vi.advanceTimersByTimeAsync(1);
+
+		expect(harness.service.unregisterPlugin(PLUGIN.name)).toBe(true);
+		releaseLookup?.([]);
+		await vi.advanceTimersByTimeAsync(1);
+		await harness.service.stop();
+
+		expect(activation).not.toHaveBeenCalled();
+	});
+
+	it("refuses registration requested after stop began", async () => {
+		let releaseLookup: ((missing: string[]) => void) | undefined;
+		const lookupGate = new Promise<string[]>((resolve) => {
+			releaseLookup = resolve;
+		});
+		const activation = vi.fn(async () => undefined);
+		const harness = await createHarness(() => lookupGate);
+		activeService = harness.service;
+		expect(await harness.service.registerPlugin(PLUGIN, activation)).toBe(
+			false,
+		);
+		await vi.advanceTimersByTimeAsync(1);
+
+		// stop() begins while the poll lookup is suspended.
+		const stopping = harness.service.stop();
+		releaseLookup?.(["TOKEN"]);
+		await stopping;
+		await vi.advanceTimersByTimeAsync(0);
+
+		// Any registration after stop must be refused, including the
+		// secretless immediate-activation path (which on the unfixed tree
+		// activates the plugin synchronously inside registerPlugin).
+		const secretlessPlugin: PluginWithSecrets = {
+			name: "secretless-stop-probe",
+			description: "Registers with no secret requirements.",
+		};
+		expect(
+			await harness.service.registerPlugin(secretlessPlugin, activation),
+		).toBe(false);
+		expect(activation).not.toHaveBeenCalled();
+	});
+
+	it("refuses registration whose requirements lookup resolves after stop", async () => {
+		let releaseRequirements:
+			| ((status: {
+					ready: boolean;
+					missingRequired: string[];
+					missingOptional: string[];
+					invalid: string[];
+			  }) => void)
+			| undefined;
+		const requirementsGate = new Promise<{
+			ready: boolean;
+			missingRequired: string[];
+			missingOptional: string[];
+			invalid: string[];
+		}>((resolve) => {
+			releaseRequirements = resolve;
+		});
+		const activation = vi.fn(async () => undefined);
+		const harness = await createHarness(
+			async () => [],
+			async () => requirementsGate,
+		);
+		activeService = harness.service;
+
+		// Registration suspends inside checkPluginRequirements.
+		const registration = harness.service.registerPlugin(PLUGIN, activation);
+
+		// stop() completes before the requirements lookup resolves.
+		const stopping = harness.service.stop();
+		await vi.advanceTimersByTimeAsync(0);
+		releaseRequirements?.({
+			ready: true,
+			missingRequired: [],
+			missingOptional: [],
+			invalid: [],
+		});
+		expect(await registration).toBe(false);
+		await stopping;
+
+		expect(activation).not.toHaveBeenCalled();
+		expect(harness.service.isPending(PLUGIN.name)).toBe(false);
+	});
+
+	it("stop drains an activation that already started without re-entering it", async () => {
+		let releaseActivation: (() => void) | undefined;
+		const activationGate = new Promise<void>((resolve) => {
+			releaseActivation = resolve;
+		});
+		let activationEntries = 0;
+		const activation = vi.fn(async () => {
+			activationEntries += 1;
+			await activationGate;
+		});
+		const harness = await createHarness(async () => []);
+		activeService = harness.service;
+		expect(await harness.service.registerPlugin(PLUGIN, activation)).toBe(
+			false,
+		);
+
+		// The activation callback is entered and suspended in flight.
+		await vi.advanceTimersByTimeAsync(1);
+		expect(activation).toHaveBeenCalledTimes(1);
+
+		// stop() must not settle while the in-flight activation is still
+		// pending — a shutdown that returns early would pass the flush below.
+		let stopped = false;
+		const stopping = harness.service.stop().then(() => {
+			stopped = true;
+		});
+		await vi.advanceTimersByTimeAsync(0);
+		expect(stopped).toBe(false);
+
+		releaseActivation?.();
+		await stopping;
+		await vi.advanceTimersByTimeAsync(0);
+
+		expect(activationEntries).toBe(1);
+		expect(harness.service.isPending(PLUGIN.name)).toBe(false);
+		expect(harness.service.isActivated(PLUGIN.name)).toBe(false);
 	});
 });
