@@ -13,7 +13,7 @@
  * into a fake success.
  */
 import type http from "node:http";
-import { ElizaError } from "@elizaos/core";
+import { ElizaError, jsonValueEquals } from "@elizaos/core";
 import { createMockRuntime } from "@elizaos/core/testing";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { NotificationPushService } from "../services/push/notification-push-service.ts";
@@ -38,6 +38,20 @@ async function makeRuntimeWithService(): Promise<{
       return true;
     },
     deleteCache: async (key: string): Promise<boolean> => cache.delete(key),
+    compareAndSetCache: async <T>(
+      key: string,
+      expected: unknown,
+      replacement: T,
+    ): Promise<boolean> => {
+      const stored = cache.get(key);
+      const matches =
+        expected === undefined
+          ? stored === undefined
+          : stored !== undefined && jsonValueEquals(stored, expected);
+      if (!matches) return false;
+      cache.set(key, replacement);
+      return true;
+    },
     // No AGENT_EVENT bus → the service starts dormant (fine for route tests).
     getService: () => null,
   });
@@ -691,6 +705,24 @@ describe("handlePushTokenRoute", () => {
         },
         setCache: async <T>(key: string, value: T): Promise<boolean> => {
           cache.set(key, value);
+          return true;
+        },
+        // The store persists through compareAndSetCache; route the CAS at the
+        // same gated local cache or update() sees a foreign empty row and
+        // exhausts its retry budget (503).
+        compareAndSetCache: async <T>(
+          key: string,
+          expected: unknown,
+          replacement: T,
+        ): Promise<boolean> => {
+          const stored = cache.get(key);
+          const matches =
+            expected === undefined
+              ? stored === undefined
+              : stored !== undefined &&
+                JSON.stringify(stored) === JSON.stringify(expected);
+          if (!matches) return false;
+          cache.set(key, replacement);
           return true;
         },
         getService: () => null,

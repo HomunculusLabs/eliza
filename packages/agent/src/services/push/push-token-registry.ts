@@ -7,9 +7,9 @@
  * `createdAt`).
  *
  * Persistence rides on the DB-backed runtime cache (`runtime.getCache` /
- * `runtime.setCache`) under a single stable key, mirroring the persistence
- * pattern in `@elizaos/core`'s `NotificationService`. A cold/headless runtime
- * with no cache adapter starts empty and degrades to in-memory only.
+ * `runtime.compareAndSetCache`) under a single stable key, mirroring the
+ * persistence pattern in `@elizaos/core`'s `NotificationService`. A cold/headless
+ * runtime with no cache adapter starts empty and degrades to in-memory only.
  *
  * Boundary invariants (a cache row is untrusted, possibly-hostile input):
  *   1. Hydration bounds work BEFORE traversing. A stored array larger than
@@ -40,9 +40,12 @@
  *      processing later operations after a failure (no wedge).
  *
  * Concurrency scope: mutations are serialized and failure-atomic WITHIN a
- * single process. Cross-process compare-and-swap is out of scope because the
- * runtime cache contract exposes no transactional CAS primitive; do not read
- * multi-process atomicity into this class.
+ * single process (promise-tail queue) and — since the migration to
+ * `compareAndSetCache` — durable writes are also conflict-safe ACROSS
+ * processes: each mutation CAS-es against the last-known raw durable value
+ * and re-applies the pure op to the reloaded base on conflict, so a retiring
+ * container generation writing during a blue/green overlap cannot silently
+ * drop the new generation's tokens (and vice versa).
  */
 
 import { ElizaError, type IAgentRuntime, logger } from "@elizaos/core";
@@ -100,6 +103,33 @@ export const MAX_PERSISTED_PUSH_TOKENS = MAX_PUSH_TOKENS_PER_AGENT * 16;
 export const PUSH_TOKEN_INVALID_CODE = "PUSH_TOKEN_INVALID";
 /** Stable `ElizaError.code` for a durable-write failure during a mutation. */
 export const PUSH_TOKEN_PERSIST_FAILED_CODE = "PUSH_TOKEN_PERSIST_FAILED";
+/**
+ * Stable `ElizaError.code` for a mutation whose CAS kept conflicting past the
+ * bounded retry budget (a concurrent writer is persistently racing us).
+ */
+export const PUSH_TOKEN_CONFLICT_EXHAUSTED_CODE =
+  "PUSH_TOKEN_CONFLICT_EXHAUSTED";
+
+/**
+ * Bounded compare-and-set retry budget for one registry mutation. Each retry
+ * re-applies the same pure op to the reloaded durable base, so this only
+ * bounds the loop against an adversarial writer that conflicts on EVERY
+ * attempt — a normal blue/green overlap resolves on the first or second try.
+ */
+const MAX_CAS_ATTEMPTS = 8;
+
+/**
+ * The durable persistence envelope for the registry row. `version` is a
+ * monotonic integer bumped on every accepted write, so two racing writers can
+ * never produce the same row twice (the duplicated-version lost-update the
+ * cross-process CAS exists to prevent); `tokens` is the canonical record
+ * array. Legacy rows (a bare array from before the envelope) are read as
+ * `version 0` content and rewritten in envelope form by the first CAS write.
+ */
+interface PersistedPushTokenEnvelope {
+  version: number;
+  tokens: PushTokenRecord[];
+}
 
 /**
  * True when `error` is a token-validation failure the caller should translate
@@ -209,6 +239,20 @@ export class PushTokenRegistry {
   private hydrated = false;
   private hydrationPromise: Promise<void> | null = null;
   private mutationTail: Promise<void> = Promise.resolve();
+  /**
+   * The raw durable value this instance last observed or wrote — NEVER the
+   * normalized form of a dirty row. CAS compares against this exact snapshot,
+   * so a still-dirty stored row conflicts correctly instead of wedging, and a
+   * `undefined` baseline makes the first write insert-only-if-absent.
+   */
+  private persistedBaseline: unknown = undefined;
+  /**
+   * Envelope version of {@link persistedBaseline} (`0` for legacy bare-array
+   * rows and absent rows). CAS conditions on the FULL baseline snapshot (which
+   * includes the version), and the replacement bumps the version — this field
+   * exists so repair/mutation can compute the next envelope without re-parsing.
+   */
+  private persistedVersion = 0;
 
   constructor(private readonly runtime: IAgentRuntime) {}
 
@@ -235,51 +279,67 @@ export class PushTokenRegistry {
 
   private async loadPersistedTokens(): Promise<void> {
     const stored = await this.runtime.getCache<unknown>(this.cacheKey);
-    const { records, repaired } = normalizePersistedTokens(stored);
+    const { records, version } = parsePersistedRow(stored);
+    const repaired =
+      stored !== undefined &&
+      !isCanonicalPersistedRow(stored, records, version);
     this.tokens = new Map(records.map((record) => [record.token, record]));
+    this.persistedBaseline = stored;
+    this.persistedVersion = version;
     this.hydrated = true;
     if (repaired) {
-      // Durable one-time repair: rewrite the normalized (validated, deduped,
-      // capped) form so later restarts do not re-scan the same dirty dump.
-      // Best-effort: a failed repair write only means we re-normalize next
-      // start; it must not fail the read path.
-      try {
-        await this.persist();
-      } catch (error) {
-        // error-policy:J7 diagnostics must not kill the loop — a failed
-        // one-time repair write degrades to re-scanning on the next start.
-        this.runtime.reportError("push.registry.repair", error, {
-          tokenCount: this.tokens.size,
-        });
-        logger.warn(
-          "[PushTokenRegistry] durable repair write failed; will re-normalize on next hydrate",
-        );
+      // An over-ceiling row failed closed to empty and must NOT be rewritten:
+      // the repair would persist the (empty) normalized view, destroying the
+      // original durable dump the comments above promise to leave intact.
+      const overCeiling =
+        Array.isArray(stored) && stored.length > MAX_PERSISTED_PUSH_TOKENS;
+      if (!overCeiling) {
+        // Durable one-time repair: rewrite the normalized (validated, deduped,
+        // capped) envelope so later restarts do not re-scan the same dirty dump.
+        // The repair is itself a CAS against the raw dirty baseline, so a
+        // concurrent writer that moves the row first CONFLICTS the repair
+        // instead of being silently overwritten (the exact blue/green race the
+        // CAS primitive exists for). Best-effort: a failed/conflicted repair
+        // only means we re-normalize next start; it must not fail the read path.
+        try {
+          await this.repairPersistedRow();
+        } catch (error) {
+          // error-policy:J7 diagnostics must not kill the loop — a failed
+          // one-time repair write degrades to re-scanning on the next start.
+          this.runtime.reportError("push.registry.repair", error, {
+            tokenCount: this.tokens.size,
+          });
+          logger.warn(
+            "[PushTokenRegistry] durable repair write failed; will re-normalize on next hydrate",
+          );
+        }
       }
     }
   }
 
   /**
-   * Durably rewrite the current in-memory tokens (repair path only). Requires
-   * `setCache` to resolve exactly `true`; a rejected write OR a resolved
-   * non-`true` value (an adapter reports `false` when the row did not land) is a
-   * failed durable repair and throws {@link PUSH_TOKEN_PERSIST_FAILED_CODE}, so
-   * the caller degrades to re-normalizing on the next start instead of treating
-   * an unpersisted repair as durable.
+   * Rewrite the durable row in canonical envelope form via compare-and-set
+   * against the baseline `loadPersistedTokens` observed (repair path only —
+   * every mutation goes through {@link commit}). On conflict the repair is
+   * skipped (a fresher writer owns the row; the next hydrate re-normalizes).
    */
-  private async persist(): Promise<void> {
-    const persisted = await this.runtime.setCache(this.cacheKey, [
-      ...this.tokens.values(),
-    ]);
-    if (persisted !== true) {
-      throw new ElizaError(
-        "[PushTokenRegistry] durable cache rejected the push-token repair write",
-        {
-          code: PUSH_TOKEN_PERSIST_FAILED_CODE,
-          context: { tokenCount: this.tokens.size },
-          severity: "ephemeral",
-        },
-      );
+  private async repairPersistedRow(): Promise<void> {
+    const written: PersistedPushTokenEnvelope = {
+      version: this.persistedVersion + 1,
+      tokens: [...this.tokens.values()],
+    };
+    const landed = await this.runtime.compareAndSetCache(
+      this.cacheKey,
+      this.persistedBaseline,
+      written,
+    );
+    if (!landed) {
+      // A concurrent writer moved the row first — leave the baseline on the
+      // durable truth; the next hydrate re-normalizes whatever landed.
+      return;
     }
+    this.persistedBaseline = written;
+    this.persistedVersion = written.version;
   }
 
   private enqueueMutation<T>(mutation: () => Promise<T>): Promise<T> {
@@ -294,49 +354,98 @@ export class PushTokenRegistry {
   }
 
   /**
-   * Persist `candidate` and, only after the durable write reports success,
-   * publish it as the observable registry. Because `this.tokens` is reassigned
-   * solely on a `true` result, `list`/`count` running while the write is pending
-   * observe the still-committed prior state; a write that rejects OR resolves a
-   * non-`true` value leaves the observable registry unchanged and throws a typed
-   * error. Callers run this inside {@link enqueueMutation}, so the next queued
-   * mutation still proceeds.
+   * Apply one pure mutation `op` to the durable registry via compare-and-set
+   * on the versioned persistence envelope.
+   *
+   * Each attempt CAS-es the FULL next envelope
+   * (`{ version: baseVersion + 1, tokens: op(base) }`) against the raw durable
+   * baseline (`persistedBaseline` — `undefined` before the first durable row
+   * exists, which makes that write insert-only-if-absent). Conditioning on
+   * the whole snapshot (which carries the monotonic version) means a writer
+   * that moved the row — including one that only bumped the version — cannot
+   * be overwritten: every accepted write carries a strictly larger version,
+   * so a duplicated-version lost update is structurally impossible.
+   *
+   * On conflict (`false`) the freshest raw value is reloaded and the SAME op
+   * re-applied to it — `register` (set token → evict oldest) and `unregister`
+   * (delete-if-present) are pure functions of the base, so retries converge
+   * without a mutation queue. The in-process {@link enqueueMutation} tail
+   * still orders ops within one process; the CAS closes the cross-process
+   * window (two container generations sharing the durable cache during a
+   * managed blue/green upgrade) that the previous unconditional `setCache`
+   * could not.
+   *
+   * Observable-atomicity invariant #5 is preserved: `this.tokens` and the
+   * baseline are reassigned ONLY after a `true` result, so `list`/`count`
+   * never observe an uncommitted candidate. A CAS rejection is a typed
+   * persistence failure; a `false` after {@link MAX_CAS_ATTEMPTS} bounded
+   * retries throws {@link PUSH_TOKEN_CONFLICT_EXHAUSTED_CODE} rather than
+   * looping forever against a writer that keeps racing us.
+   *
+   * @returns the op's answer computed against the base it was finally applied
+   * to (e.g. `unregister` reports presence w.r.t. the freshest durable state).
    */
-  private async commit(candidate: Map<string, PushTokenRecord>): Promise<void> {
-    let persisted: boolean;
-    try {
-      persisted = await this.runtime.setCache(this.cacheKey, [
-        ...candidate.values(),
-      ]);
-    } catch (error) {
-      // error-policy:J2 context-adding rethrow — surface a typed persistence
-      // failure with a redacted count while preserving the underlying cause. The
-      // candidate was never published, so the observable registry is unchanged.
-      throw new ElizaError(
-        "[PushTokenRegistry] failed to persist push-token mutation",
-        {
-          code: PUSH_TOKEN_PERSIST_FAILED_CODE,
-          cause: error,
-          context: { tokenCount: candidate.size },
-          severity: "ephemeral",
-        },
+  private async commit<T>(
+    op: (base: Map<string, PushTokenRecord>) => {
+      next: Map<string, PushTokenRecord>;
+      result: T;
+    },
+  ): Promise<T> {
+    let baseline = this.persistedBaseline;
+    let baseVersion = this.persistedVersion;
+    for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
+      const parsed = parsePersistedRow(baseline);
+      const base = new Map(
+        parsed.records.map((record) => [record.token, record]),
       );
+      baseVersion = parsed.version;
+      const { next, result } = op(base);
+      const replacement: PersistedPushTokenEnvelope = {
+        version: baseVersion + 1,
+        tokens: [...next.values()],
+      };
+      let landed: boolean;
+      try {
+        landed = await this.runtime.compareAndSetCache(
+          this.cacheKey,
+          baseline,
+          replacement,
+        );
+      } catch (error) {
+        // error-policy:J2 context-adding rethrow — the candidate was never
+        // published, the observable registry is unchanged, and the underlying
+        // cause is preserved.
+        throw new ElizaError(
+          "[PushTokenRegistry] failed to persist push-token mutation",
+          {
+            code: PUSH_TOKEN_PERSIST_FAILED_CODE,
+            cause: error,
+            context: { tokenCount: replacement.tokens.length },
+            severity: "ephemeral",
+          },
+        );
+      }
+      if (landed) {
+        this.tokens = next;
+        this.persistedBaseline = replacement;
+        this.persistedVersion = replacement.version;
+        return result;
+      }
+      // Conflict: another process moved the durable row. Reload the raw value
+      // and re-apply the same pure op to the freshest base.
+      baseline = await this.runtime.getCache<unknown>(this.cacheKey);
     }
-    if (persisted !== true) {
-      // error-policy:J2 context-adding rethrow — `setCache` resolving a
-      // non-`true` value is a durable-write failure (the SQL adapter propagates
-      // `false` when the underlying write did not land). The candidate was never
-      // published, so the observable registry stays on the committed state.
-      throw new ElizaError(
-        "[PushTokenRegistry] durable cache rejected the push-token mutation",
-        {
-          code: PUSH_TOKEN_PERSIST_FAILED_CODE,
-          context: { tokenCount: candidate.size },
-          severity: "ephemeral",
-        },
-      );
-    }
-    this.tokens = candidate;
+    // error-policy:J2 context-adding rethrow — a persistently conflicting row
+    // is a failure the caller must see; the observable registry stays on the
+    // last committed state and the next mutation starts from a fresh hydrate.
+    throw new ElizaError(
+      "[PushTokenRegistry] push-token cache conflicted past the retry budget",
+      {
+        code: PUSH_TOKEN_CONFLICT_EXHAUSTED_CODE,
+        context: { attempts: MAX_CAS_ATTEMPTS },
+        severity: "ephemeral",
+      },
+    );
   }
 
   /**
@@ -360,17 +469,22 @@ export class PushTokenRegistry {
     const validPlatform = assertValidPlatform(platform);
     const trimmed = assertValidToken(token);
     const owner = normalizeOwnerEntityId(ownerEntityId);
+    // createdAt is computed ONCE so every CAS retry applies the identical
+    // mutation and eviction order is stable across attempts.
+    const createdAt = Date.now();
     await this.enqueueMutation(async () => {
       await this.hydrate();
-      const candidate = new Map(this.tokens);
-      candidate.set(trimmed, {
-        token: trimmed,
-        platform: validPlatform,
-        createdAt: Date.now(),
-        ...(owner ? { ownerEntityId: owner } : {}),
+      await this.commit((base) => {
+        const next = new Map(base);
+        next.set(trimmed, {
+          token: trimmed,
+          platform: validPlatform,
+          createdAt,
+          ...(owner ? { ownerEntityId: owner } : {}),
+        });
+        evictOldestPushTokens(next);
+        return { next, result: undefined };
       });
-      evictOldestPushTokens(candidate);
-      await this.commit(candidate);
     });
   }
 
@@ -382,13 +496,16 @@ export class PushTokenRegistry {
     const trimmed = assertValidToken(token);
     return this.enqueueMutation(async () => {
       await this.hydrate();
-      if (!this.tokens.has(trimmed)) {
-        return false;
-      }
-      const candidate = new Map(this.tokens);
-      candidate.delete(trimmed);
-      await this.commit(candidate);
-      return true;
+      return this.commit((base) => {
+        if (!base.has(trimmed)) {
+          // Absent on this base: answer w.r.t. this (possibly reloaded,
+          // freshest-durable) state without attempting a write.
+          return { next: base, result: false };
+        }
+        const next = new Map(base);
+        next.delete(trimmed);
+        return { next, result: true };
+      });
     });
   }
 
@@ -427,30 +544,73 @@ export class PushTokenRegistry {
 }
 
 /**
- * Normalize a raw cache value into the registry's canonical records and report
- * whether the stored form differed (so the caller can durably repair once).
+ * Parse a raw durable row into the registry's canonical records plus the
+ * envelope version.
+ *
+ * Accepted forms:
+ *   - the canonical envelope `{ version, tokens }`
+ *   - a legacy bare array (pre-envelope row): read as `version 0`; the first
+ *     CAS write rewrites it in envelope form.
+ *   - absent/corrupt: empty records, `version 0` (fail-closed like before).
  *
  * Order matters and is load-bearing:
- *   1. Reject non-arrays and over-ceiling arrays WITHOUT traversal.
+ *   1. Reject non-envelope/non-array shapes and over-ceiling arrays WITHOUT
+ *      traversal.
  *   2. Validate each record and keep the NEWEST per token (dedup-before-cap).
  *   3. Apply the live cap to the deduped set.
  */
-function normalizePersistedTokens(stored: unknown): {
+function parsePersistedRow(stored: unknown): {
   records: PushTokenRecord[];
-  repaired: boolean;
+  version: number;
 } {
-  if (!Array.isArray(stored)) {
-    return { records: [], repaired: false };
+  if (Array.isArray(stored)) {
+    return { records: normalizeLegacyTokenArray(stored), version: 0 };
   }
+  if (isEnvelopeShape(stored)) {
+    return {
+      records: normalizeLegacyTokenArray(stored.tokens),
+      version: stored.version,
+    };
+  }
+  return { records: [], version: 0 };
+}
+
+/** Structural guard for the envelope row (own keys exactly `version,tokens`). */
+function isEnvelopeShape(
+  value: unknown,
+): value is { version: number; tokens: unknown[] } {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  const ownKeys = Object.keys(record);
+  if (
+    ownKeys.length !== 2 ||
+    !ownKeys.includes("version") ||
+    !ownKeys.includes("tokens")
+  ) {
+    return false;
+  }
+  return (
+    typeof record.version === "number" &&
+    Number.isSafeInteger(record.version) &&
+    record.version >= 0 &&
+    Array.isArray(record.tokens)
+  );
+}
+
+/**
+ * Normalize a raw token array (envelope `tokens` or a legacy bare row) into
+ * canonical records: bounded, validated, deduped (newest per token), capped.
+ */
+function normalizeLegacyTokenArray(stored: unknown[]): PushTokenRecord[] {
   // Bound BEFORE any filter/copy/sort. A hostile/corrupt oversized dump fails
   // closed to empty; we deliberately do NOT rewrite it here (a later mutation
-  // overwrites it with a bounded array), so a transient never destroys a large
-  // legitimate row.
+  // overwrites it with a bounded envelope), so a transient never destroys a
+  // large legitimate row.
   if (stored.length > MAX_PERSISTED_PUSH_TOKENS) {
     logger.warn(
       `[PushTokenRegistry] persisted token array exceeds ceiling (${stored.length} > ${MAX_PERSISTED_PUSH_TOKENS}); failing closed`,
     );
-    return { records: [], repaired: false };
+    return [];
   }
 
   const newestByToken = new Map<string, PushTokenRecord>();
@@ -475,11 +635,25 @@ function normalizePersistedTokens(stored: unknown): {
       })
       .slice(0, MAX_PUSH_TOKENS_PER_AGENT);
   }
+  return unique;
+}
 
-  return {
-    records: unique,
-    repaired: !isCanonicalPersistedArray(stored, unique),
-  };
+/**
+ * True when `stored` is already exactly the canonical persisted form of
+ * `canonical` — the envelope shape carrying the same version and a tokens
+ * array whose length and per-record fields match the normalized values (same
+ * length, same order, plain objects with exactly the canonical fields). Used
+ * to suppress a repair write on an already-clean load; a legacy bare array or
+ * dirty envelope is NOT canonical and triggers the (CAS-guarded) repair.
+ */
+function isCanonicalPersistedRow(
+  stored: unknown,
+  canonical: PushTokenRecord[],
+  version: number,
+): boolean {
+  if (!isEnvelopeShape(stored)) return false;
+  if (stored.version !== version) return false;
+  return isCanonicalPersistedArray(stored.tokens, canonical);
 }
 
 /**

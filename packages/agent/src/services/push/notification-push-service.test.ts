@@ -14,7 +14,12 @@ import type {
   AgentNotification,
   IAgentRuntime,
 } from "@elizaos/core";
-import { logger, NOTIFICATION_STREAM, ServiceType } from "@elizaos/core";
+import {
+  jsonValueEquals,
+  logger,
+  NOTIFICATION_STREAM,
+  ServiceType,
+} from "@elizaos/core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { NotificationPushService } from "./notification-push-service.ts";
 import { PushPolicyStore } from "./push-policy.ts";
@@ -79,6 +84,20 @@ function makeHarness(): Harness {
       return true;
     },
     deleteCache: async (key: string): Promise<boolean> => cache.delete(key),
+    compareAndSetCache: async <T>(
+      key: string,
+      expected: unknown,
+      replacement: T,
+    ): Promise<boolean> => {
+      const stored = cache.get(key);
+      const matches =
+        expected === undefined
+          ? stored === undefined
+          : stored !== undefined && jsonValueEquals(stored, expected);
+      if (!matches) return false;
+      cache.set(key, replacement);
+      return true;
+    },
     getService: (t: string) => (t === ServiceType.AGENT_EVENT ? bus : null),
     reportError: () => {},
   } as unknown as IAgentRuntime;

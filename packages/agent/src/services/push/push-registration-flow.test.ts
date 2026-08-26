@@ -17,7 +17,11 @@ import type {
   AgentNotification,
   IAgentRuntime,
 } from "@elizaos/core";
-import { NOTIFICATION_STREAM, ServiceType } from "@elizaos/core";
+import {
+  jsonValueEquals,
+  NOTIFICATION_STREAM,
+  ServiceType,
+} from "@elizaos/core";
 import { describe, expect, it, vi } from "vitest";
 import { handlePushTokenRoute } from "../../api/push-token-routes.ts";
 import { NotificationPushService } from "./notification-push-service.ts";
@@ -85,6 +89,20 @@ describe("push registration → delivery loop", () => {
         return true;
       },
       deleteCache: async (k: string): Promise<boolean> => cache.delete(k),
+      compareAndSetCache: async <T>(
+        k: string,
+        expected: unknown,
+        replacement: T,
+      ): Promise<boolean> => {
+        const stored = cache.get(k);
+        const matches =
+          expected === undefined
+            ? stored === undefined
+            : stored !== undefined && jsonValueEquals(stored, expected);
+        if (!matches) return false;
+        cache.set(k, replacement);
+        return true;
+      },
       getService: (t: string) => (t === ServiceType.AGENT_EVENT ? bus : null),
     } as unknown as IAgentRuntime;
 

@@ -10,6 +10,7 @@ import type { AgentNotification } from "@elizaos/core";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   decidePushDelivery,
+  PUSH_POLICY_CONFLICT_EXHAUSTED_CODE,
   PUSH_POLICY_PERSIST_FAILED_CODE,
   type PushDeliveryPolicy,
   PushPolicyStore,
@@ -121,6 +122,21 @@ describe("PushPolicyStore (durable per-principal store)", () => {
       cache.set(key, value);
       return true;
     },
+    compareAndSetCache: async <T>(
+      key: string,
+      expected: unknown,
+      replacement: T,
+    ): Promise<boolean> => {
+      const stored = cache.get(key);
+      const matches =
+        expected === undefined
+          ? stored === undefined
+          : stored !== undefined &&
+            JSON.stringify(stored) === JSON.stringify(expected);
+      if (!matches) return false;
+      cache.set(key, replacement);
+      return true;
+    },
   };
   let store: PushPolicyStore;
 
@@ -149,25 +165,34 @@ describe("PushPolicyStore (durable per-principal store)", () => {
     await expect(store.load("owner-1")).resolves.toBeNull();
   });
 
-  it("throws when the durable write is rejected (no fabricated success)", async () => {
+  it("save() throws a typed error when the underlying CAS storage fails (no fabricated success)", async () => {
     const rejecting = new PushPolicyStore({
       ...runtime,
-      setCache: async () => false,
+      compareAndSetCache: async () => {
+        throw new Error("storage down");
+      },
     });
     await expect(rejecting.save("owner-1", ALLOWED_POLICY)).rejects.toThrow(
-      /rejected the push-policy write/,
+      /failed to persist push-policy/,
     );
-  });
-
-  it("rejects with a typed ElizaError carrying the stable persist code", async () => {
-    const rejecting = new PushPolicyStore({
-      ...runtime,
-      setCache: async () => false,
-    });
-    const rejection = rejecting.save("owner-1", ALLOWED_POLICY);
-    await expect(rejection).rejects.toMatchObject({
+    await expect(
+      rejecting.save("owner-1", ALLOWED_POLICY),
+    ).rejects.toMatchObject({
       name: "ElizaError",
       code: PUSH_POLICY_PERSIST_FAILED_CODE,
+    });
+  });
+
+  it("save() returns false-resolved CAS as a typed persist failure (conflict is not success)", async () => {
+    const conflicting = new PushPolicyStore({
+      ...runtime,
+      // A CAS that always conflicts: someone else owns the row.
+      compareAndSetCache: async () => false,
+    });
+    const conflict = conflicting.save("owner-1", ALLOWED_POLICY);
+    await expect(conflict).rejects.toMatchObject({
+      name: "ElizaError",
+      code: PUSH_POLICY_CONFLICT_EXHAUSTED_CODE,
     });
   });
 });
@@ -178,6 +203,11 @@ describe("PushPolicyStore.update (serialized per-principal bump)", () => {
   function makeStore(overrides?: {
     getCache?: <T>(key: string) => Promise<T | undefined>;
     setCache?: (key: string, value: unknown) => Promise<boolean>;
+    compareAndSetCache?: (
+      key: string,
+      expected: unknown,
+      replacement: unknown,
+    ) => Promise<boolean>;
   }): {
     store: PushPolicyStore;
     cache: Map<string, unknown>;
@@ -193,6 +223,23 @@ describe("PushPolicyStore.update (serialized per-principal bump)", () => {
         overrides?.setCache ??
         (async (key: string, value: unknown): Promise<boolean> => {
           cache.set(key, value);
+          return true;
+        }),
+      compareAndSetCache:
+        overrides?.compareAndSetCache ??
+        (async (
+          key: string,
+          expected: unknown,
+          replacement: unknown,
+        ): Promise<boolean> => {
+          const stored = cache.get(key);
+          const matches =
+            expected === undefined
+              ? stored === undefined
+              : stored !== undefined &&
+                JSON.stringify(stored) === JSON.stringify(expected);
+          if (!matches) return false;
+          cache.set(key, replacement);
           return true;
         }),
     };
@@ -253,18 +300,24 @@ describe("PushPolicyStore.update (serialized per-principal bump)", () => {
   });
 
   it("does not let one principal's failed update poison another principal's queue", async () => {
-    const { store, cache } = makeStore({
-      setCache: async (key: string, value: unknown): Promise<boolean> => {
-        const policy = value as { pushEnabled: boolean };
-        if (policy.pushEnabled === false) return false; // disable writes fail
-        cache.set(key, value);
-        return true;
+    const { store } = makeStore({
+      compareAndSetCache: async (
+        _key: string,
+        _expected: unknown,
+        replacement: unknown,
+      ): Promise<boolean> => {
+        const policy = replacement as { pushEnabled: boolean };
+        if (policy.pushEnabled === false) {
+          throw new Error("storage rejects disable writes");
+        }
+        return true; // enables succeed without landing (not asserted below)
       },
     });
     await expect(store.update("owner-1", false)).rejects.toThrow(
-      /rejected the push-policy write/,
+      /failed to persist push-policy update/,
     );
-    // The queue recovers: a later update for a DIFFERENT principal proceeds.
+    // The queue recovers: the SAME store's tail is not poisoned — a later
+    // update for a different principal proceeds through its own tail.
     const ok = await store.update("owner-2", true);
     expect(ok.pushEnabled).toBe(true);
     expect(ok.version).toBe(1);
@@ -272,19 +325,32 @@ describe("PushPolicyStore.update (serialized per-principal bump)", () => {
 
   it("keeps the queue live after a failed same-principal update (no wedge)", async () => {
     let writes = 0;
-    const cache = new Map<string, unknown>();
+    const sharedCache = new Map<string, unknown>();
     const { store } = makeStore({
       getCache: async <T>(key: string): Promise<T | undefined> =>
-        cache.get(key) as T | undefined,
-      setCache: async (key: string, value: unknown): Promise<boolean> => {
+        sharedCache.get(key) as T | undefined,
+      compareAndSetCache: async (
+        key: string,
+        expected: unknown,
+        replacement: unknown,
+      ): Promise<boolean> => {
         writes += 1;
-        if (writes === 1) return false; // first durable write fails
-        cache.set(key, value);
+        if (writes === 1) {
+          throw new Error("first durable write fails");
+        }
+        const stored = sharedCache.get(key);
+        const matches =
+          expected === undefined
+            ? stored === undefined
+            : stored !== undefined &&
+              JSON.stringify(stored) === JSON.stringify(expected);
+        if (!matches) return false;
+        sharedCache.set(key, replacement);
         return true;
       },
     });
     await expect(store.update("owner-1", true)).rejects.toThrow(
-      /rejected the push-policy write/,
+      /failed to persist push-policy update/,
     );
     const recovered = await store.update("owner-1", true);
     expect(recovered.version).toBe(1); // failed write never landed
@@ -380,6 +446,23 @@ describe("PushPolicyStore.update (serialized per-principal bump)", () => {
       },
       setCache: async (key: string, value: unknown): Promise<boolean> => {
         cache.set(key, value);
+        return true;
+      },
+      // The durable CAS must read the SAME local cache the gated getCache
+      // reads (update() persists through compareAndSetCache, not setCache).
+      compareAndSetCache: async (
+        key: string,
+        expected: unknown,
+        replacement: unknown,
+      ): Promise<boolean> => {
+        const stored = cache.get(key);
+        const matches =
+          expected === undefined
+            ? stored === undefined
+            : stored !== undefined &&
+              JSON.stringify(stored) === JSON.stringify(expected);
+        if (!matches) return false;
+        cache.set(key, replacement);
         return true;
       },
     });

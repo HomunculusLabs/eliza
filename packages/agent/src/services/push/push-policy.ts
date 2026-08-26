@@ -63,6 +63,22 @@ const policyCacheKeyFor = (agentId: string, recipientId: string): string =>
 /** Stable `ElizaError.code` for a rejected durable push-policy write. */
 export const PUSH_POLICY_PERSIST_FAILED_CODE = "PUSH_POLICY_PERSIST_FAILED";
 
+/**
+ * Stable `ElizaError.code` for a policy update whose compare-and-set kept
+ * conflicting past the bounded retry budget (a concurrent writer is
+ * persistently racing us, e.g. a stuck retiring container generation).
+ */
+export const PUSH_POLICY_CONFLICT_EXHAUSTED_CODE =
+  "PUSH_POLICY_CONFLICT_EXHAUSTED";
+
+/**
+ * Bounded compare-and-set retry budget for one policy update. Each retry
+ * re-applies the same advance to the reloaded durable base, so this only
+ * bounds the loop against an adversarial writer that conflicts on EVERY
+ * attempt — a normal blue/green overlap resolves on the first or second try.
+ */
+const PUSH_POLICY_MAX_CAS_ATTEMPTS = 8;
+
 /** Cap on the stored policy record size guard (bytes, defensive). */
 const MAX_POLICY_JSON_BYTES = 4096;
 
@@ -173,20 +189,19 @@ export class PushPolicyStore {
 
   /**
    * Serialize a principal's policy advance — load, apply `pushEnabled`, bump
-   * the version, durably save — per principal, so two concurrent
-   * enable/disable requests can never both observe the same base version and
-   * silently overwrite an opt-out: each update persists a distinct monotonic
-   * version, giving every accepted write an auditable position in the
-   * principal's ordering. Returns the persisted record.
+   * the version, durably save via compare-and-set — per principal, so two
+   * concurrent enable/disable requests can never both observe the same base
+   * version and silently overwrite an opt-out: each update CAS-es on the
+   * observed (record, version) and persists a distinct monotonic version,
+   * giving every accepted write an auditable position in the principal's
+   * ordering. Returns the persisted record.
    *
    * Concurrency scope: same-principal writes are serialized and failure-atomic
-   * within a single process, mirroring `PushTokenRegistry`'s documented scope —
-   * the runtime cache contract exposes no compare-and-swap primitive
-   * (`getCache`/`setCache` only). Known limitation: during a managed
-   * blue/green upgrade two container generations briefly share the durable
-   * cache, so an in-flight write from the retiring container can interleave
-   * with the new container's first write (the same exposure the token
-   * registry carries).
+   * WITHIN one process (the tail) AND across processes/containers — the
+   * compare-and-set closes the blue/green upgrade window this store used to
+   * carry as a known limitation: an in-flight write from the retiring
+   * container now conflicts the new container's write instead of being
+   * silently overwritten, and the loser reloads and retries.
    */
   update(
     recipientId: string,
@@ -218,39 +233,117 @@ export class PushPolicyStore {
   }
 
   /**
-   * One serialized step: re-load the durable row inside the critical section
-   * (so it reflects every earlier queued update), apply the new setting, and
-   * persist. The version is `loaded + 1` — strictly monotonic across successive
-   * updates through this store. A corrupt row parses as absent per the
-   * fail-closed parse contract, so the sequence restarts at version 1 rather
-   * than trusting an unreadable prior version. A row already at the safe
-   * integer ceiling rejects the bump: persisting `version + 1` would store a
-   * record this store's own parser fails closed on, so the write is refused
-   * instead of planting a row every later load treats as corrupt.
+   * One serialized step: CAS-loop the policy advance against the durable row.
+   * Each attempt re-loads the row inside the critical section (so it reflects
+   * every earlier queued update AND the freshest cross-process writer),
+   * applies the new setting with `version + 1`, and compare-and-sets the
+   * full record. On conflict the loop reloads and re-applies — the version
+   * bump makes a duplicated-version lost update structurally impossible.
+   *
+   * A corrupt row parses as absent per the fail-closed parse contract, so the
+   * sequence restarts at version 1 rather than trusting an unreadable prior
+   * version — but only when the CAS WINS the row (insert-if-absent via a
+   * `null` base only when the row is truly absent); a corrupt row that is
+   * still durable conflicts the write, so this store never overwrites an
+   * unreadable row it cannot interpret. A row already at the safe integer
+   * ceiling rejects the bump: persisting `version + 1` would store a record
+   * this store's own parser fails closed on, so the write is refused instead
+   * of planting a row every later load treats as corrupt.
    */
   private async bumpAndSave(
     recipientId: string,
     pushEnabled: boolean,
   ): Promise<PushDeliveryPolicy> {
-    const existing = await this.load(recipientId);
-    const baseVersion = existing?.version ?? 0;
-    if (baseVersion >= Number.MAX_SAFE_INTEGER) {
-      throw new ElizaError(
-        "[PushPolicyStore] policy version exhausted the safe-integer range",
-        {
-          code: PUSH_POLICY_PERSIST_FAILED_CODE,
-          context: { recipientId: recipientId.length, baseVersion },
-          severity: "ephemeral",
-        },
+    for (let attempt = 0; attempt < PUSH_POLICY_MAX_CAS_ATTEMPTS; attempt++) {
+      const stored = await this.runtime.getCache<unknown>(
+        this.cacheKey(recipientId),
       );
+      const existing = parsePushDeliveryPolicy(stored);
+      if (existing && existing.version >= Number.MAX_SAFE_INTEGER) {
+        throw new ElizaError(
+          "[PushPolicyStore] policy version exhausted the safe-integer range",
+          {
+            code: PUSH_POLICY_PERSIST_FAILED_CODE,
+            context: {
+              recipientId: recipientId.length,
+              baseVersion: existing.version,
+            },
+            severity: "ephemeral",
+          },
+        );
+      }
+      // Corrupt-but-present rows are NOT treated as absent for writes: a
+      // non-null stored value that fails to parse conflicts the CAS (the
+      // caller/operator must repair it deliberately), preserving the
+      // fail-closed parse contract on the write side too.
+      const baseVersion = existing?.version ?? 0;
+      const expected = stored === undefined ? undefined : stored;
+      if (stored !== undefined && existing === null) {
+        throw new ElizaError(
+          "[PushPolicyStore] refusing to overwrite a corrupt policy row",
+          {
+            code: PUSH_POLICY_PERSIST_FAILED_CODE,
+            context: {
+              recipientLength: recipientId.length,
+              reason: "corrupt_row",
+            },
+            severity: "ephemeral",
+          },
+        );
+      }
+      const next: PushDeliveryPolicy = {
+        pushEnabled,
+        version: baseVersion + 1,
+        updatedAt: Date.now(),
+      };
+      const serialized = JSON.stringify(next);
+      if (serialized.length > MAX_POLICY_JSON_BYTES) {
+        throw new ElizaError(
+          "[PushPolicyStore] policy record exceeds size cap",
+          {
+            code: PUSH_POLICY_PERSIST_FAILED_CODE,
+            context: {
+              byteLength: serialized.length,
+              limit: MAX_POLICY_JSON_BYTES,
+            },
+            severity: "ephemeral",
+          },
+        );
+      }
+      let landed: boolean;
+      try {
+        landed = await this.runtime.compareAndSetCache(
+          this.cacheKey(recipientId),
+          expected,
+          next,
+        );
+      } catch (error) {
+        // error-policy:J2 context-adding rethrow — the candidate was never
+        // published and the underlying cause is preserved.
+        throw new ElizaError(
+          "[PushPolicyStore] failed to persist push-policy update",
+          {
+            code: PUSH_POLICY_PERSIST_FAILED_CODE,
+            cause: error,
+            context: { recipientLength: recipientId.length },
+            severity: "ephemeral",
+          },
+        );
+      }
+      if (landed) return next;
+      // Conflict: another writer (possibly another container generation during
+      // a blue/green upgrade) moved the row. Loop to reload the freshest base.
     }
-    const next: PushDeliveryPolicy = {
-      pushEnabled,
-      version: baseVersion + 1,
-      updatedAt: Date.now(),
-    };
-    await this.save(recipientId, next);
-    return next;
+    // error-policy:J2 context-adding rethrow — a persistently conflicting row
+    // is a failure the caller must see.
+    throw new ElizaError(
+      "[PushPolicyStore] push-policy cache conflicted past the retry budget",
+      {
+        code: PUSH_POLICY_CONFLICT_EXHAUSTED_CODE,
+        context: { attempts: PUSH_POLICY_MAX_CAS_ATTEMPTS },
+        severity: "ephemeral",
+      },
+    );
   }
 
   /**
@@ -270,20 +363,67 @@ export class PushPolicyStore {
         severity: "ephemeral",
       });
     }
-    const persisted = await this.runtime.setCache(
-      this.cacheKey(recipientId),
-      policy,
-    );
-    if (persisted !== true) {
-      throw new ElizaError(
-        "[PushPolicyStore] durable cache rejected the push-policy write",
-        {
-          code: PUSH_POLICY_PERSIST_FAILED_CODE,
-          context: { recipientLength: recipientId.length },
-          severity: "ephemeral",
-        },
+    // Write the record through the same bounded CAS loop `update()` uses, so
+    // the direct-save path is also conflict-safe across processes/containers
+    // (a blue/green overlap cannot silently overwrite a concurrent writer's
+    // row). The CAS is unconditional on CONTENT — `save` publishes exactly the
+    // caller's record, re-applying it to the freshest base on conflict — but
+    // conditional on CONFLICTS, preserving monotonic-version discipline.
+    for (let attempt = 0; attempt < PUSH_POLICY_MAX_CAS_ATTEMPTS; attempt++) {
+      const stored = await this.runtime.getCache<unknown>(
+        this.cacheKey(recipientId),
       );
+      // A corrupt-but-present row is never blindly overwritten (fail-closed
+      // on the write side, mirroring bumpAndSave): the operator must repair
+      // it deliberately. `null` parses cleanly as absent only when the row is
+      // truly absent.
+      if (stored !== undefined && parsePushDeliveryPolicy(stored) === null) {
+        throw new ElizaError(
+          "[PushPolicyStore] refusing to overwrite a corrupt policy row",
+          {
+            code: PUSH_POLICY_PERSIST_FAILED_CODE,
+            context: {
+              recipientLength: recipientId.length,
+              reason: "corrupt_row",
+            },
+            severity: "ephemeral",
+          },
+        );
+      }
+      let landed: boolean;
+      try {
+        landed = await this.runtime.compareAndSetCache(
+          this.cacheKey(recipientId),
+          stored,
+          policy,
+        );
+      } catch (error) {
+        // error-policy:J2 context-adding rethrow — the record was never
+        // published and the underlying cause is preserved.
+        throw new ElizaError(
+          "[PushPolicyStore] failed to persist push-policy save",
+          {
+            code: PUSH_POLICY_PERSIST_FAILED_CODE,
+            cause: error,
+            context: { recipientLength: recipientId.length },
+            severity: "ephemeral",
+          },
+        );
+      }
+      if (landed) return;
+      // Conflict: another writer (possibly another container generation)
+      // moved the row. Reload the freshest base and retry.
     }
+    // error-policy:J2 context-adding rethrow — a persistently conflicting row
+    // is a failure the caller must see, never a fabricated success.
+    throw new ElizaError(
+      "[PushPolicyStore] push-policy cache conflicted past the retry budget",
+      {
+        code: PUSH_POLICY_CONFLICT_EXHAUSTED_CODE,
+        context: { attempts: PUSH_POLICY_MAX_CAS_ATTEMPTS },
+        severity: "ephemeral",
+      },
+    );
   }
 }
 
@@ -292,6 +432,17 @@ export interface PushPolicyRuntime {
   agentId: string | UUIDLike;
   getCache<T>(key: string): Promise<T | undefined>;
   setCache<T>(key: string, value: T): Promise<boolean>;
+  /**
+   * Atomic conditional write (see `IAgentRuntime.compareAndSetCache`).
+   * `update()` requires it: the cross-process blue/green guarantee is built
+   * on CAS, and there is deliberately NO fallback to unconditional
+   * `setCache` (that would silently reopen the lost-update window).
+   */
+  compareAndSetCache<T>(
+    key: string,
+    expected: unknown,
+    replacement: T,
+  ): Promise<boolean>;
 }
 
 type UUIDLike = { toString(): string };
