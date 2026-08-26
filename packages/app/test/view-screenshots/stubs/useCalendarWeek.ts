@@ -22,6 +22,14 @@ export interface UseCalendarWeekResult {
   loading: boolean;
   refreshing: boolean;
   error: string | null;
+  errorKind:
+    | "capability"
+    | "auth"
+    | "permission"
+    | "offline"
+    | "timeout"
+    | "server"
+    | null;
   viewMode: CalendarViewMode;
   setViewMode: (mode: CalendarViewMode) => void;
   baseDate: Date;

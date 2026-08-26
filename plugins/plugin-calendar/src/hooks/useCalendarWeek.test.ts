@@ -38,6 +38,10 @@ vi.mock("@elizaos/ui/api", () => ({
   ElizaClient: class {
     fetch = vi.fn(async () => ({}));
   },
+  isApiError: (value: unknown): value is import("@elizaos/ui/api").ApiError =>
+    typeof value === "object" &&
+    value !== null &&
+    (value as { name?: unknown }).name === "ApiError",
 }));
 
 vi.mock("@elizaos/ui/state", () => ({
@@ -49,7 +53,7 @@ vi.mock("@elizaos/ui/state", () => ({
   ) => selector(calendarWeekAppValue),
 }));
 
-import { useCalendarWeek } from "./useCalendarWeek.js";
+import { classifyCalendarError, useCalendarWeek } from "./useCalendarWeek.js";
 
 function event(
   id: string,
@@ -562,5 +566,151 @@ describe("useCalendarWeek", () => {
     expect(result.current.events.map((item) => item.id)).toEqual(["latest"]);
     expect(result.current.status).toBe("ready");
     expect(result.current.sources).toEqual([latestSource]);
+  });
+});
+
+/**
+ * Stand-in ApiError matching the base client's shape (name + kind/status/code)
+ * — the hook classifies through `isApiError`, which the module mock above
+ * implements as a name check.
+ */
+function apiError(over: {
+  kind: string;
+  status?: number;
+  code?: string;
+  message: string;
+}): Error {
+  const error = new Error(over.message) as Error & {
+    kind: string;
+    status?: number;
+    code?: string;
+  };
+  error.name = "ApiError";
+  error.kind = over.kind;
+  error.status = over.status;
+  error.code = over.code;
+  return error;
+}
+
+describe("classifyCalendarError", () => {
+  it("maps the shared-tier typed 503 to the capability class", () => {
+    expect(
+      classifyCalendarError(
+        apiError({
+          kind: "http",
+          status: 503,
+          code: "calendar_runtime_unavailable",
+          message: "Calendar requires a dedicated agent runtime",
+        }),
+      ),
+    ).toBe("capability");
+  });
+
+  it("keeps a bare dedicated-tier 503 a retryable server error", () => {
+    expect(
+      classifyCalendarError(
+        apiError({
+          kind: "http",
+          status: 503,
+          message: "Calendar service is not available",
+        }),
+      ),
+    ).toBe("server");
+  });
+
+  it("maps auth and permission statuses", () => {
+    expect(
+      classifyCalendarError(
+        apiError({ kind: "http", status: 401, message: "Unauthorized" }),
+      ),
+    ).toBe("auth");
+    expect(
+      classifyCalendarError(
+        apiError({ kind: "http", status: 403, message: "Forbidden" }),
+      ),
+    ).toBe("permission");
+  });
+
+  it("maps timeout, offline, and unknown failures", () => {
+    expect(
+      classifyCalendarError(
+        apiError({ kind: "timeout", message: "timed out" }),
+      ),
+    ).toBe("timeout");
+    const offline = apiError({ kind: "network", message: "fetch failed" });
+    // jsdom defaults to navigator.onLine === true; flip it for the offline
+    // probe and restore it afterwards.
+    const originalOnLine = navigator.onLine;
+    Object.defineProperty(navigator, "onLine", {
+      value: false,
+      configurable: true,
+    });
+    try {
+      expect(classifyCalendarError(offline)).toBe("offline");
+    } finally {
+      Object.defineProperty(navigator, "onLine", {
+        value: originalOnLine,
+        configurable: true,
+      });
+    }
+    expect(
+      classifyCalendarError(apiError({ kind: "network", message: "refused" })),
+    ).toBe("server");
+    expect(classifyCalendarError(new Error("boom"))).toBe("server");
+    expect(classifyCalendarError("not an error")).toBe("server");
+  });
+});
+
+describe("useCalendarWeek error classification and cache windows", () => {
+  it("classifies the shared-tier capability gate on the hook result", async () => {
+    uiClient.getLifeOpsCalendarFeed.mockRejectedValue(
+      apiError({
+        kind: "http",
+        status: 503,
+        code: "calendar_runtime_unavailable",
+        message: "Calendar requires a dedicated agent runtime",
+      }),
+    );
+
+    const { result } = renderHook(() => useCalendarWeek());
+
+    await waitFor(() => expect(result.current.status).toBe("error"));
+    expect(result.current.errorKind).toBe("capability");
+    expect(result.current.loading).toBe(false);
+  });
+
+  it("clears the cached window when a DIFFERENT window fails to load", async () => {
+    uiClient.getLifeOpsCalendarFeed
+      .mockResolvedValueOnce(
+        feed(
+          [
+            event(
+              "june-event",
+              "2026-06-15T09:00:00.000Z",
+              "2026-06-15T10:00:00.000Z",
+            ),
+          ],
+          "complete",
+          [source({ summary: "June source" })],
+        ),
+      )
+      .mockRejectedValueOnce(new Error("next month transport failed"));
+
+    const { result } = renderHook(() =>
+      useCalendarWeek({
+        baseDate: new Date(2026, 5, 10, 12),
+        viewMode: "month",
+      }),
+    );
+    await waitFor(() => expect(result.current.status).toBe("ready"));
+
+    act(() => result.current.goToDate(new Date(2026, 8, 10, 12)));
+    await waitFor(() => expect(result.current.status).toBe("error"));
+
+    expect(result.current.events).toEqual([]);
+    expect(result.current.feedState).toBeNull();
+    expect(result.current.sources).toEqual([]);
+    expect(result.current.error).toBe("next month transport failed");
+    expect(result.current.errorKind).toBe("server");
   });
 });

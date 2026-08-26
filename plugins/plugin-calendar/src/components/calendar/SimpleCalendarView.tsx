@@ -21,15 +21,26 @@ import {
   PopoverTrigger,
 } from "@elizaos/ui/components";
 import { useViewEvent, VIEW_EVENTS } from "@elizaos/ui/events";
-import { ChevronDown, ChevronLeft, ChevronRight, Clock3 } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  Clock3,
+  RotateCcw,
+} from "lucide-react";
 import {
   type CSSProperties,
+  type ReactNode,
   useCallback,
   useEffect,
   useMemo,
   useState,
 } from "react";
-import { useCalendarWeek } from "../../hooks/useCalendarWeek.js";
+import {
+  type CalendarErrorKind,
+  useCalendarWeek,
+} from "../../hooks/useCalendarWeek.js";
+import { CalendarSourceHealth } from "../CalendarSourceHealth.js";
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTHS = Array.from({ length: 12 }, (_, month) =>
@@ -578,13 +589,48 @@ function EventRow({ event }: { event: LifeOpsCalendarEvent }) {
   );
 }
 
-function StatusCard({ message }: { message: string }) {
+function StatusCard({
+  message,
+  onRetry,
+  retryDisabled,
+  children,
+}: {
+  message: string;
+  onRetry?: () => void;
+  retryDisabled?: boolean;
+  children?: ReactNode;
+}) {
   return (
     <div role="alert" style={{ ...PANEL_STYLE, padding: 18 }}>
       <strong style={{ display: "block", fontSize: 14 }}>{message}</strong>
+      {children}
+      {onRetry ? (
+        <Button
+          variant="surface"
+          size="regularCompact"
+          style={{ marginTop: 10, minHeight: 44 }}
+          onClick={onRetry}
+          disabled={retryDisabled}
+          aria-label="Retry loading calendar"
+        >
+          <RotateCcw size={15} aria-hidden />
+          Retry
+        </Button>
+      ) : null}
     </div>
   );
 }
+
+/** Copy per classified failure; null means fall back to the raw message. */
+const ERROR_KIND_COPY: Record<CalendarErrorKind, string> = {
+  capability:
+    "Calendar is available on dedicated agents. Upgrade this agent to use Calendar.",
+  auth: "Calendar needs you to sign in again.",
+  permission: "You do not have permission to view this calendar.",
+  offline: "Calendar cannot load while you are offline.",
+  timeout: "Calendar is taking too long to respond. Try again.",
+  server: "Calendar failed to load. Try again.",
+};
 
 export function SimpleCalendarView() {
   const calendar = useCalendarWeek({ viewMode: "month" });
@@ -624,18 +670,28 @@ export function SimpleCalendarView() {
     (month: Date) => calendar.goToDate(month),
     [calendar.goToDate],
   );
-  const loaded = calendar.feedState !== null;
+
+  // The hook's status contract — never `feedState !== null` — decides what
+  // renders. A settled failure (`status === "error"`) must never paint the
+  // loading skeleton; a background refresh keeps the loaded grid on screen.
+  const settled = calendar.status === "loading" && calendar.feedState === null;
+  const errorCopy =
+    calendar.errorKind !== null && calendar.events.length === 0
+      ? (ERROR_KIND_COPY[calendar.errorKind] ?? calendar.error)
+      : calendar.error;
+  const showRetry =
+    calendar.status === "error" && calendar.errorKind !== "capability";
   const detail = calendar.error
-    ? loaded
+    ? calendar.events.length > 0
       ? `${calendar.events.length} events · refresh unavailable`
       : "Calendar unavailable"
-    : calendar.loading && !loaded
+    : settled
       ? "Loading calendar…"
       : `${calendar.events.length} ${calendar.events.length === 1 ? "event" : "events"}`;
 
   return (
     <main
-      aria-busy={calendar.loading}
+      aria-busy={calendar.status === "loading"}
       aria-label={`Calendar. ${detail}`}
       data-testid="simple-calendar-view"
       style={ROOT_STYLE}
@@ -659,13 +715,38 @@ export function SimpleCalendarView() {
           marginInline: "auto",
         }}
       >
-        {calendar.error ? (
+        {calendar.status === "error" ? (
           <div style={{ gridColumn: "1 / -1" }}>
-            <StatusCard message={calendar.error} />
+            <StatusCard
+              message={errorCopy ?? "Calendar unavailable"}
+              onRetry={showRetry ? () => void calendar.refresh() : undefined}
+              retryDisabled={calendar.loading}
+            >
+              {calendar.events.length > 0 ? (
+                <p style={SECONDARY_STYLE}>
+                  Showing {calendar.events.length} previously loaded{" "}
+                  {calendar.events.length === 1 ? "event" : "events"}.
+                </p>
+              ) : null}
+            </StatusCard>
           </div>
         ) : calendar.status === "unavailable" ? (
           <div style={{ gridColumn: "1 / -1" }}>
-            <StatusCard message="Calendar sources are unavailable." />
+            <StatusCard
+              message="Calendar sources are unavailable."
+              onRetry={() => void calendar.refresh()}
+              retryDisabled={calendar.loading}
+            />
+          </div>
+        ) : null}
+        {calendar.status === "partial" || calendar.status === "ready" ? (
+          <div style={{ gridColumn: "1 / -1" }}>
+            <CalendarSourceHealth
+              status={calendar.status}
+              sources={calendar.sources}
+              refreshing={calendar.refreshing}
+              onRefresh={() => void calendar.refresh()}
+            />
           </div>
         ) : null}
 
@@ -750,8 +831,8 @@ export function SimpleCalendarView() {
                 {formatSelectedDate(selectedDate)}
               </h2>
               <p style={{ ...SECONDARY_STYLE, marginTop: 3, fontSize: 12 }}>
-                {!loaded
-                  ? "Loading calendar\u2026"
+                {settled
+                  ? "Loading calendar…"
                   : selectedEvents.length === 0
                     ? "No plans yet"
                     : `${selectedEvents.length} ${selectedEvents.length === 1 ? "event" : "events"}`}
@@ -759,7 +840,7 @@ export function SimpleCalendarView() {
             </div>
             <Clock3 size={16} aria-hidden style={{ color: "var(--muted)" }} />
           </div>
-          {!loaded ? (
+          {settled ? (
             <div
               role="status"
               aria-label="Calendar events are loading"

@@ -3,6 +3,9 @@
  *
  * Consumers receive events and the authoritative complete/partial/unavailable
  * state together, so a failed source can never render as a healthy empty week.
+ * Failures settle with a classified {@link CalendarErrorKind} (capability vs
+ * auth vs transport), and previously loaded data survives only when the failed
+ * request targeted the same window.
  */
 
 import type {
@@ -10,7 +13,7 @@ import type {
   LifeOpsCalendarFeedState,
   LifeOpsCalendarSourceHealth,
 } from "@elizaos/shared";
-import { client } from "@elizaos/ui/api";
+import { client, isApiError } from "@elizaos/ui/api";
 import { useAppSelector } from "@elizaos/ui/state";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "../api/client-calendar.js";
@@ -19,6 +22,21 @@ import type { CalendarClientMethods } from "../api/client-calendar.js";
 const calendarClient = client as typeof client & CalendarClientMethods;
 
 export type CalendarViewMode = "day" | "week" | "month";
+
+/**
+ * Why a calendar fetch failed, classified at the transport boundary. The
+ * distinction drives the view's copy and affordances: only `capability` hides
+ * Retry (upgrading the tier, not re-sending, is the fix), while `offline` and
+ * `timeout` keep previously loaded data on screen.
+ */
+export type CalendarErrorKind =
+  | "capability"
+  | "auth"
+  | "permission"
+  | "offline"
+  | "timeout"
+  | "server";
+
 export type CalendarSurfaceStatus =
   | "loading"
   | "empty"
@@ -26,6 +44,39 @@ export type CalendarSurfaceStatus =
   | "partial"
   | "unavailable"
   | "error";
+
+/** The shared-tier calendar capability gate's typed response code. */
+const CALENDAR_RUNTIME_UNAVAILABLE_CODE = "calendar_runtime_unavailable";
+
+/**
+ * Maps a settled fetch failure to its user-facing class. Ordered by
+ * specificity: the typed capability gate first (a bare 503 from the dedicated
+ * tier's `Calendar service is not available` must stay a retryable `server`
+ * error), then transport kinds the base client already distinguishes. The
+ * connectivity check disambiguates a `network` fetch failure while the device
+ * is actually online (server-side refusal) from true offline.
+ */
+export function classifyCalendarError(cause: unknown): CalendarErrorKind {
+  if (isApiError(cause)) {
+    if (
+      cause.code === CALENDAR_RUNTIME_UNAVAILABLE_CODE &&
+      cause.status === 503
+    ) {
+      return "capability";
+    }
+    if (cause.status === 401) return "auth";
+    if (cause.status === 403) return "permission";
+    if (cause.kind === "timeout") return "timeout";
+    if (
+      cause.kind === "network" &&
+      typeof navigator !== "undefined" &&
+      !navigator.onLine
+    ) {
+      return "offline";
+    }
+  }
+  return "server";
+}
 
 export interface UseCalendarWeekOptions {
   viewMode?: CalendarViewMode;
@@ -41,6 +92,8 @@ export interface UseCalendarWeekResult {
   loading: boolean;
   refreshing: boolean;
   error: string | null;
+  /** Classified cause of the settled `error`, when one exists. */
+  errorKind: CalendarErrorKind | null;
   viewMode: CalendarViewMode;
   setViewMode: (mode: CalendarViewMode) => void;
   baseDate: Date;
@@ -100,6 +153,13 @@ export function useCalendarWeek(
   const [sources, setSources] = useState<LifeOpsCalendarSourceHealth[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [errorKind, setErrorKind] = useState<CalendarErrorKind | null>(null);
+  // Window key of the last SUCCESSFUL load. On a failed fetch, cached
+  // events/feedState/sources survive only when the failed request targeted the
+  // same window (stale-while-error for a refresh); a failed navigation to a
+  // different window clears them so the grid never renders another month's
+  // data as if it were the requested one.
+  const loadedWindowKeyRef = useRef<string | null>(null);
 
   const windowStart = useMemo(() => {
     const dayStart = startOfLocalDay(baseDate);
@@ -155,9 +215,11 @@ export function useCalendarWeek(
     activeRequestId.current = requestId;
     const isCurrentRequest = () =>
       mountedRef.current && activeRequestId.current === requestId;
+    const windowKey = `${viewMode}:${windowStart.toISOString()}`;
 
     setLoading(true);
     setError(null);
+    setErrorKind(null);
     try {
       const feed = await calendarClient.getLifeOpsCalendarFeed({
         side: "owner",
@@ -172,9 +234,18 @@ export function useCalendarWeek(
       setEvents(sorted);
       setFeedState(feed.state);
       setSources([...feed.sources]);
+      loadedWindowKeyRef.current = windowKey;
     } catch (cause) {
       // error-policy:J4 The calendar renders transport failure separately from an authoritative empty feed.
       if (!isCurrentRequest()) return;
+      if (loadedWindowKeyRef.current !== windowKey) {
+        // The failed request targeted a window we never loaded: drop the
+        // previous window's cache instead of painting it as the new window.
+        setEvents([]);
+        setFeedState(null);
+        setSources([]);
+      }
+      setErrorKind(classifyCalendarError(cause));
       setError(
         cause instanceof Error && cause.message.trim().length > 0
           ? cause.message.trim()
@@ -185,7 +256,7 @@ export function useCalendarWeek(
         setLoading(false);
       }
     }
-  }, [windowStart, windowEnd, loadFailedMessage]);
+  }, [windowStart, windowEnd, viewMode, loadFailedMessage]);
 
   useEffect(() => {
     void fetch();
@@ -209,6 +280,7 @@ export function useCalendarWeek(
     loading,
     refreshing: loading && feedState !== null,
     error,
+    errorKind,
     viewMode,
     setViewMode,
     baseDate,

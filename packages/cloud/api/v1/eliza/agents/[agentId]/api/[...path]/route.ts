@@ -7,9 +7,9 @@
  * routine probes (runtime mode, slash-command catalog, custom actions, agent
  * events, stream settings, overlay presence, view navigation) — each answered
  * with this tier's honest state rather than left to 404 into a client error
- * path. It also translates the app's `/api/automations`, `/api/workflow/*`, and
- * LifeOps activity-signal requests into the canonical typed
- * capability-unavailable response. Generated routing mounts the specific
+ * path. It also translates the app's `/api/automations`, `/api/workflow/*`,
+ * LifeOps activity-signal, and LifeOps calendar requests into the canonical
+ * typed capability-unavailable responses. Generated routing mounts the specific
  * conversation, health, identity, and wallet siblings first; unknown catch-all
  * paths remain 404. Production Dedicated agents use their own subdomain and
  * never enter this adapter; only the local harness's loopback Dedicated
@@ -52,7 +52,10 @@ import type { AppEnv } from "@/types/cloud-worker-env";
 import { workflowRuntimeUnavailableResponse } from "../../workflows/_shared";
 import { proxyLocalDedicatedOrNext } from "../_local-dedicated-proxy";
 
-const CORS_METHODS = "GET, POST, PUT, DELETE, OPTIONS";
+// PATCH joins the method list: the calendar event-update and ICS-source
+// clients issue PATCH against `/api/lifeops/calendar/*`, and a preflight that
+// omits PATCH would downgrade the typed 503 gate into an opaque network error.
+const CORS_METHODS = "GET, POST, PUT, PATCH, DELETE, OPTIONS";
 const MAX_PUSH_REGISTRATION_BODY_BYTES = 8_192;
 
 const app = new Hono<AppEnv>();
@@ -82,6 +85,17 @@ function shellPath(c: Context<AppEnv>): string {
 
 function isWorkflowApiPath(path: string): boolean {
   return path === "workflow" || path.startsWith("workflow/");
+}
+
+/**
+ * Calendar routes under `/api/lifeops/calendar/*` are served only by the
+ * personal-assistant host on a dedicated runtime (plugin-calendar's shared
+ * host adapter). A Tier-0 shared agent has no calendar service at all, so
+ * these paths must answer the typed calendar capability gate rather than the
+ * generic 404 the client cannot distinguish from a dead endpoint.
+ */
+function isLifeOpsCalendarPath(path: string): boolean {
+  return path === "lifeops/calendar" || path.startsWith("lifeops/calendar/");
 }
 
 /** `views/<viewId>/navigate` → `<viewId>`; null for any other shape. */
@@ -163,6 +177,42 @@ function lifeopsUnavailable(c: Context<AppEnv>): Response {
       capability: "lifeops-activity-signals",
       requiredExecutionTier: "dedicated-always",
       upgradeRequired: true,
+    },
+    503,
+  );
+}
+
+/**
+ * Calendar data and owner mutations require plugin-calendar's host adapter,
+ * which only a dedicated runtime mounts. The response mirrors
+ * {@link lifeopsUnavailable}'s tier-gate shape plus the canonical upgrade
+ * pointer (the `/upgrade-tier` endpoint the Dedicated→Shared recovery and
+ * upgrade flows already use), so the client classifies it as a capability
+ * boundary — `calendar_runtime_unavailable` — instead of a transport error.
+ * Deliberately NOT `retryable`: the capability cannot appear while the agent
+ * stays on the shared tier, so auto-retry would only burn quota.
+ */
+function calendarUnavailable(
+  c: Context<AppEnv>,
+  agentId: string,
+  executionTier: string,
+): Response {
+  return json(
+    c,
+    {
+      success: false,
+      code: "calendar_runtime_unavailable",
+      error:
+        "Calendar requires a dedicated agent runtime; this shared agent cannot serve calendar data.",
+      capability: "lifeops-calendar",
+      currentExecutionTier: executionTier,
+      requiredExecutionTier: "dedicated-always",
+      upgradeRequired: true,
+      upgrade: {
+        automatic: false,
+        method: "POST",
+        endpoint: `/api/v1/eliza/agents/${encodeURIComponent(agentId)}/upgrade-tier`,
+      },
     },
     503,
   );
@@ -275,6 +325,10 @@ app.get("/", async (c) => {
   if (path === "automations" || isWorkflowApiPath(path)) {
     return workflowUnavailable(c, r.agentId, r.agent.execution_tier);
   }
+  // Calendar reads need plugin-calendar's host adapter (dedicated-only).
+  if (isLifeOpsCalendarPath(path)) {
+    return calendarUnavailable(c, r.agentId, r.agent.execution_tier);
+  }
   switch (path) {
     case "status":
       // The startup-coordinator's first gate — must answer before first-run.
@@ -366,6 +420,11 @@ app.post("/", async (c) => {
   }
   if (isWorkflowApiPath(path)) {
     return workflowUnavailable(c, r.agentId, r.agent.execution_tier);
+  }
+  // Calendar owner mutations (event create/update/delete, ICS source admin)
+  // need plugin-calendar's host adapter (dedicated-only).
+  if (isLifeOpsCalendarPath(path)) {
+    return calendarUnavailable(c, r.agentId, r.agent.execution_tier);
   }
   // POST .../api/agent/start — the client's startup handshake.
   // A shared agent runs in-Worker with no agent server to boot, so the "start"
@@ -465,6 +524,11 @@ async function handleWorkflowMutation(c: Context<AppEnv>): Promise<Response> {
   if (isWorkflowApiPath(shellPath(c))) {
     return workflowUnavailable(c, r.agentId, r.agent.execution_tier);
   }
+  // Calendar owner mutations (include toggles, auto-join policy, ICS source
+  // updates) need plugin-calendar's host adapter (dedicated-only).
+  if (isLifeOpsCalendarPath(shellPath(c))) {
+    return calendarUnavailable(c, r.agentId, r.agent.execution_tier);
+  }
   return json(
     c,
     { success: false, error: "Not found", code: "resource_not_found" },
@@ -473,6 +537,7 @@ async function handleWorkflowMutation(c: Context<AppEnv>): Promise<Response> {
 }
 
 app.put("/", handleWorkflowMutation);
+app.patch("/", handleWorkflowMutation);
 app.delete("/", handleWorkflowMutation);
 
 export default app;
