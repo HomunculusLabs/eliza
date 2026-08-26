@@ -29,19 +29,42 @@ export const CACHE_CAS_CAPABILITY_REQUIRED_CODE =
 	"CACHE_CAS_CAPABILITY_REQUIRED";
 
 /**
- * True when `value` can round-trip through the durable cache: JSON primitives,
- * plain objects, arrays, and `null` are representable; `undefined`, functions,
- * symbols, bigint, and non-finite numbers are not (they cannot survive a
- * `setCache` → `getCache` round-trip on ANY adapter, so accepting them here
- * would create a write that later compares unequal against itself).
+ * True when `value` can round-trip through the durable cache AND through every
+ * production adapter's storage: JSON primitives, plain objects, arrays, and
+ * `null` are representable; `undefined`, functions, symbols, bigint, and
+ * non-finite numbers are not (they cannot survive a `setCache` → `getCache`
+ * round-trip on ANY adapter, so accepting them here would create a write that
+ * later compares unequal against itself). Strings are additionally restricted
+ * to the PostgreSQL jsonb string domain: no NUL (`\u0000`, rejected by jsonb)
+ * and no lone UTF-16 surrogates (rejected by PostgreSQL's UTF-8 encoding), so a
+ * value validated here cannot succeed in-memory and then throw
+ * `CACHE_CAS_FAILED` on the SQL adapters.
  */
+export function isPostgresJsonbString(value: string): boolean {
+	if (value.includes("\u0000")) return false;
+	// A lone surrogate cannot be encoded to UTF-8; every code unit must either
+	// be unpaired-or-BMP-complete or half of a valid surrogate pair.
+	for (let i = 0; i < value.length; i++) {
+		const code = value.charCodeAt(i);
+		if (code >= 0xd800 && code <= 0xdbff) {
+			// High surrogate: must be followed by a low surrogate.
+			const next = value.charCodeAt(i + 1);
+			if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+			i++;
+		} else if (code >= 0xdc00 && code <= 0xdfff) {
+			// Low surrogate without a preceding high surrogate.
+			return false;
+		}
+	}
+	return true;
+}
+
 export function isRepresentableCacheValue(value: unknown): boolean {
-	if (
-		value === null ||
-		typeof value === "string" ||
-		typeof value === "boolean"
-	) {
+	if (value === null || typeof value === "boolean") {
 		return true;
+	}
+	if (typeof value === "string") {
+		return isPostgresJsonbString(value);
 	}
 	if (typeof value === "number") {
 		return Number.isFinite(value);
@@ -50,36 +73,30 @@ export function isRepresentableCacheValue(value: unknown): boolean {
 		return value.every(isRepresentableCacheValue);
 	}
 	if (isPlainObject(value)) {
-		return Object.values(value).every(isRepresentableCacheValue);
+		// jsonb rejects NUL and PostgreSQL's UTF-8 encoding rejects lone
+		// surrogates in object KEYS exactly as in string values (JSON itself
+		// permits both), so keys must pass the same domain check as values.
+		return Object.entries(value).every(
+			([key, entry]) =>
+				isPostgresJsonbString(key) && isRepresentableCacheValue(entry),
+		);
 	}
 	return false;
 }
 
 /**
  * Validate one side of a compare-and-set at the boundary. `expected` may
- * additionally be `undefined` (the absent sentinel); a literal `null` expected
- * is rejected as contract misuse — `undefined` is the only absent sentinel on
- * this contract (the runtime cache surface has no JSON-null-absent
- * distinction), and accepting `null` would give adapters two ways to say
- * "absent", inviting silent cross-adapter divergence. (JSON `null` remains a
- * valid `replacement`/stored value; only a null EXPECTATION is rejected.)
+ * additionally be `undefined` (the absent sentinel); a literal JSON `null`
+ * expected is VALID and means "the row exists storing JSON null" — `null` is
+ * representable in a NOT NULL jsonb column (distinct from SQL NULL), and
+ * `undefined` already owns the absent meaning, so rejecting `null` would make
+ * a stored-`null` row permanently unreplacable by every caller.
  */
 export function assertCasValue(
 	value: unknown,
 	role: "expected" | "replacement",
 ): void {
 	if (role === "expected" && value === undefined) return;
-	if (role === "expected" && value === null) {
-		// `undefined` is the only absent sentinel on this contract; a null
-		// expectation is a caller bug, not a matchable value.
-		throw new ElizaError(
-			"[compareAndSetCache] null expected is a contract misuse",
-			{
-				code: CACHE_CAS_INVALID_VALUE_CODE,
-				context: { role, reason: "null_expected" },
-			},
-		);
-	}
 	if (isRepresentableCacheValue(value)) return;
 	throw new ElizaError(
 		"[compareAndSetCache] value is not a representable cache payload",

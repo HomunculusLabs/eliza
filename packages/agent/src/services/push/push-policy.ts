@@ -364,19 +364,19 @@ export class PushPolicyStore {
       });
     }
     // Write the record through the same bounded CAS loop `update()` uses, so
-    // the direct-save path is also conflict-safe across processes/containers
-    // (a blue/green overlap cannot silently overwrite a concurrent writer's
-    // row). The CAS is unconditional on CONTENT — `save` publishes exactly the
-    // caller's record, re-applying it to the freshest base on conflict — but
-    // conditional on CONFLICTS, preserving monotonic-version discipline.
+    // the direct-save path is also conflict-safe across processes/containers.
+    // On conflict the record's version is re-validated against the FRESHEST
+    // base: a save may only land at a strictly greater version than anything
+    // durably observed (monotonic-version discipline — no ABA, no regression
+    // to a stale record), and a caller-supplied version at or below the
+    // durable row is a typed rejection, never a silent overwrite.
     for (let attempt = 0; attempt < PUSH_POLICY_MAX_CAS_ATTEMPTS; attempt++) {
       const stored = await this.runtime.getCache<unknown>(
         this.cacheKey(recipientId),
       );
       // A corrupt-but-present row is never blindly overwritten (fail-closed
       // on the write side, mirroring bumpAndSave): the operator must repair
-      // it deliberately. `null` parses cleanly as absent only when the row is
-      // truly absent.
+      // it deliberately.
       if (stored !== undefined && parsePushDeliveryPolicy(stored) === null) {
         throw new ElizaError(
           "[PushPolicyStore] refusing to overwrite a corrupt policy row",
@@ -385,6 +385,22 @@ export class PushPolicyStore {
             context: {
               recipientLength: recipientId.length,
               reason: "corrupt_row",
+            },
+            severity: "ephemeral",
+          },
+        );
+      }
+      const durable = parsePushDeliveryPolicy(stored);
+      if (durable !== null && policy.version <= durable.version) {
+        throw new ElizaError(
+          "[PushPolicyStore] refusing a non-monotonic policy save",
+          {
+            code: PUSH_POLICY_PERSIST_FAILED_CODE,
+            context: {
+              recipientLength: recipientId.length,
+              reason: "version_not_monotonic",
+              durableVersion: durable.version,
+              saveVersion: policy.version,
             },
             severity: "ephemeral",
           },
@@ -412,7 +428,7 @@ export class PushPolicyStore {
       }
       if (landed) return;
       // Conflict: another writer (possibly another container generation)
-      // moved the row. Reload the freshest base and retry.
+      // moved the row. Reload the freshest base and re-validate the version.
     }
     // error-policy:J2 context-adding rethrow — a persistently conflicting row
     // is a failure the caller must see, never a fabricated success.

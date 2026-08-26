@@ -701,8 +701,8 @@ export abstract class DatabaseAdapter<DB extends object = object>
 	 */
 	compareAndSetCache<T>(
 		key: string,
-		expected: unknown,
-		replacement: T,
+		_expected: unknown,
+		_replacement: T,
 	): Promise<boolean> {
 		throw new ElizaError(
 			"Database adapter does not support atomic cache compare-and-set",

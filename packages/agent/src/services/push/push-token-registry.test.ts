@@ -121,6 +121,64 @@ describe("PushTokenRegistry", () => {
     await expect(registry.register("ios", "   ")).rejects.toThrow(/token/);
   });
 
+  it("an absent unregister never creates or bumps the durable row (F7: no phantom write)", async () => {
+    expect(await registry.unregister("never-registered")).toBe(false);
+    expect(ctx.cache.has(KEY)).toBe(false);
+    await registry.register("ios", "tok-live");
+    const before = readEnvelope(ctx.cache).version;
+    expect(await registry.unregister("never-registered-2")).toBe(false);
+    expect(readEnvelope(ctx.cache).version).toBe(before);
+    expect(readEnvelope(ctx.cache).tokens).toHaveLength(1);
+  });
+
+  it("hydration never rewrites an over-ceiling ENVELOPE row (F2: the durable dump survives repair)", async () => {
+    const oversized = Array.from(
+      { length: MAX_PERSISTED_PUSH_TOKENS + 1 },
+      (_, i) => ({
+        token: `t-${i}`,
+        platform: "ios",
+        createdAt: i + 1,
+      }),
+    );
+    ctx.cache.set(KEY, { version: 2, tokens: oversized });
+    // First read fails closed to empty but must leave the durable row intact.
+    expect(await registry.count()).toBe(0);
+    await new Promise((r) => setTimeout(r, 50));
+    const row = ctx.cache.get(KEY) as { version: number; tokens: unknown[] };
+    expect(row.tokens).toHaveLength(MAX_PERSISTED_PUSH_TOKENS + 1);
+    expect(row.version).toBe(2);
+  });
+
+  it("a mutation on a MAX_SAFE_INTEGER-1 envelope refuses the bump too — writing MAX would plant the poison row (N1 off-by-one)", async () => {
+    ctx.cache.set(KEY, {
+      version: Number.MAX_SAFE_INTEGER - 1,
+      tokens: [{ token: "edge-tok", platform: "ios", createdAt: 1 }],
+    });
+    await expect(registry.register("ios", "next-tok")).rejects.toMatchObject({
+      name: "ElizaError",
+      code: PUSH_TOKEN_PERSIST_FAILED_CODE,
+      context: { reason: "version_exhausted" },
+    });
+    const row = ctx.cache.get(KEY) as { version: number; tokens: unknown[] };
+    expect(row.version).toBe(Number.MAX_SAFE_INTEGER - 1);
+    expect(row.tokens).toHaveLength(1);
+  });
+
+  it("a mutation on an exhausted-version envelope refuses the bump instead of destroying the row (F3)", async () => {
+    ctx.cache.set(KEY, {
+      version: Number.MAX_SAFE_INTEGER,
+      tokens: [{ token: "ceiling-tok", platform: "ios", createdAt: 1 }],
+    });
+    await expect(registry.register("ios", "next-tok")).rejects.toMatchObject({
+      name: "ElizaError",
+      code: PUSH_TOKEN_PERSIST_FAILED_CODE,
+      context: { reason: "version_exhausted" },
+    });
+    const row = ctx.cache.get(KEY) as { version: number; tokens: unknown[] };
+    expect(row.version).toBe(Number.MAX_SAFE_INTEGER);
+    expect(row.tokens).toHaveLength(1);
+  });
+
   it("unregisters and reports existence", async () => {
     await registry.register("ios", "tok-c");
     expect(await registry.unregister("tok-c")).toBe(true);

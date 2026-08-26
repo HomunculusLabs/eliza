@@ -282,37 +282,31 @@ export class PushTokenRegistry {
     const { records, version } = parsePersistedRow(stored);
     const repaired =
       stored !== undefined &&
+      !isOverCeilingRow(stored) &&
       !isCanonicalPersistedRow(stored, records, version);
     this.tokens = new Map(records.map((record) => [record.token, record]));
     this.persistedBaseline = stored;
     this.persistedVersion = version;
     this.hydrated = true;
     if (repaired) {
-      // An over-ceiling row failed closed to empty and must NOT be rewritten:
-      // the repair would persist the (empty) normalized view, destroying the
-      // original durable dump the comments above promise to leave intact.
-      const overCeiling =
-        Array.isArray(stored) && stored.length > MAX_PERSISTED_PUSH_TOKENS;
-      if (!overCeiling) {
-        // Durable one-time repair: rewrite the normalized (validated, deduped,
-        // capped) envelope so later restarts do not re-scan the same dirty dump.
-        // The repair is itself a CAS against the raw dirty baseline, so a
-        // concurrent writer that moves the row first CONFLICTS the repair
-        // instead of being silently overwritten (the exact blue/green race the
-        // CAS primitive exists for). Best-effort: a failed/conflicted repair
-        // only means we re-normalize next start; it must not fail the read path.
-        try {
-          await this.repairPersistedRow();
-        } catch (error) {
-          // error-policy:J7 diagnostics must not kill the loop — a failed
-          // one-time repair write degrades to re-scanning on the next start.
-          this.runtime.reportError("push.registry.repair", error, {
-            tokenCount: this.tokens.size,
-          });
-          logger.warn(
-            "[PushTokenRegistry] durable repair write failed; will re-normalize on next hydrate",
-          );
-        }
+      // Durable one-time repair: rewrite the normalized (validated, deduped,
+      // capped) envelope so later restarts do not re-scan the same dirty dump.
+      // The repair is itself a CAS against the raw dirty baseline, so a
+      // concurrent writer that moves the row first CONFLICTS the repair
+      // instead of being silently overwritten (the exact blue/green race the
+      // CAS primitive exists for). Best-effort: a failed/conflicted repair
+      // only means we re-normalize next start; it must not fail the read path.
+      try {
+        await this.repairPersistedRow();
+      } catch (error) {
+        // error-policy:J7 diagnostics must not kill the loop — a failed
+        // one-time repair write degrades to re-scanning on the next start.
+        this.runtime.reportError("push.registry.repair", error, {
+          tokenCount: this.tokens.size,
+        });
+        logger.warn(
+          "[PushTokenRegistry] durable repair write failed; will re-normalize on next hydrate",
+        );
       }
     }
   }
@@ -324,6 +318,25 @@ export class PushTokenRegistry {
    * skipped (a fresher writer owns the row; the next hydrate re-normalizes).
    */
   private async repairPersistedRow(): Promise<void> {
+    // Safe-integer ceiling guard, computed from the RAW baseline like
+    // commit()'s: an envelope at the ceiling parses as version 0 (the shape
+    // guard rejects it), so repairing on the parsed version would rewrite the
+    // row as {version: 1, tokens: []} — destroying the stored tokens. Refuse
+    // the bump; the read path already served the normalized in-memory view.
+    const rawVersion = rawEnvelopeVersion(this.persistedBaseline);
+    if (
+      this.persistedVersion >= Number.MAX_SAFE_INTEGER - 1 ||
+      rawVersion >= Number.MAX_SAFE_INTEGER - 1
+    ) {
+      throw new ElizaError(
+        "[PushTokenRegistry] envelope version exhausted the safe-integer range",
+        {
+          code: PUSH_TOKEN_PERSIST_FAILED_CODE,
+          context: { reason: "version_exhausted" },
+          severity: "ephemeral",
+        },
+      );
+    }
     const written: PersistedPushTokenEnvelope = {
       version: this.persistedVersion + 1,
       tokens: [...this.tokens.values()],
@@ -389,6 +402,8 @@ export class PushTokenRegistry {
     op: (base: Map<string, PushTokenRecord>) => {
       next: Map<string, PushTokenRecord>;
       result: T;
+      /** Set to `false` when the op changed nothing and NO write is due; omit it (or set `true`) when the write should proceed. */
+      write?: boolean;
     },
   ): Promise<T> {
     let baseline = this.persistedBaseline;
@@ -399,7 +414,33 @@ export class PushTokenRegistry {
         parsed.records.map((record) => [record.token, record]),
       );
       baseVersion = parsed.version;
-      const { next, result } = op(base);
+      // Same safe-integer ceiling guard as repairPersistedRow, computed from
+      // the RAW baseline: an envelope whose version is AT or ONE BELOW the
+      // ceiling parses to a bumpable base (the shape guard rejects only
+      // versions >= MAX), so persisting version + 1 would write MAX itself —
+      // a row this module's own parser then fails closed on (and refuses to
+      // repair), freezing the registry empty. Refuse the bump one tick early.
+      if (
+        rawEnvelopeVersion(baseline) >= Number.MAX_SAFE_INTEGER - 1 ||
+        baseVersion >= Number.MAX_SAFE_INTEGER - 1
+      ) {
+        throw new ElizaError(
+          "[PushTokenRegistry] envelope version exhausted the safe-integer range",
+          {
+            code: PUSH_TOKEN_PERSIST_FAILED_CODE,
+            context: { reason: "version_exhausted" },
+            severity: "ephemeral",
+          },
+        );
+      }
+      const applied = op(base);
+      const { next, result } = applied;
+      // A no-op op (e.g. unregister of an absent token) must not create or
+      // bump the durable row — answering from the current base is enough.
+      if (applied.write === false) {
+        this.tokens = next;
+        return result;
+      }
       const replacement: PersistedPushTokenEnvelope = {
         version: baseVersion + 1,
         tokens: [...next.values()],
@@ -500,7 +541,7 @@ export class PushTokenRegistry {
         if (!base.has(trimmed)) {
           // Absent on this base: answer w.r.t. this (possibly reloaded,
           // freshest-durable) state without attempting a write.
-          return { next: base, result: false };
+          return { next: base, result: false, write: false };
         }
         const next = new Map(base);
         next.delete(trimmed);
@@ -559,6 +600,23 @@ export class PushTokenRegistry {
  *   2. Validate each record and keep the NEWEST per token (dedup-before-cap).
  *   3. Apply the live cap to the deduped set.
  */
+/**
+ * True when `stored` is a row whose token array exceeds the persisted-record
+ * ceiling — whether a legacy bare array or a valid envelope's `tokens`. Such a
+ * row failed closed to empty and must NOT be rewritten by the repair path: the
+ * repair would persist the empty normalized view, destroying the original
+ * durable dump (a later mutation still overwrites it with a bounded envelope).
+ */
+function isOverCeilingRow(stored: unknown): boolean {
+  if (Array.isArray(stored)) {
+    return stored.length > MAX_PERSISTED_PUSH_TOKENS;
+  }
+  if (isEnvelopeShape(stored)) {
+    return stored.tokens.length > MAX_PERSISTED_PUSH_TOKENS;
+  }
+  return false;
+}
+
 function parsePersistedRow(stored: unknown): {
   records: PushTokenRecord[];
   version: number;
@@ -573,6 +631,27 @@ function parsePersistedRow(stored: unknown): {
     };
   }
   return { records: [], version: 0 };
+}
+
+/**
+ * The `version` field of a RAW baseline when it structurally looks like an
+ * envelope whose version is a safe non-negative integer, else `-1`. Unlike
+ * {@link isEnvelopeShape}, versions AT `Number.MAX_SAFE_INTEGER` are still
+ * reported — the ceiling guard needs to observe exactly that row.
+ */
+function rawEnvelopeVersion(stored: unknown): number {
+  if (typeof stored !== "object" || stored === null) return -1;
+  const record = stored as Record<string, unknown>;
+  const version = record.version;
+  if (
+    typeof version === "number" &&
+    Number.isSafeInteger(version) &&
+    version >= 0 &&
+    Array.isArray(record.tokens)
+  ) {
+    return version;
+  }
+  return -1;
 }
 
 /** Structural guard for the envelope row (own keys exactly `version,tokens`). */
@@ -593,6 +672,7 @@ function isEnvelopeShape(
     typeof record.version === "number" &&
     Number.isSafeInteger(record.version) &&
     record.version >= 0 &&
+    record.version < Number.MAX_SAFE_INTEGER &&
     Array.isArray(record.tokens)
   );
 }

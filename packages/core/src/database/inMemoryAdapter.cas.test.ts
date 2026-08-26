@@ -53,10 +53,9 @@ describe("assertCasValue", () => {
 		expect(() => assertCasValue(undefined, "replacement")).toThrow();
 	});
 
-	it("rejects null expected with the typed misuse code", () => {
-		expect(() => assertCasValue(null, "expected")).toThrowError(
-			expect.objectContaining({ code: CACHE_CAS_INVALID_VALUE_CODE }),
-		);
+	it("matches an expected null against a row storing JSON null", () => {
+		expect(() => assertCasValue(null, "expected")).not.toThrow();
+		expect(() => assertCasValue(null, "replacement")).not.toThrow();
 	});
 });
 
@@ -133,11 +132,29 @@ describe("InMemoryDatabaseAdapter.compareAndSetCache", () => {
 		).toBeUndefined();
 	});
 
-	it("treats an expected null as contract misuse, not a value", async () => {
+	it("replaces a row storing JSON null when expected is null", async () => {
 		const adapter = makeAdapter();
+		await adapter.setCaches([{ key: "k", value: null }]);
+		await expect(adapter.compareAndSetCache("k", null, "next")).resolves.toBe(
+			true,
+		);
+		await expect((await adapter.getCaches(["k"])).get("k")).toBe("next");
+		// And a null expectation must NOT match an absent or non-null row.
 		await expect(
-			adapter.compareAndSetCache("k", null, "next"),
-		).rejects.toMatchObject({ code: CACHE_CAS_INVALID_VALUE_CODE });
+			adapter.compareAndSetCache("absent", null, "next"),
+		).resolves.toBe(false);
+	});
+
+	it("rejects jsonb-incompatible object KEYS (NUL and lone surrogate)", () => {
+		expect(isRepresentableCacheValue({ "a\u0000b": 1 })).toBe(false);
+		expect(isRepresentableCacheValue({ "\uD800key": 1 })).toBe(false);
+		expect(isRepresentableCacheValue({ ok: { "nested\u0000": 1 } })).toBe(
+			false,
+		);
+		// Clean keys at every nesting level still pass.
+		expect(
+			isRepresentableCacheValue({ ok: "v", nested: { deep: [1, "s"] } }),
+		).toBe(true);
 	});
 
 	it("rejects non-representable replacement values", async () => {

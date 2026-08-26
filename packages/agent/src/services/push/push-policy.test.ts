@@ -183,6 +183,20 @@ describe("PushPolicyStore (durable per-principal store)", () => {
     });
   });
 
+  it("save() rejects a non-monotonic version with the typed persist error (F4: no ABA, no regression to a stale record)", async () => {
+    await store.save("owner-1", ALLOWED_POLICY);
+    // A caller-supplied policy at or below the durable version must never
+    // silently overwrite the fresher durable row.
+    const stale = { ...ALLOWED_POLICY, version: 1 };
+    await expect(store.save("owner-1", stale)).rejects.toMatchObject({
+      name: "ElizaError",
+      code: PUSH_POLICY_PERSIST_FAILED_CODE,
+      context: { reason: "version_not_monotonic" },
+    });
+    // The durable row is untouched.
+    expect(await store.load("owner-1")).toEqual(ALLOWED_POLICY);
+  });
+
   it("save() returns false-resolved CAS as a typed persist failure (conflict is not success)", async () => {
     const conflicting = new PushPolicyStore({
       ...runtime,

@@ -2256,10 +2256,19 @@ export class InMemoryDatabaseAdapter extends DatabaseAdapter<IStorage> {
   }
 
   async setCaches<T>(entries: Array<{ key: string; value: T }>): Promise<boolean> {
-    for (const { key, value } of entries) {
-      await this.storage.set(COLLECTIONS.CACHE, key, { value });
-    }
-    return true;
+    // Route through the shared storage-level lane when available: an
+    // unconditional cache write landing between a CAS's compare and its write
+    // would break the conditional write's atomicity guarantee (one storage
+    // instance can be shared by several adapters). Custom IStorage without the
+    // lane still gets per-adapter ordering via this.cacheCasFallback.
+    const run = async (): Promise<boolean> => {
+      for (const { key, value } of entries) {
+        await this.storage.set(COLLECTIONS.CACHE, key, { value });
+      }
+      return true;
+    };
+    const serialized = (this.storage as MemoryStorageLike).runSerialized?.bind(this.storage);
+    return serialized ? serialized(run) : this.cacheCasFallback(run);
   }
 
   /**
@@ -2335,12 +2344,18 @@ export class InMemoryDatabaseAdapter extends DatabaseAdapter<IStorage> {
   }
 
   async deleteCaches(keys: string[]): Promise<boolean> {
-    let removed = false;
-    for (const key of keys) {
-      const ok = await this.storage.delete(COLLECTIONS.CACHE, key);
-      if (ok) removed = true;
-    }
-    return removed;
+    // Same lane discipline as setCaches: a delete between a CAS's compare and
+    // write must not be able to interleave.
+    const run = async (): Promise<boolean> => {
+      let removed = false;
+      for (const key of keys) {
+        const ok = await this.storage.delete(COLLECTIONS.CACHE, key);
+        if (ok) removed = true;
+      }
+      return removed;
+    };
+    const serialized = (this.storage as MemoryStorageLike).runSerialized?.bind(this.storage);
+    return serialized ? serialized(run) : this.cacheCasFallback(run);
   }
 
   // ── Task CRUD ─────────────────────────────────────────────────────────
