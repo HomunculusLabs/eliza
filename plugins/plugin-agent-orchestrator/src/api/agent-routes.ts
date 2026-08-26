@@ -306,7 +306,19 @@ export async function handleAgentRoutes(
       sendError(res, "Invalid JSON body", 400);
       return true;
     }
-    const { policy, issues } = writeCodingPolicy(ctx.runtime, body);
+    let written: ReturnType<typeof writeCodingPolicy>;
+    try {
+      written = writeCodingPolicy(ctx.runtime, body);
+    } catch (error) {
+      // error-policy:J1 boundary translation — a persistence failure inside
+      // setSetting becomes a structured 500, never an unhandled throw.
+      logger.error(
+        `[coding-policy] write failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      sendError(res, "Failed to persist coding policy", 500);
+      return true;
+    }
+    const { policy, issues } = written;
     if (!policy) {
       sendJson(res, { policy: null, issues }, 400);
       return true;
@@ -315,6 +327,8 @@ export async function handleAgentRoutes(
       `[coding-policy] wrote policy: primary=${policy.primary.backend}/${policy.primary.providerId} fallbacks=${policy.fallbacks.length} preset=${policy.approvalPreset}`,
     );
     const readiness = assessCodingPolicyReadiness(ctx.runtime, policy);
+    // Single-operator settings surface: a concurrent PUT/GET pair may serve
+    // a stale read; acceptable here — no cross-operator merge exists.
     sendJson(res, { policy, readiness, issues });
     return true;
   }

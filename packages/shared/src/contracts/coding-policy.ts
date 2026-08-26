@@ -44,7 +44,6 @@ export interface CodingPolicyIssue {
     | "unsupported_provider"
     | "provider_backend_mismatch"
     | "provider_not_spawnable"
-    | "account_on_unaccounted_route"
     | "missing_account"
     | "duplicate_route"
     | "empty_route"
@@ -119,6 +118,45 @@ function checkNoSecretShapedKeys(
       });
     }
     checkNoSecretShapedKeys(
+      child,
+      path === "" ? key : `${path}.${key}`,
+      issues,
+    );
+  }
+}
+
+/**
+ * Obvious key-shaped secret values a caller may have pasted into a free-text
+ * field (model name, account label). Defense in depth on top of the
+ * key-NAME rejection: the persisted document is echoed by GET and `model`
+ * flows into spawn argv, so a value that IS a key must never persist.
+ */
+const SECRET_VALUE_RE = /\bsk-[A-Za-z0-9_-]{16,}\b/;
+
+function checkNoSecretShapedValues(
+  value: unknown,
+  path: string,
+  issues: CodingPolicyIssue[],
+): void {
+  if (typeof value === "string") {
+    if (SECRET_VALUE_RE.test(value)) {
+      issues.push({
+        path,
+        code: "secret_rejected",
+        message: `${path || "value"} looks like a pasted API key; the coding policy never stores credentials — use the encrypted Accounts flow.`,
+      });
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const [i, item] of value.entries()) {
+      checkNoSecretShapedValues(item, `${path}[${i}]`, issues);
+    }
+    return;
+  }
+  if (!isPlainObject(value)) return;
+  for (const [key, child] of Object.entries(value)) {
+    checkNoSecretShapedValues(
       child,
       path === "" ? key : `${path}.${key}`,
       issues,
@@ -252,6 +290,7 @@ export function validateCodingPolicy(input: unknown): CodingPolicyValidation {
     }
   }
   checkNoSecretShapedKeys(input, "", issues);
+  checkNoSecretShapedValues(input, "", issues);
   if (input.version !== CODING_POLICY_VERSION) {
     issues.push({
       path: "version",
@@ -322,21 +361,15 @@ export function validateCodingPolicy(input: unknown): CodingPolicyValidation {
   const modelPowerful = optionalModel("modelPowerful");
   const modelFast = optionalModel("modelFast");
 
-  if (issues.length > 0 || !primary || !Array.isArray(rawFallbacks)) {
+  // approvalPreset === null always records an issue above; the issues.length
+  // gate below therefore also catches it — no separate late branch is needed.
+  if (
+    issues.length > 0 ||
+    !primary ||
+    !Array.isArray(rawFallbacks) ||
+    approvalPreset === null
+  ) {
     return { policy: null, issues };
-  }
-  if (approvalPreset === null) {
-    return {
-      policy: null,
-      issues: [
-        ...issues,
-        {
-          path: "approvalPreset",
-          code: "invalid_approval_preset",
-          message: `approvalPreset must be one of ${CODING_POLICY_APPROVAL_PRESETS.join(", ")}.`,
-        },
-      ],
-    };
   }
   return {
     policy: {

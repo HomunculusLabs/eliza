@@ -167,3 +167,65 @@ describe("codingPolicyRouteBackends", () => {
     ).toEqual(["claude", "codex", "kimi"]);
   });
 });
+
+describe("validateCodingPolicy secret-value defense (#24099)", () => {
+  it("rejects a pasted key as a free-text value while key names stay clean", () => {
+    const result = validateCodingPolicy({
+      version: 1,
+      primary: {
+        backend: "claude",
+        providerId: "anthropic-subscription",
+        model: "sk-ant-api03-thisIsALongFakeKey1234",
+      },
+      fallbacks: [],
+      approvalPreset: "standard",
+    });
+    expect(result.policy).toBeNull();
+    expect(
+      result.issues.some(
+        (issue) =>
+          issue.code === "secret_rejected" && issue.path === "primary.model",
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a key-shaped value nested in fallbacks", () => {
+    const result = validateCodingPolicy({
+      version: 1,
+      primary: { backend: "claude", providerId: "anthropic-subscription" },
+      fallbacks: [
+        { backend: "codex", providerId: "openai-codex" },
+        {
+          backend: "claude",
+          providerId: "anthropic-subscription",
+          accountId: "sk-ant-suffix-key12345678",
+        },
+      ],
+      approvalPreset: "standard",
+    });
+    expect(result.policy).toBeNull();
+    expect(
+      result.issues.some(
+        (issue) =>
+          issue.code === "secret_rejected" &&
+          issue.path === "fallbacks[1].accountId",
+      ),
+    ).toBe(true);
+  });
+
+  it("still accepts ordinary model names and account ids", () => {
+    const result = validateCodingPolicy({
+      version: 1,
+      primary: {
+        backend: "claude",
+        providerId: "anthropic-subscription",
+        accountId: "acc-1",
+        model: "claude-opus-4.5",
+      },
+      fallbacks: [{ backend: "codex", providerId: "openai-codex" }],
+      approvalPreset: "standard",
+    });
+    expect(result.policy).not.toBeNull();
+    expect(result.issues).toEqual([]);
+  });
+});

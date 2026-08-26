@@ -10,6 +10,7 @@ import type { HandlerCallback, IAgentRuntime, Memory } from "@elizaos/core";
 import {
 	APPEARANCE_APPLY_EVENT,
 	VOICE_SETTINGS_APPLY_EVENT,
+	validateCodingPolicy,
 } from "@elizaos/shared";
 import {
 	SETTINGS_NON_CATALOG_SECTION_META,
@@ -2446,12 +2447,69 @@ describe("SETTINGS action: coding-policy keyed writes on a delegated section (#2
 		expect(routeFetch).toHaveBeenCalledTimes(2);
 		expect(calls[0].method).toBe("GET");
 		expect(calls[1].method).toBe("PUT");
-		// The backend switch clears the old provider binding — the server
-		// rejects a carried-over anthropic binding on a codex route.
-		const putBody = calls[1].body as { primary: { backend: string } };
-		expect(putBody.primary).toEqual({ backend: "codex" });
+		const putBody = calls[1].body as {
+			primary: { backend: string; providerId: string };
+		};
+		// The candidate must satisfy the REAL shared validator the server
+		// runs (review r1 finding 1): a spawn-capable providerId for the
+		// target backend, never a provider-less primary.
+		expect(putBody.primary.backend).toBe("codex");
+		expect(putBody.primary.providerId).toBe("openai-codex");
+		const validation = validateCodingPolicy(putBody);
+		expect(validation.policy).not.toBeNull();
+		expect(validation.issues).toEqual([]);
 		expect(result?.success).toBe(true);
 		expect(texts.join(" ")).toContain("codex");
+	});
+
+	it("preserves model roles and fallback account pins through the backend switch", async () => {
+		const fullDoc = {
+			policy: {
+				version: 1,
+				primary: {
+					backend: "claude",
+					providerId: "anthropic-subscription",
+					accountId: "acc-1",
+					model: "claude-opus",
+				},
+				fallbacks: [
+					{ backend: "codex", providerId: "openai-codex", accountId: "acc-2" },
+				],
+				approvalPreset: "standard",
+				modelPowerful: "opus",
+				modelFast: "haiku",
+			},
+		};
+		let putBody: unknown;
+		const routeFetch = vi.fn<SettingsRouteFetch>(async (req) => {
+			if (req.method === "GET") return { ok: true, data: fullDoc };
+			putBody = req.body;
+			return { ok: true, data: fullDoc };
+		});
+		const { result } = await invoke(
+			{
+				action: "set",
+				section: "ai-model",
+				key: "coding-backend",
+				value: "codex",
+			},
+			routeFetch,
+		);
+		expect(result?.success).toBe(true);
+		const body = putBody as {
+			fallbacks: Array<{ accountId?: string }>;
+			modelPowerful?: string;
+			modelFast?: string;
+			primary: { accountId?: string; model?: string };
+		};
+		// Lossless read-modify-write (review r1 finding 2): only the primary
+		// route's binding resets; everything else carries through untouched.
+		expect(body.fallbacks[0]?.accountId).toBe("acc-2");
+		expect(body.modelPowerful).toBe("opus");
+		expect(body.modelFast).toBe("haiku");
+		expect(body.primary.accountId).toBeUndefined();
+		expect(body.primary.model).toBeUndefined();
+		expect(validateCodingPolicy(body).policy).not.toBeNull();
 	});
 
 	it("rejects an unknown backend without any write", async () => {

@@ -14,9 +14,14 @@ function runtimeWith(settings: Record<string, string>) {
   } as never;
 }
 
+// A whole-document-valid policy whose primary routes to a REAL spawn
+// backend. NOTE: "kimi-coding" is inference-only (descriptor backend is
+// null — the Kimi ACP CLI uses its own OAuth, not the coding-plan key), so
+// a kimi primary is NOT expressible as a valid policy today. Codex via the
+// openai-codex subscription descriptor is the canonical spawn route.
 const POLICY = JSON.stringify({
   version: 1,
-  primary: { backend: "kimi", providerId: "kimi-coding" },
+  primary: { backend: "codex", providerId: "openai-codex" },
   fallbacks: [],
   approvalPreset: "standard",
 });
@@ -30,7 +35,7 @@ describe("resolvePinnedAdapter precedence (#24099)", () => {
         ELIZA_DEFAULT_AGENT_TYPE: "codex",
       }),
     );
-    expect(resolved).toBe("kimi");
+    expect(resolved).toBe("codex");
   });
 
   it("benchmark override still wins over the policy", () => {

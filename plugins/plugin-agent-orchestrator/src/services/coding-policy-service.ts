@@ -16,10 +16,10 @@ import type { IAgentRuntime } from "@elizaos/core";
 import { logger } from "@elizaos/core";
 import {
   CODING_POLICY_SETTING_KEY,
+  type CodingAgentBackend,
   type CodingPolicy,
   type CodingPolicyIssue,
   type CodingPolicyRoute,
-  codingPolicyRouteBackends,
   codingProviderDescriptorForProvider,
   validateCodingPolicy,
 } from "@elizaos/shared";
@@ -37,8 +37,10 @@ export interface CodingPolicyRouteHealth {
     total: number;
     enabled: number;
     healthy: number;
-    /** Present when the route pins a specific account id. */
-    pinnedExists?: boolean;
+    /** Present when the route pins a specific account id: whether the
+     * provider's pool has ANY account. The bridge exposes pool counts, not
+     * ids — the specific pin is verified at spawn time (fails closed). */
+    poolHasAccounts?: boolean;
   };
   ok: boolean;
   problems: string[];
@@ -97,13 +99,18 @@ function authorityIssuesForRoute(
   path: string,
 ): CodingPolicyIssue[] {
   const issues: CodingPolicyIssue[] = [];
-  if (!route.accountId) return issues;
+  // Provider-level authority only applies to routes that pin an account.
+  if (route.accountId === undefined) return issues;
+  // NOTE: this is a PROVIDER-level check. The bridge surface exposes pool
+  // counts per provider, not per account id, so a pinned id cannot be
+  // verified here — spawn-time selection is the authoritative account check
+  // (and fails closed per #24355). The message below states exactly that.
   const bridge = getCodingAccountBridge();
   if (!bridge) {
     issues.push({
       path: `${path}.accountId`,
       code: "missing_account",
-      message: `Route pins account "${route.accountId}" but no account bridge is available to verify it.`,
+      message: `Route pins account "${route.accountId}" but no account bridge is available; the pin is verified at spawn time, which fails closed.`,
     });
     return issues;
   }
@@ -116,7 +123,7 @@ function authorityIssuesForRoute(
       issues.push({
         path: `${path}.accountId`,
         code: "missing_account",
-        message: `No connected account for provider "${route.providerId}" (backend "${route.backend}"); connect one through Accounts before pinning "${route.accountId}".`,
+        message: `No connected account for provider "${route.providerId}" (backend "${route.backend}"); connect one through Accounts. The specific pin "${route.accountId}" is verified at spawn time, which fails closed.`,
       });
       return issues;
     }
@@ -216,7 +223,7 @@ export function assessCodingPolicyReadiness(
             enabled: row.enabled,
             healthy: row.healthy,
             ...(route.accountId !== undefined
-              ? { pinnedExists: row.total > 0 }
+              ? { poolHasAccounts: row.total > 0 }
               : {}),
           }
         : {
@@ -257,14 +264,18 @@ export function assessCodingPolicyReadiness(
 }
 
 /**
- * Resolve the spawn backend order for routing: policy first (primary then
- * fallbacks), used by the routing layer ahead of legacy env keys. Benchmark
- * overrides stay above policy — see task-agent-routing.
+ * The validated spawn backend for pinned-adapter routing: the policy's
+ * PRIMARY route, and only when the whole stored document passes strict
+ * validation — a document whose fallbacks or preset are invalid is not a
+ * policy in force, and routing must not cherry-pick its primary while
+ * GET /policy reports the same document as broken (review r1, finding 3).
+ * Returns null when no valid policy exists; callers then fall to legacy
+ * env keys. Benchmark overrides stay above policy — see task-agent-routing.
  */
-export function resolveCodingPolicyBackends(
+export function resolveCodingPolicyPrimaryBackend(
   runtime: IAgentRuntime,
-): string[] | null {
+): CodingAgentBackend | null {
   const { policy } = loadCodingPolicy(runtime);
   if (!policy) return null;
-  return codingPolicyRouteBackends(policy);
+  return policy.primary.backend;
 }

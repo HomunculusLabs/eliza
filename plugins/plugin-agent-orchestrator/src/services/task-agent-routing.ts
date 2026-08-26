@@ -9,6 +9,7 @@ import * as path from "node:path";
 import type { IAgentRuntime } from "@elizaos/core";
 import { logger } from "@elizaos/core";
 import { CODING_AGENT_BACKENDS } from "@elizaos/shared";
+import { resolveCodingPolicyPrimaryBackend } from "./coding-policy-service.js";
 import { readConfigEnvKey } from "./config-env.js";
 
 export const KNOWN_ADAPTER_TYPES = new Set<string>(CODING_AGENT_BACKENDS);
@@ -96,19 +97,16 @@ export function resolvePinnedAdapter(
   // policy is a runtime character setting written by PUT /api/coding-agents/
   // policy; legacy keys remain as the unset-policy default, never a silent
   // co-author of the decision.
-  const policyRaw = getSetting("ELIZA_CODING_POLICY");
+  // Single reader: the same strict validator the policy route uses.
+  // A stored document only steers routing when it validates as a whole —
+  // routing never cherry-picks a plausible primary from a broken document
+  // (review r1, finding 3).
   const policyBackend = (() => {
-    if (typeof policyRaw !== "string" || policyRaw.trim() === "") {
-      return undefined;
-    }
     try {
-      const parsed = JSON.parse(policyRaw) as {
-        primary?: { backend?: unknown };
-      };
-      const backend = parsed?.primary?.backend;
-      const normalized = normalizeTaskAgentAdapter(
-        typeof backend === "string" ? backend : undefined,
-      );
+      const backend = runtime
+        ? resolveCodingPolicyPrimaryBackend(runtime)
+        : null;
+      const normalized = normalizeTaskAgentAdapter(backend ?? undefined);
       return normalized && KNOWN_ADAPTER_TYPES.has(normalized)
         ? normalized
         : undefined;

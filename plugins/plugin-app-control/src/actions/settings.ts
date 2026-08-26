@@ -35,6 +35,7 @@ import {
 	type AppearanceApplyPayload,
 	AppPermissionsViewSchema,
 	buildWalletRpcUpdateRequest,
+	CODING_PROVIDER_DESCRIPTORS,
 	isPermissionId,
 	normalizeWalletRpcProviderId,
 	type PermissionId,
@@ -682,14 +683,55 @@ const CODING_POLICY_BACKEND_KEY: SettingsWritableKey = {
 				detail: `the primary coding backend is already ${backend}`,
 			};
 		}
-		// Backend switch clears the old route's provider binding: the
-		// descriptor-mismatch validation on PUT rejects a carried-over binding,
-		// and silently retaining it would be a false success.
+		// Resolve a spawn-capable provider for the target backend from the
+		// shared descriptor table — the PUT validator requires a real
+		// providerId on every route, so a provider-less primary would always
+		// 400 (review r1, finding 1). Carrying the RAW fetched document (not
+		// the lossy reader projection) preserves model roles and account pins
+		// everywhere except the primary route, whose provider binding is
+		// deliberately reset: the old binding would fail the
+		// descriptor-mismatch check and silently retaining it would be a
+		// false success.
+		const providerId = spawnableProviderForBackend(backend);
+		if (!providerId) {
+			return {
+				ok: false,
+				detail: `no spawn-capable provider is registered for backend "${backend}" yet`,
+			};
+		}
+		const rawPolicy = (current.data as { policy?: unknown }).policy;
+		if (!rawPolicy || typeof rawPolicy !== "object") {
+			return {
+				ok: false,
+				detail:
+					"the stored coding policy is unreadable; reconfigure it in Settings → Coding Agents",
+			};
+		}
+		// A fallback whose route identity (backend|provider|account) equals
+		// the new primary would trip the validator's duplicate-route check —
+		// it is redundant under the new primary and is dropped.
+		const rawFallbacks = Array.isArray(
+			(rawPolicy as { fallbacks?: unknown }).fallbacks,
+		)
+			? ((rawPolicy as { fallbacks: unknown[] }).fallbacks as unknown[])
+			: [];
+		const dedupedFallbacks = rawFallbacks.filter((fallback) => {
+			if (!fallback || typeof fallback !== "object") return true;
+			const route = fallback as {
+				backend?: unknown;
+				providerId?: unknown;
+				accountId?: unknown;
+			};
+			return !(
+				route.backend === backend &&
+				route.providerId === providerId &&
+				route.accountId === undefined
+			);
+		});
 		const candidate = {
-			version: policy.version,
-			primary: { backend },
-			fallbacks: policy.fallbacks,
-			approvalPreset: policy.approvalPreset,
+			...(rawPolicy as Record<string, unknown>),
+			primary: { backend, providerId },
+			fallbacks: dedupedFallbacks,
 		};
 		const write = await routeFetch({
 			method: "PUT",
@@ -786,6 +828,21 @@ function readCodingPolicyReadiness(
 			? { effectiveBackend: r.effectiveBackend }
 			: {}),
 	};
+}
+
+/**
+ * First spawn-capable provider registered for a backend, per the shared
+ * capability descriptors. The chat backend switch needs a valid providerId
+ * for its PUT; the descriptor table is the single source of which
+ * provider/backend pairs can actually spawn (review r1, finding 1).
+ */
+function spawnableProviderForBackend(backend: string): string | null {
+	for (const descriptor of Object.values(CODING_PROVIDER_DESCRIPTORS)) {
+		if (descriptor.backend === backend && descriptor.spawnSupport) {
+			return descriptor.providerId;
+		}
+	}
+	return null;
 }
 
 function readCodingPolicyIssues(data: unknown): string[] {
