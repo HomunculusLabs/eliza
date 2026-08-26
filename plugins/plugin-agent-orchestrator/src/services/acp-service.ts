@@ -2038,8 +2038,7 @@ export class AcpService extends Service {
     // move to ambient credentials; only an unbridged (single-account) host
     // keeps ambient credentials with a warn.
     const policyRoutes = policyPin?.routes ?? [];
-    let resolvedAccount: Awaited<ReturnType<typeof selectCodingAccount>> =
-      null;
+    let resolvedAccount: Awaited<ReturnType<typeof selectCodingAccount>> = null;
     let policyRouteUsed: (typeof policyRoutes)[number] | undefined;
     const bridgeForPolicy = getCodingAccountBridge();
     for (const route of policyRoutes) {
