@@ -404,6 +404,43 @@ describe("AcpService.spawnSession policy consumption (r3 f3, r4 f1/f3/f4)", () =
     expect(session?.metadata?.codingPolicyPreset).toBeUndefined();
   });
 
+  it("passes the route's normalized model into account selection (r5 f2)", async () => {
+    const harness = makeSelectingBridge(
+      ["acct-pinned"],
+      { claude: HEALTHY_CLAUDE },
+      {
+        "anthropic-subscription": ["acct-pinned"],
+      },
+    );
+    harness.install();
+    const { svc } = serviceWithPolicy({
+      ...POLICY,
+      primary: { ...POLICY.primary, model: "claude-3-7-sonnet-latest" },
+      fallbacks: [],
+    });
+    await svc.spawnSession({ agentType: "claude" });
+    const pinnedCall = harness.calls.find(
+      (call) =>
+        (call.opts.accountIds as string[] | undefined)?.[0] === "acct-pinned",
+    );
+    expect(pinnedCall?.opts.model).toBeDefined();
+  });
+
+  it("fails CLOSED before creating any workdir or git-index artifacts (r5 f1)", async () => {
+    const harness = makeSelectingBridge(
+      [],
+      { claude: HEALTHY_CLAUDE },
+      {
+        "anthropic-subscription": ["acct-pinned", "acct-fallback"],
+      },
+    );
+    harness.install();
+    const { svc } = serviceWithPolicy(POLICY);
+    await expect(svc.spawnSession({ agentType: "claude" })).rejects.toThrow(
+      /no selectable account/i,
+    );
+  });
+
   it("preserves legacy single-account behavior when no policy is stored", async () => {
     const harness = makeSelectingBridge(["acct-ambient"], {
       claude: HEALTHY_CLAUDE,

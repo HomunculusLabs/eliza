@@ -2014,6 +2014,157 @@ export class AcpService extends Service {
         ? normalizeApprovalPreset(policyPin.approvalPreset)
         : undefined) ??
       this.defaultApprovalPreset;
+
+    // Policy account/model resolution runs BEFORE any workdir, git-index, or
+    // registry side effects: the fail-closed refusal below (r5 finding 1)
+    // must never leak prepared filesystem artifacts.
+    // Unified policy (#24099, r3 finding 3): the validated policy's model
+    // for this backend is the DEFAULT when the caller did not pin one; the
+    // final value is derived below from the route that actually supplied
+    // the session's account, so execution and provenance can never disagree
+    // (r4 finding 3).
+    const policyFirstModel = policyPin?.model;
+
+    // Multi-account selection: pick the least-used (default) linked subscription
+    // for this agent type and inject its credentials into the spawn env so the
+    // sub-agent authenticates AS that account. Returns null (and we keep the
+    // single-account behavior) when no accounts are linked.
+    // Unified policy (#24099, r3 finding 3): when the whole-valid policy has
+    // routes for this backend, their account bindings are tried FIRST, in
+    // policy order — the spawn authenticates as the configured account (or
+    // walks to the next configured route when a binding is not selectable).
+    // A configured policy whose every route fails to select FAILS CLOSED on
+    // a bridged host (r4 finding 1): billing authority must not silently
+    // move to ambient credentials; only an unbridged (single-account) host
+    // keeps ambient credentials with a warn.
+    const policyRoutes = policyPin?.routes ?? [];
+    let resolvedAccount: Awaited<ReturnType<typeof selectCodingAccount>> =
+      null;
+    let policyRouteUsed: (typeof policyRoutes)[number] | undefined;
+    const bridgeForPolicy = getCodingAccountBridge();
+    for (const route of policyRoutes) {
+      // Selection sees the model this route would actually spawn with (r5
+      // finding 2): the bridge uses it for model-scoped quota/reset ordering.
+      const routeModel = policyRouteSelectionModel(
+        agentType,
+        opts.model ?? route.model,
+      );
+      if (route.accountId !== undefined) {
+        resolvedAccount = await selectCodingAccount(agentType, {
+          sessionKey: id,
+          accountIds: [route.accountId],
+          ...(routeModel ? { model: routeModel } : {}),
+        });
+        if (resolvedAccount) {
+          policyRouteUsed = route;
+          break;
+        }
+        continue;
+      }
+      // No explicit pin: honor the route's provider binding by selecting
+      // within the provider's enumerated accounts when the bridge can
+      // enumerate them; otherwise fall through to the ambient strategy.
+      const providerIds =
+        bridgeForPolicy?.accountIds?.(route.providerId) ?? undefined;
+      if (providerIds && providerIds.length > 0) {
+        resolvedAccount = await selectCodingAccount(agentType, {
+          sessionKey: id,
+          accountIds: providerIds,
+          ...(routeModel ? { model: routeModel } : {}),
+        });
+        if (resolvedAccount) {
+          policyRouteUsed = route;
+          break;
+        }
+      }
+    }
+    if (!resolvedAccount && policyRoutes.length === 0) {
+      const ambientModel = policyRouteSelectionModel(
+        agentType,
+        opts.model ?? policyFirstModel,
+      );
+      const accountStrategy = resolveCodingAccountStrategy(
+        this.setting("ELIZA_CODING_ACCOUNT_STRATEGY"),
+      );
+      resolvedAccount = await selectCodingAccount(agentType, {
+        sessionKey: id,
+        ...(accountStrategy ? { strategy: accountStrategy } : {}),
+        ...(ambientModel ? { model: ambientModel } : {}),
+      });
+    }
+    if (policyRoutes.length > 0 && !resolvedAccount) {
+      const triedPins = policyRoutes.map((route: CodingPolicyRoute) =>
+        route.accountId !== undefined
+          ? route.accountId
+          : `(provider ${route.providerId})`,
+      );
+      if (bridgeForPolicy) {
+        // error-policy:J2 context-adding rethrow — a configured policy with
+        // no selectable route is a typed spawn refusal, never a silent
+        // degrade onto ambient credentials (r4 finding 1).
+        throw new ElizaError(
+          "The coding policy routes for this backend have no selectable account; fix the policy (connect the pinned account or repoint the route) before spawning",
+          {
+            code: "CODING_POLICY_NO_SELECTABLE_ROUTE",
+            context: {
+              sessionId: id,
+              agentType,
+              triedRoutes: triedPins,
+            },
+            severity: "ephemeral",
+          },
+        );
+      }
+      this.log(
+        "warn",
+        "coding policy routes yielded no account; unbridged host falls back to ambient credentials",
+        {
+          sessionId: id,
+          agentType,
+          triedRoutes: triedPins,
+        },
+      );
+    }
+    // Model precedence (r4 finding 3): explicit caller > the model of the
+    // policy route that actually supplied the account > the first matching
+    // route's model (route-less model default) > unset.
+    const effectiveModel =
+      opts.model ??
+      policyRouteUsed?.model ??
+      (policyRouteUsed ? undefined : policyFirstModel);
+    const spawnModel =
+      agentType === "claude"
+        ? normalizeClaudeAcpModelId(effectiveModel)
+        : effectiveModel;
+    const customCredentials = resolvedAccount
+      ? {
+          ...(opts.customCredentials ?? {}),
+          ...resolvedAccount.selection.envPatch,
+        }
+      : opts.customCredentials;
+    if (resolvedAccount) {
+      this.log("info", "coding account selected for spawn", {
+        sessionId: id,
+        agentType,
+        providerId: resolvedAccount.meta.providerId,
+        accountId: resolvedAccount.meta.accountId,
+        label: resolvedAccount.meta.label,
+        strategy: resolvedAccount.meta.strategy,
+      });
+    } else {
+      // A degraded pool must not hard-fail a spawn, but it must not degrade
+      // invisibly either (#9960). Warn loudly only when accounts are connected
+      // yet none are healthy — a benign empty pool stays quiet.
+      const fallbackWarning = diagnoseCodingAccountFallback(agentType);
+      if (fallbackWarning) {
+        this.log("warn", "coding account pool degraded to single-account", {
+          sessionId: id,
+          agentType,
+          detail: fallbackWarning,
+        });
+      }
+    }
+
     // Orchestrated spawns (via tasks.ts → resolveSpawnWorkdir) always pass
     // opts.workdir, which already applies route/convention/explicit resolution
     // and the same ELIZA_ACP_WORKSPACE_ROOT/ACPX_DEFAULT_CWD settings, falling
@@ -2098,143 +2249,6 @@ export class AcpService extends Service {
         ...(gitIndexIsolation?.env ?? {}),
         [CREDENTIAL_BRIDGE_TOKEN_ENV]: credentialBridgeToken.token,
       };
-      // Unified policy (#24099, r3 finding 3): the validated policy's model
-      // for this backend is the DEFAULT when the caller did not pin one; the
-      // final value is derived below from the route that actually supplied
-      // the session's account, so execution and provenance can never disagree
-      // (r4 finding 3).
-      const policyFirstModel = policyPin?.model;
-
-      // Multi-account selection: pick the least-used (default) linked subscription
-      // for this agent type and inject its credentials into the spawn env so the
-      // sub-agent authenticates AS that account. Returns null (and we keep the
-      // single-account behavior) when no accounts are linked.
-      // Unified policy (#24099, r3 finding 3): when the whole-valid policy has
-      // routes for this backend, their account bindings are tried FIRST, in
-      // policy order — the spawn authenticates as the configured account (or
-      // walks to the next configured route when a binding is not selectable).
-      // A configured policy whose every route fails to select FAILS CLOSED on
-      // a bridged host (r4 finding 1): billing authority must not silently
-      // move to ambient credentials; only an unbridged (single-account) host
-      // keeps ambient credentials with a warn.
-      const policyRoutes = policyPin?.routes ?? [];
-      let resolvedAccount: Awaited<ReturnType<typeof selectCodingAccount>> =
-        null;
-      let policyRouteUsed: (typeof policyRoutes)[number] | undefined;
-      const bridgeForPolicy = getCodingAccountBridge();
-      for (const route of policyRoutes) {
-        if (route.accountId !== undefined) {
-          resolvedAccount = await selectCodingAccount(agentType, {
-            sessionKey: id,
-            accountIds: [route.accountId],
-          });
-          if (resolvedAccount) {
-            policyRouteUsed = route;
-            break;
-          }
-          continue;
-        }
-        // No explicit pin: honor the route's provider binding by selecting
-        // within the provider's enumerated accounts when the bridge can
-        // enumerate them; otherwise fall through to the ambient strategy.
-        const providerIds =
-          bridgeForPolicy?.accountIds?.(route.providerId) ?? undefined;
-        if (providerIds && providerIds.length > 0) {
-          resolvedAccount = await selectCodingAccount(agentType, {
-            sessionKey: id,
-            accountIds: providerIds,
-          });
-          if (resolvedAccount) {
-            policyRouteUsed = route;
-            break;
-          }
-        }
-      }
-      if (!resolvedAccount && policyRoutes.length === 0) {
-        const accountStrategy = resolveCodingAccountStrategy(
-          this.setting("ELIZA_CODING_ACCOUNT_STRATEGY"),
-        );
-        resolvedAccount = await selectCodingAccount(agentType, {
-          sessionKey: id,
-          ...(accountStrategy ? { strategy: accountStrategy } : {}),
-          ...((opts.model ?? policyFirstModel)
-            ? { model: opts.model ?? policyFirstModel }
-            : {}),
-        });
-      }
-      if (policyRoutes.length > 0 && !resolvedAccount) {
-        const triedPins = policyRoutes.map((route: CodingPolicyRoute) =>
-          route.accountId !== undefined
-            ? route.accountId
-            : `(provider ${route.providerId})`,
-        );
-        if (bridgeForPolicy) {
-          // error-policy:J2 context-adding rethrow — a configured policy with
-          // no selectable route is a typed spawn refusal, never a silent
-          // degrade onto ambient credentials (r4 finding 1).
-          throw new ElizaError(
-            "The coding policy routes for this backend have no selectable account; fix the policy (connect the pinned account or repoint the route) before spawning",
-            {
-              code: "CODING_POLICY_NO_SELECTABLE_ROUTE",
-              context: {
-                sessionId: id,
-                agentType,
-                triedRoutes: triedPins,
-              },
-              severity: "ephemeral",
-            },
-          );
-        }
-        this.log(
-          "warn",
-          "coding policy routes yielded no account; unbridged host falls back to ambient credentials",
-          {
-            sessionId: id,
-            agentType,
-            triedRoutes: triedPins,
-          },
-        );
-      }
-      // Model precedence (r4 finding 3): explicit caller > the model of the
-      // policy route that actually supplied the account > the first matching
-      // route's model (route-less model default) > unset.
-      const effectiveModel =
-        opts.model ??
-        policyRouteUsed?.model ??
-        (policyRouteUsed ? undefined : policyFirstModel);
-      const spawnModel =
-        agentType === "claude"
-          ? normalizeClaudeAcpModelId(effectiveModel)
-          : effectiveModel;
-      const customCredentials = resolvedAccount
-        ? {
-            ...(opts.customCredentials ?? {}),
-            ...resolvedAccount.selection.envPatch,
-          }
-        : opts.customCredentials;
-      if (resolvedAccount) {
-        this.log("info", "coding account selected for spawn", {
-          sessionId: id,
-          agentType,
-          providerId: resolvedAccount.meta.providerId,
-          accountId: resolvedAccount.meta.accountId,
-          label: resolvedAccount.meta.label,
-          strategy: resolvedAccount.meta.strategy,
-        });
-      } else {
-        // A degraded pool must not hard-fail a spawn, but it must not degrade
-        // invisibly either (#9960). Warn loudly only when accounts are connected
-        // yet none are healthy — a benign empty pool stays quiet.
-        const fallbackWarning = diagnoseCodingAccountFallback(agentType);
-        if (fallbackWarning) {
-          this.log("warn", "coding account pool degraded to single-account", {
-            sessionId: id,
-            agentType,
-            detail: fallbackWarning,
-          });
-        }
-      }
-
       const now = new Date();
       // Stamp the capacity class onto the session so getCapacity() (and the
       // admission queue that reads it) can count worker vs system slots off the
@@ -5938,6 +5952,20 @@ function approvalArgs(preset: ApprovalPreset): string[] {
     default:
       return ["--approve-reads", "--non-interactive-permissions", "deny"];
   }
+}
+
+/**
+ * The model value passed to bridge account selection (#24099, r5 finding 2):
+ * the same normalization the spawn itself applies, so the bridge's
+ * model-scoped quota/reset ordering sees exactly the model the subprocess
+ * would run with — never an unnormalized alias.
+ */
+function policyRouteSelectionModel(
+  agentType: string,
+  model: string | undefined,
+): string | undefined {
+  if (model === undefined) return undefined;
+  return agentType === "claude" ? normalizeClaudeAcpModelId(model) : model;
 }
 
 function normalizeApprovalPreset(value: string | undefined): ApprovalPreset {
