@@ -135,6 +135,14 @@ export interface CodingProviderAvailability {
 export interface CodingAgentSelectorBridge {
 	/** Which providers can serve each coding-agent type, with account counts. */
 	describe(): Record<string, CodingProviderAvailability[]>;
+	/**
+	 * Read-only account ids for a provider, when the producer can enumerate
+	 * them. Optional for minimal producers; used to verify persisted account
+	 * pins WITHOUT the side effects of select() (which materializes
+	 * subprocess env like a Codex home directory). Returns undefined when
+	 * enumeration is not supported — callers degrade to pool-level checks.
+	 */
+	accountIds?(providerId: string): string[] | undefined;
 	/** Pick an account for a new (or continuing) coding sub-agent. */
 	select(
 		agentType: string,

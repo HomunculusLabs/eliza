@@ -386,14 +386,3 @@ export function validateCodingPolicy(input: unknown): CodingPolicyValidation {
 
 /** Stable runtime setting key the orchestrator persists the policy under. */
 export const CODING_POLICY_SETTING_KEY = "ELIZA_CODING_POLICY";
-
-/**
- * Ordered spawn backends a policy asks the runtime to try: primary first,
- * then fallbacks. Consumers that only need backend names (readiness,
- * routing precedence) use this instead of re-deriving it.
- */
-export function codingPolicyRouteBackends(
-  policy: CodingPolicy,
-): CodingAgentBackend[] {
-  return [policy.primary.backend, ...policy.fallbacks.map((f) => f.backend)];
-}

@@ -831,18 +831,25 @@ function readCodingPolicyReadiness(
 }
 
 /**
- * First spawn-capable provider registered for a backend, per the shared
- * capability descriptors. The chat backend switch needs a valid providerId
- * for its PUT; the descriptor table is the single source of which
- * provider/backend pairs can actually spawn (review r1, finding 1).
+ * The spawn-capable provider for a backend, per the shared capability
+ * descriptors, when exactly one exists. The chat backend switch needs a
+ * valid providerId for its PUT (review r1, finding 1); when a backend has
+ * MULTIPLE spawn-capable providers the choice is not ours to make from
+ * descriptor insertion order — it would silently change credential source
+ * and billing mode — so the switch refuses and points at the settings
+ * surface where the operator picks (review r2, finding 3). Today every
+ * backend maps to at most one spawn-capable provider, so the ambiguity
+ * branch is a guard against future descriptor additions, not a live path.
  */
 function spawnableProviderForBackend(backend: string): string | null {
+	let found: string | null = null;
 	for (const descriptor of Object.values(CODING_PROVIDER_DESCRIPTORS)) {
 		if (descriptor.backend === backend && descriptor.spawnSupport) {
-			return descriptor.providerId;
+			if (found !== null) return null; // ambiguous — refuse, don't guess
+			found = descriptor.providerId;
 		}
 	}
-	return null;
+	return found;
 }
 
 function readCodingPolicyIssues(data: unknown): string[] {

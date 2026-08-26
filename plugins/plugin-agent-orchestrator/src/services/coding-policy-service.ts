@@ -101,10 +101,6 @@ function authorityIssuesForRoute(
   const issues: CodingPolicyIssue[] = [];
   // Provider-level authority only applies to routes that pin an account.
   if (route.accountId === undefined) return issues;
-  // NOTE: this is a PROVIDER-level check. The bridge surface exposes pool
-  // counts per provider, not per account id, so a pinned id cannot be
-  // verified here — spawn-time selection is the authoritative account check
-  // (and fails closed per #24355). The message below states exactly that.
   const bridge = getCodingAccountBridge();
   if (!bridge) {
     issues.push({
@@ -115,6 +111,25 @@ function authorityIssuesForRoute(
     return issues;
   }
   try {
+    // ID-level verification when the producer can enumerate accounts: a
+    // ghost pin is rejected here instead of persisting a "validated"
+    // document referencing a nonexistent account (review r2 finding 2).
+    // Minimal producers without accountIds degrade to the provider-level
+    // pool check below; spawn-time selection stays authoritative either way.
+    let enumerable = false;
+    if (typeof bridge.accountIds === "function") {
+      enumerable = true;
+      const ids = bridge.accountIds(route.providerId) ?? [];
+      if (!ids.includes(route.accountId)) {
+        issues.push({
+          path: `${path}.accountId`,
+          code: "missing_account",
+          message: `No account "${route.accountId}" exists for provider "${route.providerId}"; connect it through Accounts or pin one of: ${ids.join(", ") || "(none connected)"}.`,
+        });
+        return issues;
+      }
+    }
+    // Provider-level pool check (the only check a minimal bridge can make).
     const availability = bridge.describe()[route.backend] ?? [];
     const row = availability.find(
       (entry) => entry.providerId === route.providerId,
@@ -123,7 +138,11 @@ function authorityIssuesForRoute(
       issues.push({
         path: `${path}.accountId`,
         code: "missing_account",
-        message: `No connected account for provider "${route.providerId}" (backend "${route.backend}"); connect one through Accounts. The specific pin "${route.accountId}" is verified at spawn time, which fails closed.`,
+        message: `No connected account for provider "${route.providerId}" (backend "${route.backend}"); connect one through Accounts.${
+          enumerable
+            ? ""
+            : " The specific pin is verified at spawn time, which fails closed."
+        }`,
       });
       return issues;
     }

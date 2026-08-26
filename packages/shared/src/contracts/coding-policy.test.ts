@@ -9,7 +9,6 @@ import { describe, expect, it } from "vitest";
 import {
   CODING_POLICY_VERSION,
   type CodingPolicy,
-  codingPolicyRouteBackends,
   validateCodingPolicy,
 } from "./coding-policy.ts";
 
@@ -151,20 +150,6 @@ describe("validateCodingPolicy", () => {
     const paths = issues.map((i) => i.path);
     expect(paths).toContain("fallbacks[0].providerId");
     expect(paths).toContain("fallbacks[1].providerId");
-  });
-});
-
-describe("codingPolicyRouteBackends", () => {
-  it("returns primary first, then fallbacks in order", () => {
-    expect(
-      codingPolicyRouteBackends({
-        ...VALID_POLICY,
-        fallbacks: [
-          { backend: "codex", providerId: "openai-codex" },
-          { backend: "kimi", providerId: "kimi-coding" },
-        ],
-      }),
-    ).toEqual(["claude", "codex", "kimi"]);
   });
 });
 

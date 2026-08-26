@@ -31,6 +31,36 @@ function makeRuntime(
   return runtime;
 }
 
+/**
+ * Request whose stream carries RAW WIRE BYTES — parseBody falls back to
+ * reading the stream, so malformed JSON hits the real J3 rejection path
+ * (lesson from review r2 finding 4: a pre-materialized req.body only
+ * exercises the pre-parsed object shortcut, not wire parsing).
+ */
+function wireRequest(method: string, raw: string): IncomingMessage {
+  const listeners: Record<string, Array<(chunk?: unknown) => void>> = {};
+  const req = {
+    method,
+    headers: {},
+    on(event: string, cb: (chunk?: unknown) => void) {
+      listeners[event] = listeners[event] ?? [];
+      listeners[event].push(cb);
+      return req;
+    },
+    destroy() {},
+  } as unknown as IncomingMessage;
+  // Emit after the current tick so parseBody attaches its listeners first.
+  setTimeout(() => {
+    for (const cb of listeners.data ?? []) cb(Buffer.from(raw, "utf8"));
+    for (const cb of listeners.end ?? []) cb();
+  }, 0);
+  return req;
+}
+
+/**
+ * Pre-parsed-body request for the happy-path shapes the runtime dispatcher
+ * would have already materialized.
+ */
 function request(
   method: string,
   body?: unknown,
@@ -38,7 +68,7 @@ function request(
   return {
     method,
     headers: {},
-    body,
+    ...(body !== undefined ? { body } : {}),
   } as unknown as IncomingMessage & { body?: unknown };
 }
 
@@ -154,17 +184,18 @@ describe("GET /api/coding-agents/policy (#24099)", () => {
 });
 
 describe("PUT /api/coding-agents/policy (#24099)", () => {
-  it("rejects malformed JSON with a 400 and never fabricates a document", async () => {
+  it("rejects malformed wire JSON with a 400 via the real J3 parse path", async () => {
     const res = response();
     expect(
       await handleAgentRoutes(
-        request("PUT", "not-an-object"),
+        wireRequest("PUT", '{"version": 1, "primary":'),
         res.res,
         "/api/coding-agents/policy",
         ctx(makeRuntime()),
       ),
     ).toBe(true);
     expect(res.status()).toBe(400);
+    expect(res.payload()).toEqual({ error: "Invalid JSON body" });
   });
 
   it("returns per-field issues with 400 and persists nothing on an invalid document", async () => {

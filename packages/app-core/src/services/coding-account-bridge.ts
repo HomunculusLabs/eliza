@@ -868,6 +868,15 @@ function makeBridge(pool: AccountPool): CodingAgentSelectorBridge {
       return out;
     },
 
+    // Read-only pin verification for the coding policy write path (#24099):
+    // enumerate ids WITHOUT select()'s side effects (Codex home
+    // materialization, token refresh).
+    accountIds(providerId: string) {
+      return pool
+        .list(providerId as Parameters<typeof pool.list>[0])
+        .map((account) => account.id);
+    },
+
     async select(agentType, opts) {
       const candidates = candidatesFor(agentType);
       if (candidates.length === 0) return null;

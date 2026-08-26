@@ -36,9 +36,11 @@ function makeRuntime(): IAgentRuntime & {
 
 function makeBridge(
   availability: Record<string, CodingProviderAvailability[]>,
+  accountIds?: Record<string, string[]>,
 ): CodingAgentSelectorBridge {
   return {
     describe: () => availability,
+    ...(accountIds ? { accountIds: (p: string) => accountIds[p] } : {}),
     select: vi.fn(async () => null),
   } as unknown as CodingAgentSelectorBridge;
 }
@@ -126,6 +128,68 @@ describe("writeCodingPolicy", () => {
     });
     expect(issues).toEqual([]);
     expect(policy?.primary.accountId).toBe("acct-a");
+  });
+
+  it("rejects a ghost pin when the bridge can enumerate account ids (r2 #2)", () => {
+    setCodingAgentSelectorBridge(
+      makeBridge(
+        {
+          claude: [
+            {
+              providerId: "anthropic-subscription",
+              total: 1,
+              enabled: 1,
+              healthy: 1,
+            },
+          ],
+        },
+        { "anthropic-subscription": ["acct-real"] },
+      ),
+    );
+    const { policy, issues } = writeCodingPolicy(makeRuntime(), {
+      ...VALID,
+      primary: {
+        backend: "claude",
+        providerId: "anthropic-subscription",
+        accountId: "acct-ghost",
+      },
+    });
+    expect(policy).toBeNull();
+    expect(
+      issues.some(
+        (issue) =>
+          issue.code === "missing_account" &&
+          issue.path === "primary.accountId" &&
+          issue.message.includes("acct-ghost"),
+      ),
+    ).toBe(true);
+  });
+
+  it("degrades to the provider-level check when the bridge cannot enumerate ids", () => {
+    setCodingAgentSelectorBridge(
+      makeBridge({
+        claude: [
+          {
+            providerId: "anthropic-subscription",
+            total: 1,
+            enabled: 1,
+            healthy: 1,
+          },
+        ],
+      }),
+    );
+    // No accountIds support: a would-be-ghost pin is NOT rejected here —
+    // spawn-time selection stays the authoritative check (fails closed).
+    const { policy, issues } = writeCodingPolicy(makeRuntime(), {
+      ...VALID,
+      primary: {
+        backend: "claude",
+        providerId: "anthropic-subscription",
+        accountId: "acct-unknown",
+      },
+    });
+    expect(issues).toEqual([]);
+    expect(policy?.primary.accountId).toBe("acct-unknown");
   });
 });
 
