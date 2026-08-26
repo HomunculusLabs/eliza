@@ -70,6 +70,8 @@ describe("accountMetaFromSessionMetadata", () => {
       label: "Personal",
       source: "oauth",
       strategy: "least-used",
+      // billingMode is descriptor-derived (#24099), never stamped input.
+      billingMode: "subscription-coding-cli",
     });
   });
   it("returns null when absent or malformed", () => {
@@ -131,6 +133,7 @@ describe("selectCodingAccount", () => {
       label: "Work",
       source: "oauth",
       strategy: "least-used",
+      billingMode: "subscription-coding-cli",
     });
     // meta carries no secret
     expect(JSON.stringify(resolved?.meta)).not.toContain("sk-ant-oat-X");

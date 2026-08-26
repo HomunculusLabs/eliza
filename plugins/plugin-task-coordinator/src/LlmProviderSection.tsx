@@ -1,7 +1,9 @@
 /**
  * LLM-provider selector sub-section of the coding-agent settings panel — chooses
- * between subscription, API-keys, and Eliza Cloud provider modes and renders the
- * matching credential inputs.
+ * between subscription, API-keys, and Eliza Cloud provider modes. Raw API keys
+ * are never typed or persisted here (#24099): the api-keys mode detects
+ * credentials stored through the encrypted Accounts/Vault flow, and this
+ * section only points at that flow.
  */
 import { Button, SettingsControls } from "@elizaos/ui";
 import { useAppSelector } from "@elizaos/ui/state";
@@ -10,6 +12,7 @@ import {
   CheckCircle2,
   Cloud,
   KeyRound,
+  Lock,
   type LucideIcon,
   Terminal,
 } from "lucide-react";
@@ -89,34 +92,19 @@ export function LlmProviderSection({
 
       {llmProvider === "api_keys" && (
         <div className="flex flex-col gap-3">
-          <SettingsControls.Field>
-            <SettingsControls.FieldLabel>
-              {t("codingagentsettingssection.AnthropicApiKey", {
-                defaultValue: "Anthropic API Key",
-              })}
-            </SettingsControls.FieldLabel>
-            <SettingsControls.Input
-              variant="compact"
-              type="password"
-              placeholder="sk-ant-..."
-              value={prefs.ANTHROPIC_API_KEY || ""}
-              onChange={(e) => setPref("ANTHROPIC_API_KEY", e.target.value)}
-            />
-          </SettingsControls.Field>
-          <SettingsControls.Field>
-            <SettingsControls.FieldLabel>
-              {t("codingagentsettingssection.OpenaiApiKey", {
-                defaultValue: "OpenAI API Key",
-              })}
-            </SettingsControls.FieldLabel>
-            <SettingsControls.Input
-              variant="compact"
-              type="password"
-              placeholder="sk-..."
-              value={prefs.OPENAI_API_KEY || ""}
-              onChange={(e) => setPref("OPENAI_API_KEY", e.target.value)}
-            />
-          </SettingsControls.Field>
+          <SettingsControls.MutedText
+            className="inline-flex items-center gap-1.5 text-xs"
+            title={t("codingagentsettingssection.ApiKeysVaultHint", {
+              defaultValue:
+                "API keys are stored encrypted through Accounts / Vault, never as plaintext settings.",
+            })}
+          >
+            <Lock className="size-3.5 shrink-0" aria-hidden />
+            {t("codingagentsettingssection.ApiKeysVaultHint", {
+              defaultValue:
+                "Add provider API keys under Settings → Vault or the Accounts surface; they are detected here automatically.",
+            })}
+          </SettingsControls.MutedText>
         </div>
       )}
 

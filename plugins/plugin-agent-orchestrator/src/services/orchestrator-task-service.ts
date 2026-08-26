@@ -44,6 +44,7 @@ import {
   toWellFormedUnicode,
   type UUID,
 } from "@elizaos/core";
+import { codingProviderDescriptorForProvider } from "@elizaos/shared";
 import {
   detectTaskType,
   generateDefaultAcceptanceCriteria,
@@ -2258,6 +2259,8 @@ export class OrchestratorTaskService extends Service {
         // spawn-time account went unhealthy). Re-key the durable session
         // record so recordUsage bills the account actually serving and the
         // rate-limit/reauth marks land on it — not the spawn-time account.
+        // The billing mode is re-derived from the new provider's descriptor
+        // (#24099): a failover across providers changes the billing mode.
         const providerId = str(record.providerId);
         const accountId = str(record.accountId);
         if (providerId && accountId) {
@@ -2267,6 +2270,13 @@ export class OrchestratorTaskService extends Service {
               accountProviderId: providerId,
               accountId,
               accountLabel: str(record.label) ?? accountId,
+              ...(codingProviderDescriptorForProvider(providerId)?.billingMode
+                ? {
+                    accountBillingMode:
+                      codingProviderDescriptorForProvider(providerId)
+                        ?.billingMode,
+                  }
+                : {}),
             },
             taskId,
           );
@@ -6025,6 +6035,9 @@ export class OrchestratorTaskService extends Service {
             accountProviderId: account.providerId,
             accountId: account.accountId,
             accountLabel: account.label,
+            ...(account.billingMode
+              ? { accountBillingMode: account.billingMode }
+              : {}),
           }
         : {}),
       label: agentName,
@@ -6281,6 +6294,9 @@ export class OrchestratorTaskService extends Service {
             accountProviderId: account.providerId,
             accountId: account.accountId,
             accountLabel: account.label,
+            ...(account.billingMode
+              ? { accountBillingMode: account.billingMode }
+              : {}),
           }
         : {}),
       label: input.label ?? input.sessionId,

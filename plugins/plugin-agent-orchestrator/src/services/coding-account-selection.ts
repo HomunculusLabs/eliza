@@ -19,7 +19,10 @@ import {
   getCodingAgentSelectorBridge,
   logger,
 } from "@elizaos/core";
-import { CODING_AGENT_BACKEND_PROVIDERS } from "@elizaos/shared";
+import {
+  CODING_AGENT_BACKEND_PROVIDERS,
+  codingProviderDescriptorForProvider,
+} from "@elizaos/shared";
 
 // The bridge symbol + contract are single-sourced in `@elizaos/core`; re-export
 // the shared types under this plugin's public surface. `CodingAccountSelection`
@@ -38,6 +41,8 @@ export interface CodingAccountMeta {
   label: string;
   source: string;
   strategy: string;
+  /** Canonical billing mode derived from the provider descriptor (#24099). */
+  billingMode: string | null;
 }
 
 export interface ResolvedCodingAccount {
@@ -89,6 +94,9 @@ function toMeta(selection: CodingAccountSelection): CodingAccountMeta {
     label: selection.label,
     source: selection.source,
     strategy: selection.strategy,
+    billingMode:
+      codingProviderDescriptorForProvider(selection.providerId)?.billingMode ??
+      null,
   };
 }
 
@@ -357,5 +365,7 @@ export function accountMetaFromSessionMetadata(
     label: typeof a.label === "string" ? a.label : a.accountId,
     source: typeof a.source === "string" ? a.source : "oauth",
     strategy: typeof a.strategy === "string" ? a.strategy : "least-used",
+    billingMode:
+      codingProviderDescriptorForProvider(a.providerId)?.billingMode ?? null,
   };
 }

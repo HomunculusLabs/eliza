@@ -2381,3 +2381,154 @@ describe("SETTINGS action: get and validate", () => {
 		expect(texts.join(" ").toLowerCase()).toContain("settings");
 	});
 });
+
+describe("SETTINGS action: coding-policy keyed writes on a delegated section (#24099)", () => {
+	const policyDoc = {
+		policy: {
+			version: 1,
+			primary: { backend: "claude", providerId: "anthropic-subscription" },
+			fallbacks: [{ backend: "codex", providerId: "openai-codex" }],
+			approvalPreset: "standard",
+		},
+		readiness: {
+			ready: true,
+			problems: [],
+			effectiveBackend: "claude",
+		},
+	};
+
+	it("reads the coding policy through the keyed status command (coding-policy)", async () => {
+		const routeFetch = vi.fn<SettingsRouteFetch>(async (req) => {
+			expect(req.method).toBe("GET");
+			expect(req.path).toBe("/api/coding-agents/policy");
+			return { ok: true, data: policyDoc };
+		});
+		const { result, texts } = await invoke(
+			{
+				action: "set",
+				section: "ai-model",
+				key: "coding-policy",
+				value: "status",
+			},
+			routeFetch,
+		);
+		expect(routeFetch).toHaveBeenCalledTimes(1);
+		expect(result?.success).toBe(true);
+		expect(texts.join(" ")).toContain("claude/anthropic-subscription");
+		expect(texts.join(" ")).toContain("codex/openai-codex");
+	});
+
+	it("switches the primary backend with one atomic PUT (read-modify-write)", async () => {
+		const calls: Array<{ method?: string; body?: unknown }> = [];
+		const routeFetch = vi.fn<SettingsRouteFetch>(async (req) => {
+			calls.push({ method: req.method, body: req.body });
+			if (req.method === "GET") return { ok: true, data: policyDoc };
+			return {
+				ok: true,
+				data: {
+					policy: {
+						...policyDoc.policy,
+						primary: { backend: "codex", providerId: "openai-codex" },
+					},
+					readiness: { ready: true, problems: [] },
+				},
+			};
+		});
+		const { result, texts } = await invoke(
+			{
+				action: "set",
+				section: "ai-model",
+				key: "coding-backend",
+				value: "codex",
+			},
+			routeFetch,
+		);
+		expect(routeFetch).toHaveBeenCalledTimes(2);
+		expect(calls[0].method).toBe("GET");
+		expect(calls[1].method).toBe("PUT");
+		// The backend switch clears the old provider binding — the server
+		// rejects a carried-over anthropic binding on a codex route.
+		const putBody = calls[1].body as { primary: { backend: string } };
+		expect(putBody.primary).toEqual({ backend: "codex" });
+		expect(result?.success).toBe(true);
+		expect(texts.join(" ")).toContain("codex");
+	});
+
+	it("rejects an unknown backend without any write", async () => {
+		const routeFetch = vi.fn<SettingsRouteFetch>(async () => ({ ok: true }));
+		const { result, texts } = await invoke(
+			{
+				action: "set",
+				section: "ai-model",
+				key: "coding-backend",
+				value: "hyperdrive",
+			},
+			routeFetch,
+		);
+		expect(routeFetch).not.toHaveBeenCalled();
+		expect(result?.success).toBe(false);
+		expect(texts.join(" ")).toContain("choose a coding backend");
+	});
+
+	it("surfaces per-field validation issues from a rejected PUT", async () => {
+		const routeFetch = vi.fn<SettingsRouteFetch>(async (req) => {
+			if (req.method === "GET") return { ok: true, data: policyDoc };
+			return {
+				ok: false,
+				status: 400,
+				data: {
+					policy: null,
+					issues: [
+						{
+							path: "primary.backend",
+							code: "unsupported_backend",
+							message: "no such backend",
+						},
+					],
+				},
+			};
+		});
+		const { result, texts } = await invoke(
+			{
+				action: "set",
+				section: "ai-model",
+				key: "coding-backend",
+				value: "codex",
+			},
+			routeFetch,
+		);
+		expect(result?.success).toBe(false);
+		expect(texts.join(" ")).toContain("primary.backend");
+		expect(texts.join(" ")).toContain("no such backend");
+	});
+
+	it("refuses the backend switch when no policy is configured yet", async () => {
+		const routeFetch = vi.fn<SettingsRouteFetch>(async () => ({
+			ok: true,
+			data: { policy: null },
+		}));
+		const { result, texts } = await invoke(
+			{
+				action: "set",
+				section: "ai-model",
+				key: "coding-backend",
+				value: "codex",
+			},
+			routeFetch,
+		);
+		expect(routeFetch).toHaveBeenCalledTimes(1); // GET only, no PUT
+		expect(result?.success).toBe(false);
+		expect(texts.join(" ")).toContain("no coding policy is configured");
+	});
+
+	it("still delegates an un-keyed ai-model request to MODEL_SWITCH", async () => {
+		const routeFetch = vi.fn<SettingsRouteFetch>(async () => ({ ok: true }));
+		const { result } = await invoke(
+			{ action: "set", section: "ai-model", value: "cloud" },
+			routeFetch,
+		);
+		expect(routeFetch).not.toHaveBeenCalled();
+		expect(result?.success).toBe(false);
+		expect(result?.data).toMatchObject({ delegateTo: "MODEL_SWITCH" });
+	});
+});

@@ -91,8 +91,37 @@ export function resolvePinnedAdapter(
     .toLowerCase()
     .trim();
   if (strategy !== "fixed") return undefined;
+  // Precedence (#24099): an explicit benchmark override first, then the
+  // validated coding policy (primary route), then the legacy env keys. The
+  // policy is a runtime character setting written by PUT /api/coding-agents/
+  // policy; legacy keys remain as the unset-policy default, never a silent
+  // co-author of the decision.
+  const policyRaw = getSetting("ELIZA_CODING_POLICY");
+  const policyBackend = (() => {
+    if (typeof policyRaw !== "string" || policyRaw.trim() === "") {
+      return undefined;
+    }
+    try {
+      const parsed = JSON.parse(policyRaw) as {
+        primary?: { backend?: unknown };
+      };
+      const backend = parsed?.primary?.backend;
+      const normalized = normalizeTaskAgentAdapter(
+        typeof backend === "string" ? backend : undefined,
+      );
+      return normalized && KNOWN_ADAPTER_TYPES.has(normalized)
+        ? normalized
+        : undefined;
+    } catch {
+      // error-policy:J4 user-facing degrade — a corrupt stored policy falls
+      // back to legacy env routing; the settings surface surfaces the parse
+      // issue separately via GET /api/coding-agents/policy.
+      return undefined;
+    }
+  })();
   const raw = normalizeTaskAgentAdapter(
     getSetting("BENCHMARK_TASK_AGENT") ??
+      policyBackend ??
       getSetting("ELIZA_ACP_DEFAULT_AGENT") ??
       getSetting("ELIZA_DEFAULT_AGENT_TYPE"),
   );

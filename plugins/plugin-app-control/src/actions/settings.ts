@@ -124,6 +124,13 @@ export type SettingsSectionCapability =
 			action: string;
 			/** One-line summary of what that action does, for `list`. */
 			summary: string;
+			/**
+			 * Optional route-backed keys a delegate section still owns directly:
+			 * a request naming one of these keys runs the keyed write here
+			 * instead of bouncing to the delegate action (#24099 — the coding
+			 * policy lives under `ai-model` but has no dedicated action).
+			 */
+			keys?: Record<string, SettingsWritableKey>;
 	  }
 	| {
 			kind: "route";
@@ -605,6 +612,196 @@ const COMPUTER_USE_CAPABILITY_KEY = makeCapabilityConfigKey(
 	"computerUse",
 	"computer-use",
 );
+
+/**
+ * Read the current coding policy (primary/fallback coding-agent routes,
+ * provider/account binding, approval preset) from the same
+ * `/api/coding-agents/policy` route the settings surface reads — one
+ * contract, one write path (#24099).
+ */
+const CODING_POLICY_STATUS_KEY: SettingsWritableKey = {
+	description:
+		"Read the unified coding-agent policy: primary and fallback routes, bound provider/account, and approval preset, with live route readiness.",
+	valueType: "command",
+	apply: ({ routeFetch }) =>
+		routeFetch({ method: "GET", path: "/api/coding-agents/policy" }),
+	successText: (_value, _request, outcome) => {
+		const policy = readCodingPolicyPayload(outcome.data);
+		if (!policy) return "No coding-agent policy is configured yet.";
+		const readiness = readCodingPolicyReadiness(outcome.data);
+		const routes = [policy.primary, ...policy.fallbacks]
+			.map((route) => `${route.backend}/${route.providerId}`)
+			.join(" -> ");
+		return `Coding policy: ${routes}. Approval preset: ${policy.approvalPreset}.${
+			readiness
+				? readiness.ready
+					? ` Ready (effective backend: ${readiness.effectiveBackend ?? "unknown"}).`
+					: ` Not ready: ${readiness.problems.join("; ")}`
+				: ""
+		}`;
+	},
+};
+
+/**
+ * Change the coding policy's primary backend from chat/voice. Read-modify-write
+ * against the authoritative policy route: the action fetches the current
+ * document, replaces the primary route's backend (clearing any provider/account
+ * binding that belonged to the old backend — the server rejects mismatches),
+ * and issues ONE atomic PUT. Provider/account binding and model roles stay in
+ * the settings surface until chat-safe sub-keys exist for them.
+ */
+const CODING_POLICY_BACKEND_KEY: SettingsWritableKey = {
+	description:
+		"Switch the primary coding-agent backend (claude, codex, kimi, grok, elizaos, pi-agent). Read-modify-write on the atomic policy route.",
+	valueType: "command",
+	apply: async ({ request, routeFetch }) => {
+		const backend = (request.value ?? "").trim().toLowerCase();
+		const known = ["claude", "codex", "kimi", "grok", "elizaos", "pi-agent"];
+		if (!known.includes(backend)) {
+			return {
+				ok: false,
+				detail: `choose a coding backend: ${known.join(", ")}`,
+			};
+		}
+		const current = await routeFetch({
+			method: "GET",
+			path: "/api/coding-agents/policy",
+		});
+		const policy = readCodingPolicyPayload(current.data);
+		if (!policy) {
+			return {
+				ok: false,
+				detail:
+					"no coding policy is configured yet; set one up in Settings → Coding Agents first",
+			};
+		}
+		if (policy.primary.backend === backend) {
+			return {
+				ok: true,
+				data: current.data,
+				detail: `the primary coding backend is already ${backend}`,
+			};
+		}
+		// Backend switch clears the old route's provider binding: the
+		// descriptor-mismatch validation on PUT rejects a carried-over binding,
+		// and silently retaining it would be a false success.
+		const candidate = {
+			version: policy.version,
+			primary: { backend },
+			fallbacks: policy.fallbacks,
+			approvalPreset: policy.approvalPreset,
+		};
+		const write = await routeFetch({
+			method: "PUT",
+			path: "/api/coding-agents/policy",
+			body: candidate,
+		});
+		if (!write.ok) {
+			const issues = readCodingPolicyIssues(write.data);
+			return {
+				ok: false,
+				detail: issues.length
+					? `the policy route rejected the change: ${issues.join("; ")}`
+					: (write.detail ?? "the policy route rejected the change"),
+			};
+		}
+		return write;
+	},
+	successText: (_value, request, outcome) => {
+		const policy = readCodingPolicyPayload(outcome.data);
+		return policy
+			? `Primary coding backend is now ${policy.primary.backend}.`
+			: `Coding backend switched to ${request.value}.`;
+	},
+};
+
+/** Shape readers shared by the coding-policy chat keys. */
+function readCodingPolicyPayload(data: unknown): {
+	version: number;
+	primary: { backend: string; providerId: string };
+	fallbacks: Array<{ backend: string; providerId: string }>;
+	approvalPreset: string;
+} | null {
+	if (!data || typeof data !== "object") return null;
+	const policy = (data as { policy?: unknown }).policy;
+	if (!policy || typeof policy !== "object") return null;
+	const p = policy as {
+		version?: unknown;
+		primary?: unknown;
+		fallbacks?: unknown;
+		approvalPreset?: unknown;
+	};
+	if (
+		typeof p.version !== "number" ||
+		!p.primary ||
+		typeof p.primary !== "object" ||
+		typeof (p.primary as { backend?: unknown }).backend !== "string" ||
+		typeof (p.primary as { providerId?: unknown }).providerId !== "string" ||
+		!Array.isArray(p.fallbacks) ||
+		typeof p.approvalPreset !== "string"
+	) {
+		return null;
+	}
+	const fallbacks = p.fallbacks
+		.filter(
+			(route): route is { backend: string; providerId: string } =>
+				!!route &&
+				typeof route === "object" &&
+				typeof (route as { backend?: unknown }).backend === "string" &&
+				typeof (route as { providerId?: unknown }).providerId === "string",
+		)
+		.map((route) => ({
+			backend: route.backend,
+			providerId: route.providerId,
+		}));
+	return {
+		version: p.version,
+		primary: {
+			backend: (p.primary as { backend: string }).backend,
+			providerId: (p.primary as { providerId: string }).providerId,
+		},
+		fallbacks,
+		approvalPreset: p.approvalPreset,
+	};
+}
+
+function readCodingPolicyReadiness(
+	data: unknown,
+): { ready: boolean; problems: string[]; effectiveBackend?: string } | null {
+	if (!data || typeof data !== "object") return null;
+	const readiness = (data as { readiness?: unknown }).readiness;
+	if (!readiness || typeof readiness !== "object") return null;
+	const r = readiness as {
+		ready?: unknown;
+		problems?: unknown;
+		effectiveBackend?: unknown;
+	};
+	if (typeof r.ready !== "boolean" || !Array.isArray(r.problems)) return null;
+	return {
+		ready: r.ready,
+		problems: r.problems.filter(
+			(problem): problem is string => typeof problem === "string",
+		),
+		...(typeof r.effectiveBackend === "string"
+			? { effectiveBackend: r.effectiveBackend }
+			: {}),
+	};
+}
+
+function readCodingPolicyIssues(data: unknown): string[] {
+	if (!data || typeof data !== "object") return [];
+	const issues = (data as { issues?: unknown }).issues;
+	if (!Array.isArray(issues)) return [];
+	return issues
+		.map((issue) =>
+			issue && typeof issue === "object"
+				? `${(issue as { path?: unknown }).path ?? ""}: ${
+						(issue as { message?: unknown }).message ?? "invalid"
+					}`
+				: null,
+		)
+		.filter((line): line is string => line !== null);
+}
 
 const APPEARANCE_THEME_ALIASES: ReadonlyMap<
 	string,
@@ -1407,7 +1604,14 @@ export const SETTINGS_WRITE_REGISTRY: Readonly<
 	"ai-model": {
 		kind: "delegate",
 		action: "MODEL_SWITCH",
-		summary: "Switch inference between the on-device model and Eliza Cloud.",
+		summary:
+			"Switch inference between the on-device model and Eliza Cloud; coding-agent backend/fallback policy lives under the coding-policy keys here.",
+		keys: {
+			"coding-policy": CODING_POLICY_STATUS_KEY,
+			"coding-agent-policy": CODING_POLICY_STATUS_KEY,
+			"coding-backend": CODING_POLICY_BACKEND_KEY,
+			"coding-agent-backend": CODING_POLICY_BACKEND_KEY,
+		},
 	},
 	appearance: {
 		kind: "route",
@@ -1844,17 +2048,30 @@ async function handleSet(
 	}
 	const cap = SETTINGS_WRITE_REGISTRY[request.sectionId];
 
+	// Delegate sections can still own explicit route-backed keys: when the
+	// request names one, the keyed write runs here against the section's own
+	// backend route; only un-keyed requests bounce to the delegate action.
 	if (cap.kind === "delegate") {
-		// Point the planner at the dedicated action rather than duplicating its
-		// write. routingHint already prefers that action; this is the safety net
-		// for when the planner reached SETTINGS anyway.
-		// Planner-facing only: raw action names are routing guidance, not chat.
-		const reply = `Changing ${request.sectionId} runs through the ${cap.action} action — ${cap.summary}`;
-		return {
-			success: false,
-			text: reply,
-			data: { delegateTo: cap.action, section: request.sectionId },
-		};
+		const keyedEntry = request.key ? cap.keys?.[request.key] : undefined;
+		if (!keyedEntry || !request.key) {
+			// Point the planner at the dedicated action rather than duplicating its
+			// write. routingHint already prefers that action; this is the safety net
+			// for when the planner reached SETTINGS anyway.
+			// Planner-facing only: raw action names are routing guidance, not chat.
+			const reply = `Changing ${request.sectionId} runs through the ${cap.action} action — ${cap.summary}`;
+			return {
+				success: false,
+				text: reply,
+				data: { delegateTo: cap.action, section: request.sectionId },
+			};
+		}
+		return await applyWritableKey(
+			request,
+			request.key,
+			keyedEntry,
+			routeFetch,
+			callback,
+		);
 	}
 
 	if (cap.kind === "readonly") {
@@ -1924,6 +2141,28 @@ async function handleSet(
 		return { success: false, text: reply };
 	}
 
+	return await applyWritableKey(
+		request,
+		keyName,
+		writable,
+		routeFetch,
+		callback,
+	);
+}
+
+/**
+ * Execute one resolved writable key: parse the value, run the key's apply /
+ * buildRequest against the section's backend route, and narrate the outcome.
+ * Shared by the `route` path in handleSet and delegate sections' keyed
+ * entries, so both write paths are byte-identical.
+ */
+async function applyWritableKey(
+	request: SettingsRequest,
+	keyName: string,
+	writable: SettingsWritableKey,
+	routeFetch: SettingsRouteFetch,
+	callback: HandlerCallback | undefined,
+): Promise<ActionResult> {
 	const parsedValue =
 		writable.valueType === "boolean" ? parseBooleanValue(request.value) : null;
 	if (writable.valueType === "boolean" && parsedValue === null) {

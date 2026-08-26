@@ -17,6 +17,11 @@ import * as path from "node:path";
 import { promisify } from "node:util";
 import { logger } from "@elizaos/core";
 import { assignAgentName } from "../services/agent-name-assignment.js";
+import {
+  assessCodingPolicyReadiness,
+  loadCodingPolicy,
+  writeCodingPolicy,
+} from "../services/coding-policy-service.js";
 import { buildGoalFollowUp, buildGoalPrompt } from "../services/goal-prompt.js";
 import { isParentAgentBrokerWired } from "../services/parent-agent-broker.js";
 import { getTaskAgentFrameworkState } from "../services/task-agent-frameworks.js";
@@ -270,6 +275,49 @@ export async function handleAgentRoutes(
   ctx: RouteContext,
 ): Promise<boolean> {
   const method = req.method?.toUpperCase();
+
+  // === Coding Policy (#24099) ===
+  // GET /api/coding-agents/policy — policy + derived readiness, never one
+  // without the other, so the settings surface cannot show a policy the
+  // runtime would not actually use.
+  if (method === "GET" && pathname === "/api/coding-agents/policy") {
+    const { policy, issues } = loadCodingPolicy(ctx.runtime);
+    const readiness = policy
+      ? assessCodingPolicyReadiness(ctx.runtime, policy)
+      : null;
+    sendJson(res, {
+      policy,
+      ...(readiness ? { readiness } : {}),
+      ...(issues.length > 0 ? { issues } : {}),
+    });
+    return true;
+  }
+
+  // PUT /api/coding-agents/policy — the one atomic validated write. Rejects
+  // with 400 + per-field issues; on success returns the authoritative
+  // post-write policy and freshly derived readiness.
+  if (method === "PUT" && pathname === "/api/coding-agents/policy") {
+    let body: Record<string, unknown>;
+    try {
+      body = await parseBody(req);
+    } catch {
+      // error-policy:J3 untrusted-input sanitizing — malformed JSON is an
+      // explicit 400, never a fabricated empty document.
+      sendError(res, "Invalid JSON body", 400);
+      return true;
+    }
+    const { policy, issues } = writeCodingPolicy(ctx.runtime, body);
+    if (!policy) {
+      sendJson(res, { policy: null, issues }, 400);
+      return true;
+    }
+    logger.info(
+      `[coding-policy] wrote policy: primary=${policy.primary.backend}/${policy.primary.providerId} fallbacks=${policy.fallbacks.length} preset=${policy.approvalPreset}`,
+    );
+    const readiness = assessCodingPolicyReadiness(ctx.runtime, policy);
+    sendJson(res, { policy, readiness, issues });
+    return true;
+  }
 
   // === Preflight Check ===
   // GET /api/coding-agents/preflight

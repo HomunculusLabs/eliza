@@ -143,6 +143,9 @@ describe("coding account selection helpers", () => {
       label: "acct-1",
       source: "oauth",
       strategy: "least-used",
+      // billingMode is re-derived from the provider's capability descriptor
+      // (#24099): derived state, never persisted from client input.
+      billingMode: "subscription-coding-cli",
     });
     expect(
       accountMetaFromSessionMetadata({

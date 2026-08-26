@@ -247,6 +247,10 @@ export interface OrchestratorTaskSession {
   accountId?: string;
   /** Human label of the pooled account (e.g. "Work"). */
   accountLabel?: string;
+  /** Canonical billing mode derived from the provider descriptor at spawn
+   * (#24099) — `subscription-coding-cli`, `subscription-coding-plan`, or
+   * `usage`. Never a user free-text field. */
+  accountBillingMode?: string;
   label: string;
   originalTask: string;
   goalPrompt?: string;
