@@ -1,15 +1,16 @@
 /**
  * Behavioral tests for unified-policy spawn consumption and readiness pin
- * honesty (#24099 review r3 findings 3+5): the whole-valid policy steers the
- * spawn's approval preset, model, and ordered pinned-account walk (with policy
- * provenance stamped onto the durable session record), readiness never
- * presents a pinned route as confirmed-healthy off sibling-account counts, and
- * `accountIds() === undefined` degrades to the provider-level check. Deterministic;
+ * honesty (#24099 review r3 findings 3+5, hardened by r4 findings 1-4): the
+ * whole-valid policy steers the spawn's approval preset, model, and ordered
+ * account walk (failing CLOSED on a bridged host when no route selects), with
+ * policy provenance stamped onto the durable session record; readiness never
+ * presents a pinned route as usable without pin-level evidence. Deterministic;
  * real AcpService + InMemorySessionStore + fake account bridge, no network.
  */
 
 import type { CodingAgentSelection } from "@elizaos/core";
 import { setCodingAgentSelectorBridge } from "@elizaos/core";
+import type { CodingPolicy } from "@elizaos/shared";
 import { afterEach, describe, expect, it } from "vitest";
 import { AcpService } from "../services/acp-service.ts";
 import {
@@ -133,8 +134,8 @@ describe("writeCodingPolicy: accountIds undefined degrades (r3 undefined-finding
   });
 });
 
-describe("assessCodingPolicyReadiness: pinned-route honesty (r3 finding 5)", () => {
-  const POLICY = {
+describe("assessCodingPolicyReadiness: pinned-route honesty (r3 f5, r4 f2)", () => {
+  const POLICY: CodingPolicy = {
     version: 1,
     primary: {
       backend: "claude",
@@ -165,7 +166,7 @@ describe("assessCodingPolicyReadiness: pinned-route honesty (r3 finding 5)", () 
     expect(readiness.ready).toBe(false);
   });
 
-  it("verifies an existing pin but never claims its health from aggregate counts", () => {
+  it("verifies pin EXISTENCE but never certifies usability from aggregate health (r4 f2)", () => {
     setCodingAgentSelectorBridge(
       makeSelectingBridge(
         [],
@@ -180,8 +181,12 @@ describe("assessCodingPolicyReadiness: pinned-route honesty (r3 finding 5)", () 
       POLICY,
     );
     expect(readiness.routes[0]?.account?.pinStatus).toBe("verified");
-    // Aggregate pool health (healthy:1) must not be reported as the pin's.
-    expect(readiness.routes[0]?.problems.join(" ")).not.toContain("No healthy");
+    // ok means "currently usable": existence alone cannot certify that when
+    // the bridge exposes no per-account health.
+    expect(readiness.routes[0]?.ok).toBe(false);
+    expect(readiness.routes[0]?.problems.join(" ")).toContain(
+      "per-account health is not observable",
+    );
   });
 
   it("marks a pinned route unverifiable — never confirmed-healthy — without enumeration", () => {
@@ -248,7 +253,7 @@ describe("resolveCodingPolicySpawnPin", () => {
   });
 });
 
-describe("AcpService.spawnSession policy consumption (r3 finding 3)", () => {
+describe("AcpService.spawnSession policy consumption (r3 f3, r4 f1/f3/f4)", () => {
   function serviceWithPolicy(policy: unknown) {
     const settings: Record<string, string> = { ELIZA_ACP_TRANSPORT: "cli" };
     const runtime = makeRuntime(settings) as never;
@@ -270,24 +275,57 @@ describe("AcpService.spawnSession policy consumption (r3 finding 3)", () => {
     return { svc, store, settings };
   }
 
-  const POLICY = {
+  const POLICY: CodingPolicy = {
     version: 1,
     primary: {
       backend: "claude",
       providerId: "anthropic-subscription",
       accountId: "acct-pinned",
+      model: "claude-primary-model",
     },
     fallbacks: [
       {
         backend: "claude",
         providerId: "anthropic-subscription",
         accountId: "acct-fallback",
+        model: "claude-fallback-model",
       },
     ],
     approvalPreset: "readonly",
   };
 
-  it("authenticates as the pinned primary account and stamps policy provenance", async () => {
+  it("authenticates as the pinned primary account, uses ITS model, and stamps provenance", async () => {
+    const harness = makeSelectingBridge(
+      ["acct-pinned", "acct-fallback"],
+      { claude: HEALTHY_CLAUDE },
+      {
+        "anthropic-subscription": ["acct-pinned", "acct-fallback"],
+      },
+    );
+    harness.install();
+    const { svc, store } = serviceWithPolicy(POLICY);
+    const result = await svc.spawnSession({ agentType: "claude" });
+    expect(
+      harness.calls
+        .filter((call) => call.opts.accountIds !== undefined)
+        .map((call) => call.opts.accountIds),
+    ).toEqual([["acct-pinned"]]);
+    const session = await store.get(result.sessionId);
+    expect(
+      (session?.metadata?.account as { accountId?: string } | undefined)
+        ?.accountId,
+    ).toBe("acct-pinned");
+    expect(session?.approvalPreset).toBe("readonly");
+    expect(session?.metadata?.codingPolicyRoute).toEqual({
+      backend: "claude",
+      providerId: "anthropic-subscription",
+      accountId: "acct-pinned",
+      model: "claude-primary-model",
+    });
+    expect(session?.metadata?.codingPolicyPreset).toBe("readonly");
+  });
+
+  it("walks to the fallback pin and uses the FALLBACK route's model (r4 f3)", async () => {
     const harness = makeSelectingBridge(
       ["acct-fallback"],
       { claude: HEALTHY_CLAUDE },
@@ -298,21 +336,31 @@ describe("AcpService.spawnSession policy consumption (r3 finding 3)", () => {
     harness.install();
     const { svc, store } = serviceWithPolicy(POLICY);
     const result = await svc.spawnSession({ agentType: "claude" });
-    // Selection walked past the unselectable primary pin to the fallback pin.
-    expect(
-      harness.calls
-        .filter((call) => call.opts.accountIds !== undefined)
-        .map((call) => call.opts.accountIds),
-    ).toEqual([["acct-pinned"], ["acct-fallback"]]);
     const session = await store.get(result.sessionId);
-    expect(session?.metadata?.account?.accountId).toBe("acct-fallback");
-    expect(session?.approvalPreset).toBe("readonly");
-    expect(session?.metadata?.codingPolicyRoute).toEqual({
-      backend: "claude",
-      providerId: "anthropic-subscription",
-      accountId: "acct-fallback",
-    });
-    expect(session?.metadata?.codingPolicyPreset).toBe("readonly");
+    expect(
+      (session?.metadata?.account as { accountId?: string } | undefined)
+        ?.accountId,
+    ).toBe("acct-fallback");
+    expect(
+      (session?.metadata?.codingPolicyRoute as { model?: string } | undefined)
+        ?.model,
+    ).toBe("claude-fallback-model");
+    expect(session?.metadata?.spawnModel).toBe("claude-fallback-model");
+  });
+
+  it("fails CLOSED when a bridged policy has no selectable route (r4 f1)", async () => {
+    const harness = makeSelectingBridge(
+      [],
+      { claude: HEALTHY_CLAUDE },
+      {
+        "anthropic-subscription": ["acct-pinned", "acct-fallback"],
+      },
+    );
+    harness.install();
+    const { svc } = serviceWithPolicy(POLICY);
+    await expect(svc.spawnSession({ agentType: "claude" })).rejects.toThrow(
+      /no selectable account/i,
+    );
   });
 
   it("falls back to the ambient strategy when no policy routes match the backend", async () => {
@@ -337,7 +385,7 @@ describe("AcpService.spawnSession policy consumption (r3 finding 3)", () => {
     expect(session?.metadata?.codingPolicyRoute).toBeUndefined();
   });
 
-  it("keeps an explicit caller preset above the policy preset", async () => {
+  it("keeps an explicit caller preset above the policy preset and stamps no policy provenance for it (r4 f4)", async () => {
     const harness = makeSelectingBridge(
       ["acct-pinned"],
       { claude: HEALTHY_CLAUDE },
@@ -353,5 +401,22 @@ describe("AcpService.spawnSession policy consumption (r3 finding 3)", () => {
     });
     const session = await store.get(result.sessionId);
     expect(session?.approvalPreset).toBe("permissive");
+    expect(session?.metadata?.codingPolicyPreset).toBeUndefined();
+  });
+
+  it("preserves legacy single-account behavior when no policy is stored", async () => {
+    const harness = makeSelectingBridge(["acct-ambient"], {
+      claude: HEALTHY_CLAUDE,
+    });
+    harness.install();
+    const { svc, store } = serviceWithPolicy(null);
+    const result = await svc.spawnSession({ agentType: "claude" });
+    const session = await store.get(result.sessionId);
+    expect(
+      (session?.metadata?.account as { accountId?: string } | undefined)
+        ?.accountId,
+    ).toBe("acct-ambient");
+    expect(session?.metadata?.codingPolicyRoute).toBeUndefined();
+    expect(session?.metadata?.codingPolicyPreset).toBeUndefined();
   });
 });

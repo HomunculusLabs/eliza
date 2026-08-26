@@ -72,6 +72,7 @@ import {
   accountMetaFromSessionMetadata,
   type CodingAccountMeta,
   diagnoseCodingAccountFallback,
+  getCodingAccountBridge,
   isRefreshTokenExpiryText,
   isTokenExpiryText,
   resolveCodingAccountStrategy,
@@ -2097,40 +2098,56 @@ export class AcpService extends Service {
         ...(gitIndexIsolation?.env ?? {}),
         [CREDENTIAL_BRIDGE_TOKEN_ENV]: credentialBridgeToken.token,
       };
-      const spawnModel =
-        agentType === "claude"
-          ? normalizeClaudeAcpModelId(
-              opts.model ??
-                // Unified policy (#24099, r3 finding 3): the validated policy's
-                // model for this backend is the default when the caller did not
-                // pin one. First matching route carrying a model wins, in
-                // policy order (primary before fallbacks).
-                policyPin?.model,
-            )
-          : (opts.model ?? policyPin?.model);
+      // Unified policy (#24099, r3 finding 3): the validated policy's model
+      // for this backend is the DEFAULT when the caller did not pin one; the
+      // final value is derived below from the route that actually supplied
+      // the session's account, so execution and provenance can never disagree
+      // (r4 finding 3).
+      const policyFirstModel = policyPin?.model;
 
       // Multi-account selection: pick the least-used (default) linked subscription
       // for this agent type and inject its credentials into the spawn env so the
       // sub-agent authenticates AS that account. Returns null (and we keep the
       // single-account behavior) when no accounts are linked.
       // Unified policy (#24099, r3 finding 3): when the whole-valid policy has
-      // routes for this backend, their account pins are tried FIRST, in policy
-      // order — the spawn authenticates as the configured account (or walks to
-      // the next configured route when a pin is not selectable), and only a
-      // policy with zero matching routes falls back to the ambient strategy.
+      // routes for this backend, their account bindings are tried FIRST, in
+      // policy order — the spawn authenticates as the configured account (or
+      // walks to the next configured route when a binding is not selectable).
+      // A configured policy whose every route fails to select FAILS CLOSED on
+      // a bridged host (r4 finding 1): billing authority must not silently
+      // move to ambient credentials; only an unbridged (single-account) host
+      // keeps ambient credentials with a warn.
       const policyRoutes = policyPin?.routes ?? [];
       let resolvedAccount: Awaited<ReturnType<typeof selectCodingAccount>> =
         null;
       let policyRouteUsed: (typeof policyRoutes)[number] | undefined;
+      const bridgeForPolicy = getCodingAccountBridge();
       for (const route of policyRoutes) {
-        if (route.accountId === undefined) continue;
-        resolvedAccount = await selectCodingAccount(agentType, {
-          sessionKey: id,
-          accountIds: [route.accountId],
-        });
-        if (resolvedAccount) {
-          policyRouteUsed = route;
-          break;
+        if (route.accountId !== undefined) {
+          resolvedAccount = await selectCodingAccount(agentType, {
+            sessionKey: id,
+            accountIds: [route.accountId],
+          });
+          if (resolvedAccount) {
+            policyRouteUsed = route;
+            break;
+          }
+          continue;
+        }
+        // No explicit pin: honor the route's provider binding by selecting
+        // within the provider's enumerated accounts when the bridge can
+        // enumerate them; otherwise fall through to the ambient strategy.
+        const providerIds =
+          bridgeForPolicy?.accountIds?.(route.providerId) ?? undefined;
+        if (providerIds && providerIds.length > 0) {
+          resolvedAccount = await selectCodingAccount(agentType, {
+            sessionKey: id,
+            accountIds: providerIds,
+          });
+          if (resolvedAccount) {
+            policyRouteUsed = route;
+            break;
+          }
         }
       }
       if (!resolvedAccount && policyRoutes.length === 0) {
@@ -2140,27 +2157,55 @@ export class AcpService extends Service {
         resolvedAccount = await selectCodingAccount(agentType, {
           sessionKey: id,
           ...(accountStrategy ? { strategy: accountStrategy } : {}),
-          ...(spawnModel ? { model: spawnModel } : {}),
+          ...((opts.model ?? policyFirstModel)
+            ? { model: opts.model ?? policyFirstModel }
+            : {}),
         });
       }
       if (policyRoutes.length > 0 && !resolvedAccount) {
-        // A configured policy whose every pin failed to select must not
-        // silently degrade to ambient/strategy credentials: billing authority
-        // would move off every configured route without a trace.
+        const triedPins = policyRoutes.map((route: CodingPolicyRoute) =>
+          route.accountId !== undefined
+            ? route.accountId
+            : `(provider ${route.providerId})`,
+        );
+        if (bridgeForPolicy) {
+          // error-policy:J2 context-adding rethrow — a configured policy with
+          // no selectable route is a typed spawn refusal, never a silent
+          // degrade onto ambient credentials (r4 finding 1).
+          throw new ElizaError(
+            "The coding policy routes for this backend have no selectable account; fix the policy (connect the pinned account or repoint the route) before spawning",
+            {
+              code: "CODING_POLICY_NO_SELECTABLE_ROUTE",
+              context: {
+                sessionId: id,
+                agentType,
+                triedRoutes: triedPins,
+              },
+              severity: "ephemeral",
+            },
+          );
+        }
         this.log(
           "warn",
-          "coding policy routes yielded no account; spawn falls back to ambient credentials",
+          "coding policy routes yielded no account; unbridged host falls back to ambient credentials",
           {
             sessionId: id,
             agentType,
-            triedPins: policyRoutes
-              .filter(
-                (route: CodingPolicyRoute) => route.accountId !== undefined,
-              )
-              .map((route: CodingPolicyRoute) => route.accountId),
+            triedRoutes: triedPins,
           },
         );
       }
+      // Model precedence (r4 finding 3): explicit caller > the model of the
+      // policy route that actually supplied the account > the first matching
+      // route's model (route-less model default) > unset.
+      const effectiveModel =
+        opts.model ??
+        policyRouteUsed?.model ??
+        (policyRouteUsed ? undefined : policyFirstModel);
+      const spawnModel =
+        agentType === "claude"
+          ? normalizeClaudeAcpModelId(effectiveModel)
+          : effectiveModel;
       const customCredentials = resolvedAccount
         ? {
             ...(opts.customCredentials ?? {}),
@@ -2216,9 +2261,9 @@ export class AcpService extends Service {
         // Policy provenance (#24099 AC: session metadata records the route the
         // spawn actually consumed — backend/provider/account/billing source
         // without secrets. `codingPolicyRoute` is set only when a whole-valid
-        // policy steered account selection; `codingPolicyPreset` records the
-        // effective preset source so an incidental preset is distinguishable
-        // from a configured one.
+        // policy steered account selection; `codingPolicyPreset` is stamped
+        // only when the POLICY preset actually governed the session (an
+        // explicit caller preset outranks it — r4 finding 4).
         ...(policyRouteUsed
           ? {
               codingPolicyRoute: {
@@ -2233,7 +2278,9 @@ export class AcpService extends Service {
               },
             }
           : {}),
-        ...(policyPin ? { codingPolicyPreset: policyPin.approvalPreset } : {}),
+        ...(policyPin && !opts.approvalPreset
+          ? { codingPolicyPreset: policyPin.approvalPreset }
+          : {}),
         [ORCHESTRATOR_OWNED_ARTIFACTS_METADATA_KEY]:
           this.getOrchestratorOwnedArtifacts(id),
         [CREDENTIAL_BRIDGE_TOKEN_HASH_METADATA]: credentialBridgeToken.hash,

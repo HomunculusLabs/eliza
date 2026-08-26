@@ -310,7 +310,14 @@ export function assessCodingPolicyReadiness(
             `Pinned account "${route.accountId}" does not exist for provider "${route.providerId}"; reconnect it or pin one of: ${ids.join(", ") || "(none connected)"}.`,
           );
         } else {
+          // Existence is proven, but the bridge exposes no per-account health:
+          // aggregate sibling health must not certify the PIN as usable (r4
+          // finding 2). The route stays not-ok with an explicit pin-level
+          // caveat; spawn-time selection remains the health authority.
           account.pinStatus = "verified";
+          routeProblems.push(
+            `Pinned account "${route.accountId}" exists but per-account health is not observable; usability is decided at spawn time, which fails closed.`,
+          );
         }
         if (account.healthy === 0) {
           routeProblems.push(
