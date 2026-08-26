@@ -739,7 +739,9 @@ export function SimpleCalendarView() {
             />
           </div>
         ) : null}
-        {calendar.status === "partial" || calendar.status === "ready" ? (
+        {calendar.status === "partial" ||
+        calendar.status === "ready" ||
+        calendar.status === "unavailable" ? (
           <div style={{ gridColumn: "1 / -1" }}>
             <CalendarSourceHealth
               status={calendar.status}
@@ -833,9 +835,11 @@ export function SimpleCalendarView() {
               <p style={{ ...SECONDARY_STYLE, marginTop: 3, fontSize: 12 }}>
                 {settled
                   ? "Loading calendar…"
-                  : selectedEvents.length === 0
-                    ? "No plans yet"
-                    : `${selectedEvents.length} ${selectedEvents.length === 1 ? "event" : "events"}`}
+                  : selectedEvents.length > 0
+                    ? `${selectedEvents.length} ${selectedEvents.length === 1 ? "event" : "events"}`
+                    : calendar.feedState === "complete"
+                      ? "No plans yet"
+                      : "Coverage unavailable for this day"}
               </p>
             </div>
             <Clock3 size={16} aria-hidden style={{ color: "var(--muted)" }} />
@@ -862,9 +866,15 @@ export function SimpleCalendarView() {
                 />
               ))}
             </div>
-          ) : selectedEvents.length === 0 ? (
+          ) : selectedEvents.length === 0 &&
+            calendar.feedState === "complete" ? (
             <p style={SECONDARY_STYLE}>
               Ask Eliza in chat to schedule something for today.
+            </p>
+          ) : selectedEvents.length === 0 ? (
+            <p style={SECONDARY_STYLE}>
+              No calendar coverage for this day. Try again after reconnecting
+              your calendar sources.
             </p>
           ) : (
             selectedEvents.map((event) => (

@@ -220,6 +220,15 @@ export function useCalendarWeek(
     setLoading(true);
     setError(null);
     setErrorKind(null);
+    // A request for a different window starts from a clean slate: keeping the
+    // previous window's data visible during the in-flight fetch would paint
+    // another month's events under the newly selected month as status stayed
+    // "ready". Cache survives only same-window refreshes.
+    if (loadedWindowKeyRef.current !== windowKey) {
+      setEvents([]);
+      setFeedState(null);
+      setSources([]);
+    }
     try {
       const feed = await calendarClient.getLifeOpsCalendarFeed({
         side: "owner",

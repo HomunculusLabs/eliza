@@ -346,3 +346,87 @@ it("surfaces source health on the ready state", () => {
     view.container.querySelector('[data-testid="calendar-source-health"]'),
   ).toBeTruthy();
 });
+
+it("renders partial with source-health attention, never as a healthy empty grid", () => {
+  fixtures.calendar.mockReturnValue(
+    calendarState({
+      events: [event("Synced only", 10)],
+      feedState: "partial",
+      status: "partial",
+      sources: [
+        {
+          key: {
+            provider: "google",
+            side: "owner",
+            grantId: "g1",
+            connectorAccountId: "a1",
+            calendarId: "primary",
+          },
+          summary: "Work",
+          accessRole: "owner",
+          visibility: "details",
+          status: "stale",
+          syncedAt: "2026-08-01T12:00:00.000Z",
+          error: {
+            code: "CALENDAR_REFRESH_FAILED",
+            message: "Refresh failed.",
+            retryable: true,
+          },
+        },
+      ],
+    }),
+  );
+  const view = render(<SimpleCalendarView />);
+
+  // Source health renders the partial attention headline.
+  const health = view.container.querySelector(
+    '[data-testid="calendar-source-health"]',
+  );
+  expect(health).toBeTruthy();
+  expect(health?.textContent).toContain("1 source needs attention");
+  // The main label carries the event count, not an empty-calendar reading.
+  expect(screen.getByRole("main", { name: "Calendar. 1 event" })).toBeTruthy();
+});
+
+it("renders unavailable with the unavailable card and source details, distinct from empty", () => {
+  fixtures.calendar.mockReturnValue(
+    calendarState({
+      events: [],
+      feedState: "unavailable",
+      status: "unavailable",
+      sources: [
+        {
+          key: {
+            provider: "google",
+            side: "owner",
+            grantId: "g1",
+            connectorAccountId: "a1",
+            calendarId: "primary",
+          },
+          summary: "Work",
+          accessRole: "owner",
+          visibility: "details",
+          status: "disconnected",
+          syncedAt: null,
+          error: {
+            code: "OAUTH_REVOKED",
+            message: "Authorization was revoked.",
+            retryable: true,
+          },
+        },
+      ],
+    }),
+  );
+  const view = render(<SimpleCalendarView />);
+
+  expect(screen.getByRole("alert").textContent).toContain(
+    "Calendar sources are unavailable.",
+  );
+  const health = view.container.querySelector(
+    '[data-testid="calendar-source-health"]',
+  );
+  expect(health).toBeTruthy();
+  expect(health?.textContent).toContain("Calendar sources unavailable");
+  // The designed empty state never renders for an unavailable feed.
+  expect(screen.queryByText("No plans yet")).toBeNull();
+});

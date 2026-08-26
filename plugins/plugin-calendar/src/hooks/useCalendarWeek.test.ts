@@ -714,3 +714,58 @@ describe("useCalendarWeek error classification and cache windows", () => {
     expect(result.current.errorKind).toBe("server");
   });
 });
+
+it("starts a different-window fetch from a clean slate (no cross-month paint)", async () => {
+  let resolveSecond: ((value: LifeOpsCalendarFeed) => void) | undefined;
+  uiClient.getLifeOpsCalendarFeed
+    .mockResolvedValueOnce(
+      feed(
+        [
+          event(
+            "june-event",
+            "2026-06-15T09:00:00.000Z",
+            "2026-06-15T10:00:00.000Z",
+          ),
+        ],
+        "complete",
+      ),
+    )
+    .mockImplementationOnce(
+      () =>
+        new Promise<LifeOpsCalendarFeed>((resolve) => {
+          resolveSecond = resolve;
+        }),
+    );
+
+  const { result } = renderHook(() =>
+    useCalendarWeek({ baseDate: new Date(2026, 5, 10, 12), viewMode: "month" }),
+  );
+  await waitFor(() => expect(result.current.status).toBe("ready"));
+
+  act(() => result.current.goToDate(new Date(2026, 8, 10, 12)));
+  // While the September fetch is in flight, June's data must already be
+  // gone: the surface reads as loading, never as a ready September grid
+  // carrying June events.
+  await waitFor(() => expect(result.current.status).toBe("loading"));
+  expect(result.current.events).toEqual([]);
+  expect(result.current.feedState).toBeNull();
+  expect(result.current.sources).toEqual([]);
+
+  // The settled success restores a ready September window.
+  act(() => {
+    resolveSecond?.(
+      feed(
+        [
+          event(
+            "sept-event",
+            "2026-09-15T09:00:00.000Z",
+            "2026-09-15T10:00:00.000Z",
+          ),
+        ],
+        "complete",
+      ),
+    );
+  });
+  await waitFor(() => expect(result.current.status).toBe("ready"));
+  expect(result.current.events.map((item) => item.id)).toEqual(["sept-event"]);
+});
