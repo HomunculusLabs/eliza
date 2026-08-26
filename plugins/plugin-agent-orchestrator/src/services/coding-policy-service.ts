@@ -41,6 +41,15 @@ export interface CodingPolicyRouteHealth {
      * provider's pool has ANY account. The bridge exposes pool counts, not
      * ids — the specific pin is verified at spawn time (fails closed). */
     poolHasAccounts?: boolean;
+    /** Pin-resolution status for an accountId-bearing route. Aggregate pool
+     * counts say nothing about the PINNED account (review r3, finding 5):
+     * `ghost` — enumerated ids prove the pin does not exist (not ok);
+     * `verified` — enumerated ids contain the pin (existence proven; health
+     *   remains a spawn-time concern, selection fails closed);
+     * `unverifiable` — the bridge cannot enumerate; existence is decided at
+     *   spawn time (fails closed), and the route must not be presented as
+     *   confirmed-healthy off sibling-account counts. */
+    pinStatus?: "ghost" | "verified" | "unverifiable";
   };
   ok: boolean;
   problems: string[];
@@ -121,15 +130,21 @@ function authorityIssuesForRoute(
     // pool check below; spawn-time selection stays authoritative either way.
     let enumerable = false;
     if (typeof bridge.accountIds === "function") {
-      enumerable = true;
-      const ids = bridge.accountIds(route.providerId) ?? [];
-      if (!ids.includes(route.accountId)) {
-        issues.push({
-          path: `${path}.accountId`,
-          code: "missing_account",
-          message: `No account "${route.accountId}" exists for provider "${route.providerId}"; connect it through Accounts or pin one of: ${ids.join(", ") || "(none connected)"}.`,
-        });
-        return issues;
+      // `undefined` is the bridge's documented "enumeration unsupported (for
+      // this provider)" signal, not an empty pool: only a defined result
+      // proves enumeration, and only an EMPTY defined result proves the
+      // provider has no accounts (review r3, undefined-degrade finding).
+      const ids = bridge.accountIds(route.providerId);
+      if (ids !== undefined) {
+        enumerable = true;
+        if (!ids.includes(route.accountId)) {
+          issues.push({
+            path: `${path}.accountId`,
+            code: "missing_account",
+            message: `No account "${route.accountId}" exists for provider "${route.providerId}"; connect it through Accounts or pin one of: ${ids.join(", ") || "(none connected)"}.`,
+          });
+          return issues;
+        }
       }
     }
     // Provider-level pool check (the only check a minimal bridge can make).
@@ -266,7 +281,43 @@ export function assessCodingPolicyReadiness(
             enabled: 0,
             healthy: 0,
           };
-      if (account.healthy === 0) {
+      if (route.accountId !== undefined) {
+        // Pin-level honesty (review r3, finding 5): aggregate `healthy` counts
+        // describe the PROVIDER's pool, never the pinned account. Resolve the
+        // pin itself when the bridge can enumerate; a proven ghost is a
+        // blocking problem, an existing pin is verified-but-health-unknown,
+        // and an unenumerable bridge reports the pin as unverifiable — never
+        // as confirmed-usable off a sibling account's health.
+        let ids: string[] | undefined;
+        try {
+          ids =
+            typeof bridge?.accountIds === "function"
+              ? bridge.accountIds(route.providerId)
+              : undefined;
+        } catch {
+          // error-policy:J4 user-facing degrade — enumeration failing reads
+          // as "unverifiable", matching a bridge without the accessor.
+          ids = undefined;
+        }
+        if (ids === undefined) {
+          account.pinStatus = "unverifiable";
+          routeProblems.push(
+            `Pinned account "${route.accountId}" cannot be verified against the live pool; it is checked at spawn time, which fails closed.`,
+          );
+        } else if (!ids.includes(route.accountId)) {
+          account.pinStatus = "ghost";
+          routeProblems.push(
+            `Pinned account "${route.accountId}" does not exist for provider "${route.providerId}"; reconnect it or pin one of: ${ids.join(", ") || "(none connected)"}.`,
+          );
+        } else {
+          account.pinStatus = "verified";
+        }
+        if (account.healthy === 0) {
+          routeProblems.push(
+            `No healthy pooled account for provider "${route.providerId}" (backend "${route.backend}").`,
+          );
+        }
+      } else if (account.healthy === 0) {
         routeProblems.push(
           `No healthy pooled account for provider "${route.providerId}" (backend "${route.backend}").`,
         );
@@ -312,4 +363,42 @@ export function resolveCodingPolicyPrimaryBackend(
   const { policy } = loadCodingPolicy(runtime);
   if (!policy) return null;
   return policy.primary.backend;
+}
+
+/**
+ * Spawn-time consumption of the unified policy (#24099, review r3 finding 3):
+ * the whole-document-validated policy steers the spawn's approval preset,
+ * model, and account selection — not just the routing backend pin. Returns
+ * null when no whole-valid policy exists (legacy defaults remain in force).
+ *
+ * `candidateRoutes` returns the policy routes whose backend matches the
+ * spawn's agentType, in policy order (primary first, then fallbacks): the
+ * spawn walks them exactly like readiness does, pinning to each route's
+ * accountId when set and letting ordered fallback carry to the next route
+ * when a pin is not selectable. Callers keep their own strategy/env patch
+ * merge; this function is pure policy resolution, no bridge side effects.
+ */
+export interface CodingPolicySpawnPin {
+  /** Policy routes matching the spawn backend, in policy order. */
+  routes: CodingPolicyRoute[];
+  /** Approval preset from the validated policy document. */
+  approvalPreset: string;
+  /** Model from the first route that carries one, in policy order. */
+  model: string | undefined;
+}
+
+export function resolveCodingPolicySpawnPin(
+  runtime: IAgentRuntime,
+  backend: string,
+): CodingPolicySpawnPin | null {
+  const { policy } = loadCodingPolicy(runtime);
+  if (!policy) return null;
+  const routes = [policy.primary, ...policy.fallbacks].filter(
+    (route) => route.backend === backend,
+  );
+  return {
+    routes,
+    approvalPreset: policy.approvalPreset,
+    model: routes.find((route) => route.model !== undefined)?.model,
+  };
 }
