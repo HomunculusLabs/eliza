@@ -8,10 +8,13 @@
  * one backend, which the row-level conditional UPDATE serializes).
  */
 import type { UUID } from "@elizaos/core";
+import { v4 } from "uuid";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { PgDatabaseAdapter } from "../../pg/adapter";
 import type { PgliteDatabaseAdapter } from "../../pglite/adapter";
-import { cacheTable } from "../../schema";
+import { PgliteDatabaseAdapter as PgliteAdapterCtor } from "../../pglite/adapter";
+import type { PGliteClientManager } from "../../pglite/manager";
+import { agentTable, cacheTable } from "../../schema";
 import type { DrizzleDatabase } from "../../types";
 import { createIsolatedTestDatabase } from "../test-helpers";
 
@@ -19,12 +22,16 @@ describe("Cache compare-and-set (real PGlite)", () => {
   let adapter: PgliteDatabaseAdapter | PgDatabaseAdapter;
   let cleanup: () => Promise<void>;
   let testAgentId: UUID;
+  let sharedManager: PGliteClientManager | undefined;
 
   beforeAll(async () => {
-    const setup = await createIsolatedTestDatabase("cache-cas-tests");
+    const setup = await createIsolatedTestDatabase("cache-cas-tests", [], {
+      exposeManager: true,
+    });
     adapter = setup.adapter;
     cleanup = setup.cleanup;
     testAgentId = setup.testAgentId;
+    sharedManager = setup.manager;
   });
 
   afterAll(async () => {
@@ -80,12 +87,89 @@ describe("Cache compare-and-set (real PGlite)", () => {
     expect(after[0]?.createdAt).toEqual(before[0]?.createdAt);
   });
 
-  it("resolves false for a conflicting same-agent key but true cross-agent (composite PK scoping)", async () => {
-    await adapter.setCache("shared-key", "agent-a-value");
-    // Same agentId + different value ⇒ conflict.
-    await expect(adapter.compareAndSetCache("shared-key", "other", "x")).resolves.toBe(false);
-    expect(testAgentId).toBeDefined();
-  });
+  it.skipIf(Boolean(process.env.POSTGRES_URL))(
+    "isolates agents on the replace branch: a CAS naming another agent's value cannot touch that row (composite PK scoping)",
+    async () => {
+      // Skipped under POSTGRES_URL: the pg PostgresConnectionManager pools
+      // per-URL, and a second adapter against the same live server would need
+      // the same schema/search-path dance the helper performs, mutating shared
+      // state. This regression is only meaningful on the shared-connection
+      // PGlite path, where two adapters legitimately front one database
+      // process (the tenant model in issue #28875).
+      if (!sharedManager) {
+        throw new Error("exposeManager option did not yield a manager on the PGlite path");
+      }
+      const otherAgentId = v4() as UUID;
+      // Create the second agent row first: cache.agent_id FK-references
+      // agents.id, so agent B must exist before it can own cache rows.
+      await (adapter.getDatabase() as DrizzleDatabase).insert(agentTable).values({
+        id: otherAgentId,
+        name: "cross-agent-cas-b",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      const adapterB = new PgliteAdapterCtor(otherAgentId, sharedManager);
+      try {
+        // Seed the same key independently for both agents.
+        await adapter.setCache("shared-key", "agent-a-value");
+        await adapterB.setCache("shared-key", "agent-b-value");
+
+        // Agent A CASes naming agent B's stored value as `expected` — the value
+        // matches a row in the table, but that row belongs to another agent.
+        // Under the tenant contract it must resolve false and change nothing.
+        await expect(
+          adapter.compareAndSetCache("shared-key", "agent-b-value", "hijacked")
+        ).resolves.toBe(false);
+        // Agent B's row is untouched; agent A's row is untouched too.
+        await expect(adapterB.getCache("shared-key")).resolves.toBe("agent-b-value");
+        await expect(adapter.getCache("shared-key")).resolves.toBe("agent-a-value");
+
+        // A legitimate same-agent replace still succeeds after the refusal.
+        await expect(
+          adapter.compareAndSetCache("shared-key", "agent-a-value", "agent-a-next")
+        ).resolves.toBe(true);
+        await expect(adapterB.getCache("shared-key")).resolves.toBe("agent-b-value");
+      } finally {
+        // adapterB shares the manager's connection and lifecycle; closing it
+        // would close the shared PGlite instance for every later test. The
+        // suite's afterAll cleanup owns manager teardown — here only the rows
+        // this test created need to go.
+        await (adapter.getDatabase() as DrizzleDatabase).delete(cacheTable);
+      }
+    }
+  );
+
+  it.skipIf(Boolean(process.env.POSTGRES_URL))(
+    "isolates agents on the insert branch: a present other-agent row does not block this agent's insert-only CAS",
+    async () => {
+      // Skipped under POSTGRES_URL for the same shared-state reason as the
+      // replace-branch twin above.
+      if (!sharedManager) {
+        throw new Error("exposeManager option did not yield a manager on the PGlite path");
+      }
+      const otherAgentId = v4() as UUID;
+      await (adapter.getDatabase() as DrizzleDatabase).insert(agentTable).values({
+        id: otherAgentId,
+        name: "cross-agent-cas-insert-b",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      const adapterB = new PgliteAdapterCtor(otherAgentId, sharedManager);
+      try {
+        await adapter.setCache("tenant-key", { owner: "a" });
+        // The composite PK is (key, agentId): agent B's insert-only CAS on the
+        // same key must succeed — agent A's row is not a conflict for B.
+        await expect(
+          adapterB.compareAndSetCache("tenant-key", undefined, { owner: "b" })
+        ).resolves.toBe(true);
+        await expect(adapterB.getCache("tenant-key")).resolves.toEqual({ owner: "b" });
+        await expect(adapter.getCache("tenant-key")).resolves.toEqual({ owner: "a" });
+      } finally {
+        // Shared manager: no adapter-level close here (see note above).
+        await (adapter.getDatabase() as DrizzleDatabase).delete(cacheTable);
+      }
+    }
+  );
 
   it("exactly one of N racing insert-only CASes wins", async () => {
     const results = await Promise.all(
