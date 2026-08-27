@@ -9,10 +9,12 @@
 import { describe, expect, it } from "vitest";
 import {
 	assertCasValue,
+	CACHE_CAS_FAILED_CODE,
 	CACHE_CAS_INVALID_VALUE_CODE,
 	isRepresentableCacheValue,
 	jsonValueEquals,
 } from "./cas-values";
+import { ElizaError } from "../errors";
 import { InMemoryDatabaseAdapter } from "./inMemoryAdapter";
 
 function makeAdapter(): InMemoryDatabaseAdapter {
@@ -182,5 +184,56 @@ describe("InMemoryDatabaseAdapter.compareAndSetCache", () => {
 		);
 		expect(results.filter((r) => r)).toHaveLength(1);
 		await expect((await adapter.getCaches(["k"])).get("k")).toBe(1);
+	});
+});
+
+describe("compareAndSetCache storage failure", () => {
+	it("throws the typed CAS error (not false) when a stored row is undecodable", async () => {
+		const adapter = makeAdapter();
+		// Plant a corrupt row directly in the private cache map; JSON.parse inside
+		// compareAndSetCache must surface as a typed storage failure, never as a
+		// conflict `false` — `false` is reserved exclusively for conflicts.
+		(adapter as unknown as { cache: Map<string, string> }).cache.set(
+			"corrupt",
+			"{not-json",
+		);
+		const promise = adapter.compareAndSetCache("corrupt", "any", "next");
+		await expect(promise).rejects.toMatchObject({
+			name: "ElizaError",
+			code: CACHE_CAS_FAILED_CODE,
+		});
+		await expect(promise).rejects.toBeInstanceOf(ElizaError);
+		// Cause must be preserved so the caller can distinguish a storage fault
+		// from a contract-misuse invalid value.
+		await expect(promise).rejects.toMatchObject({
+			cause: { name: "SyntaxError" },
+		});
+		// The corrupt row is NOT overwritten by the failed attempt.
+		expect(
+			(adapter as unknown as { cache: Map<string, string> }).cache.get(
+				"corrupt",
+			),
+		).toBe("{not-json");
+	});
+
+	it("a healthy key still CASes after an earlier storage failure (no poison)", async () => {
+		const adapter = makeAdapter();
+		(adapter as unknown as { cache: Map<string, string> }).cache.set(
+			"corrupt",
+			"{not-json",
+		);
+		await expect(
+			adapter.compareAndSetCache("corrupt", "any", "next"),
+		).rejects.toMatchObject({
+			code: CACHE_CAS_FAILED_CODE,
+		});
+		await expect(
+			adapter.compareAndSetCache("fresh", undefined, { v: 1 }),
+		).resolves.toBe(true);
+		await expect(
+			(await adapter.getCaches<{ v: number }>(["fresh"])).get("fresh"),
+		).toEqual({
+			v: 1,
+		});
 	});
 });

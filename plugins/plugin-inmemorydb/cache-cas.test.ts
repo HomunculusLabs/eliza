@@ -7,6 +7,7 @@
  * adapter + real MemoryStorage — no mocks of the system under test.
  */
 
+import { CACHE_CAS_FAILED_CODE, ElizaError } from "@elizaos/core";
 import type { UUID } from "@elizaos/core";
 import { describe, expect, it } from "vitest";
 import { InMemoryDatabaseAdapter } from "./adapter";
@@ -78,5 +79,45 @@ describe("plugin-inmemorydb compareAndSetCache", () => {
     await adapter.compareAndSetCache("k", "v0", "v1");
     await expect(adapter.compareAndSetCache("k", "v1", "v2")).resolves.toBe(true);
     await expect((await adapter.getCaches(["k"])).get("k")).toBe("v2");
+  });
+});
+
+describe("plugin-inmemorydb compareAndSetCache storage failure", () => {
+  it("throws the typed CAS error (not false) when the storage read fails", async () => {
+    const adapter = await makeAdapter();
+    // Break the storage read: a failed get is a storage fault and must surface
+    // as the typed error, never as a conflict `false`.
+    const internal = adapter as unknown as { storage: MemoryStorage };
+    const originalGet = internal.storage.get.bind(internal.storage);
+    internal.storage.get = (async () => {
+      throw new Error("disk read failed");
+    }) as typeof internal.storage.get;
+    try {
+      const promise = adapter.compareAndSetCache("k", undefined, "v");
+      await expect(promise).rejects.toBeInstanceOf(ElizaError);
+      await expect(promise).rejects.toMatchObject({
+        code: CACHE_CAS_FAILED_CODE,
+        cause: { message: "disk read failed" },
+      });
+    } finally {
+      internal.storage.get = originalGet;
+    }
+  });
+
+  it("a healthy key still CASes after a storage failure (tail not poisoned)", async () => {
+    const adapter = await makeAdapter();
+    const internal = adapter as unknown as { storage: MemoryStorage };
+    const originalGet = internal.storage.get.bind(internal.storage);
+    internal.storage.get = (async () => {
+      throw new Error("disk read failed");
+    }) as typeof internal.storage.get;
+    await expect(adapter.compareAndSetCache("k", undefined, "v")).rejects.toMatchObject({
+      code: CACHE_CAS_FAILED_CODE,
+    });
+    internal.storage.get = originalGet;
+    await expect(adapter.compareAndSetCache("fresh", undefined, { v: 1 })).resolves.toBe(true);
+    await expect((await adapter.getCaches<{ v: number }>(["fresh"])).get("fresh")).toEqual({
+      v: 1,
+    });
   });
 });

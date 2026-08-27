@@ -7,6 +7,7 @@
  * cure this primitive exists for — simulated here by concurrent statements on
  * one backend, which the row-level conditional UPDATE serializes).
  */
+import { CACHE_CAS_FAILED_CODE, ElizaError } from "@elizaos/core";
 import type { UUID } from "@elizaos/core";
 import { v4 } from "uuid";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -162,8 +163,12 @@ describe("Cache compare-and-set (real PGlite)", () => {
         await expect(
           adapterB.compareAndSetCache("tenant-key", undefined, { owner: "b" })
         ).resolves.toBe(true);
-        await expect(adapterB.getCache("tenant-key")).resolves.toEqual({ owner: "b" });
-        await expect(adapter.getCache("tenant-key")).resolves.toEqual({ owner: "a" });
+        await expect(adapterB.getCache("tenant-key")).resolves.toEqual({
+          owner: "b",
+        });
+        await expect(adapter.getCache("tenant-key")).resolves.toEqual({
+          owner: "a",
+        });
       } finally {
         // Shared manager: no adapter-level close here (see note above).
         await (adapter.getDatabase() as DrizzleDatabase).delete(cacheTable);
@@ -196,5 +201,62 @@ describe("Cache compare-and-set (real PGlite)", () => {
     // stale expected now conflicts
     await expect(adapter.compareAndSetCache("chain", "v0", "v3")).resolves.toBe(false);
     await expect(adapter.getCache("chain")).resolves.toBe("v2");
+  });
+
+  describe("storage failure surfacing (real PGlite)", () => {
+    it("throws the typed CAS error (not false) when the statement fails", async () => {
+      // Break the drizzle handle: a failed statement is a storage failure and
+      // must surface as the typed error, never as a conflict `false`. This is
+      // the path the M5 fail-open mutant opens (catch -> return false).
+      const internal = adapter as unknown as { db: DrizzleDatabase };
+      const originalDb = internal.db;
+      const boom: DrizzleDatabase = new Proxy(originalDb, {
+        get(target, prop, receiver) {
+          if (prop === "insert" || prop === "update") {
+            return () => {
+              throw new Error("statement failed");
+            };
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      });
+      internal.db = boom;
+      try {
+        const insertPromise = adapter.compareAndSetCache("failing", undefined, {
+          v: 1,
+        });
+        await expect(insertPromise).rejects.toBeInstanceOf(ElizaError);
+        await expect(insertPromise).rejects.toMatchObject({
+          code: CACHE_CAS_FAILED_CODE,
+          context: { table: "cache", key: "failing" },
+        });
+      } finally {
+        internal.db = originalDb;
+      }
+    });
+
+    it("a healthy CAS still works after a statement failure (no poison)", async () => {
+      const internal = adapter as unknown as { db: DrizzleDatabase };
+      const originalDb = internal.db;
+      const proxyDb: DrizzleDatabase = new Proxy(originalDb, {
+        get(target, prop, receiver) {
+          if (prop === "insert" || prop === "update") {
+            return () => {
+              throw new Error("statement failed");
+            };
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      });
+      internal.db = proxyDb;
+      await expect(
+        adapter.compareAndSetCache("failing", undefined, { v: 1 })
+      ).rejects.toMatchObject({
+        code: CACHE_CAS_FAILED_CODE,
+      });
+      internal.db = originalDb;
+      await expect(adapter.compareAndSetCache("healthy", undefined, { v: 2 })).resolves.toBe(true);
+      await expect(adapter.getCache("healthy")).resolves.toEqual({ v: 2 });
+    });
   });
 });
