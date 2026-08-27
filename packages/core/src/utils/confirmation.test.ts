@@ -103,7 +103,11 @@ describe("confirmation utilities", () => {
 
 			expect(decision.status).toBe("confirmed");
 			expect(decision.metadata).toEqual({ itemId: 1 });
-			expect(runtime.cacheStore.size).toBe(0);
+			// Consume leaves a short-TTL consumed tombstone (not an empty
+			// key) so racing siblings cannot re-stash a fresh prompt.
+			expect(runtime.cacheStore.size).toBe(1);
+			const [onlyValue] = runtime.cacheStore.values();
+			expect((onlyValue as { consumed?: boolean }).consumed).toBe(true);
 		}
 	});
 
@@ -138,7 +142,10 @@ describe("confirmation utilities", () => {
 
 		expect(decision.status).toBe("cancelled");
 		expect(decision.metadata).toEqual({ itemId: 1 });
-		expect(runtime.cacheStore.size).toBe(0);
+		// Cancel consumes the pending record too — tombstone remains.
+		expect(runtime.cacheStore.size).toBe(1);
+		const [cancelledValue] = runtime.cacheStore.values();
+		expect((cancelledValue as { consumed?: boolean }).consumed).toBe(true);
 	});
 
 	it("treats expired pending confirmation as fresh call", async () => {
