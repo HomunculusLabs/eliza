@@ -1,11 +1,10 @@
-/** Verifies the trajectory cache stats definition-list content model required by the story gate. */
-// @vitest-environment jsdom
-
 /**
- * Pins the valid dl shape (axe `definition-list`, story-gate failures for
- * Default + SingleMetric): every div group inside <dl> contains only dt/dd
- * children, with meta rendered as a second <dd> for its <dt>.
+ * Verifies the trajectory cache stats definition-list content model required
+ * by the story gate: every div group inside <dl> contains only dt/dd
+ * children, with meta rendered as a second <dd> for its <dt>
+ * (axe `definition-list`, Default + SingleMetric failures).
  */
+// @vitest-environment jsdom
 
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";

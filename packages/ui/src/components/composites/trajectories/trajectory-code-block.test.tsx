@@ -1,10 +1,9 @@
-/** Verifies the trajectory code block a11y attribute contract for empty and non-empty payloads. */
-// @vitest-environment jsdom
-
 /**
- * Pins the focus + label contract (axe `aria-prohibited-attr`, Empty story):
- * the affordances attach ONLY when the <pre> has content to read.
+ * Verifies the trajectory code block a11y attribute contract for empty and
+ * non-empty payloads: the focus + label affordances attach ONLY when the
+ * <pre> has content to read (axe `aria-prohibited-attr`, Empty story).
  */
+// @vitest-environment jsdom
 
 import { cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
