@@ -2,11 +2,9 @@
 // @vitest-environment jsdom
 
 /**
- * The metric meta line used to render as a <div> SIBLING of <dt>/<dd> inside
- * the dl group wrapper, violating the HTML definition-list content model
- * (axe `definition-list`, story-gate failures for Default + SingleMetric).
- * This pins the valid shape: every div group inside <dl> contains only
- * dt/dd children, with meta rendered as a second <dd> for its <dt>.
+ * Pins the valid dl shape (axe `definition-list`, story-gate failures for
+ * Default + SingleMetric): every div group inside <dl> contains only dt/dd
+ * children, with meta rendered as a second <dd> for its <dt>.
  */
 
 import { cleanup, render, screen } from "@testing-library/react";

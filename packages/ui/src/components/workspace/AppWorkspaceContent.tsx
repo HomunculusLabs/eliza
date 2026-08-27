@@ -108,7 +108,7 @@ export function AppWorkspaceContent({
           // biome-ignore lint/a11y/noNoninteractiveTabindex: scrollable regions require a keyboard entry point
           tabIndex={0}
           className={cn(
-            "eliza-chat-scroll min-h-0 min-w-0 w-full flex-1 overflow-y-auto outline-none",
+            "eliza-chat-scroll min-h-0 min-w-0 w-full flex-1 overflow-y-auto keyboard-focus-surface",
             clearanceClass,
             className,
           )}
@@ -122,7 +122,7 @@ export function AppWorkspaceContent({
         // biome-ignore lint/a11y/noNoninteractiveTabindex: scrollable regions require a keyboard entry point
         tabIndex={0}
         className={cn(
-          "eliza-chat-scroll min-h-0 min-w-0 w-full flex-1 overflow-y-auto outline-none",
+          "eliza-chat-scroll min-h-0 min-w-0 w-full flex-1 overflow-y-auto keyboard-focus-surface",
           clearanceClass,
           className,
         )}

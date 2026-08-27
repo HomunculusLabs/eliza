@@ -2,11 +2,8 @@
 // @vitest-environment jsdom
 
 /**
- * `aria-label` is prohibited on a roleless <pre> (axe
- * `aria-prohibited-attr`) once the element has no text content — only the
- * Empty story tripped, because non-empty code text makes the attribute
- * pass. This pins the contract: the focus + label affordances attach ONLY
- * when there is content to read.
+ * Pins the focus + label contract (axe `aria-prohibited-attr`, Empty story):
+ * the affordances attach ONLY when the <pre> has content to read.
  */
 
 import { cleanup, render } from "@testing-library/react";

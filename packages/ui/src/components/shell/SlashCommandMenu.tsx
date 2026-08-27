@@ -247,14 +247,12 @@ export function SlashCommandMenu({
           border="standard"
           radius="xlarge"
           visualStyle={{
-            borderColor:
-              "rgb(255 255 255 / 14%)",
+            borderColor: "rgb(255 255 255 / 14%)",
           }}
           className={cn(
             "absolute bottom-full left-0 right-0 z-10 mb-2 px-4 py-3 text-xs",
-            // tone="inverse" resolved to black text on the near-black
-            // wallpaper overlay and rendered the row invisible (story-gate
-            // blank-render). Wallpaper chrome uses the fixed white ladder.
+            // Wallpaper chrome renders tone="inverse" near-invisible; loading
+            // uses the fixed white ladder (story-gate blank-render).
             WALLPAPER_TEXT.primary,
             WALLPAPER_FLOAT_SHADOW,
           )}
@@ -300,8 +298,7 @@ export function SlashCommandMenu({
       radius="xlarge"
       data-testid="slash-command-menu"
       visualStyle={{
-        borderColor:
-          "rgb(255 255 255 / 14%)",
+        borderColor: "rgb(255 255 255 / 14%)",
       }}
       className={cn(
         "absolute bottom-full left-0 right-0 z-10 mb-2 max-h-[min(46vh,22rem)] overflow-y-auto py-1.5",

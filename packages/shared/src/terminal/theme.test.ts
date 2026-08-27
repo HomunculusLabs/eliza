@@ -6,11 +6,11 @@
  * scope (no bare `process` read).
  */
 
-import { build } from "esbuild";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import vm from "node:vm";
+import { build } from "esbuild";
 import { describe, expect, it } from "vitest";
 import { colorize } from "./theme.js";
 

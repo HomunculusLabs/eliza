@@ -89,6 +89,11 @@ describe("AppWorkspaceContent", () => {
       );
       expect(scroller).not.toBeNull();
       expect(scroller?.getAttribute("tabindex")).toBe("0");
+      // The product bans focus rings globally (styles.css strips outlines on
+      // :focus); keyboard position stays visible through the canonical filled
+      // accent :focus-visible surface instead of the outline we removed.
+      expect(scroller?.className).toContain("keyboard-focus-surface");
+      expect(scroller?.className).not.toContain("outline-none");
     }
   });
 });
