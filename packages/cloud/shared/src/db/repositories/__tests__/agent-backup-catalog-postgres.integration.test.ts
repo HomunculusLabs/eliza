@@ -14,6 +14,7 @@ import {
   acquireEphemeralPostgres,
   type EphemeralPostgres,
 } from "../../../lib/services/tenant-db/__tests__/ephemeral-postgres";
+import { installAgentNodeOccurrenceTriggerForTests } from "../../agent-node-occurrence-test-support";
 import { sqlRows } from "../../execute-helpers";
 import {
   agentBackupNodeAdmissionCursors,
@@ -50,7 +51,6 @@ interface TenantFixture {
   readonly organizationId: string;
   readonly userId: string;
   readonly agentId: string;
-  readonly nodeHistoryId?: string;
   readonly nodeRecordId: string;
   readonly nodeId: string;
   readonly nodeIncarnation: string;
@@ -61,7 +61,6 @@ const TENANT_A = {
   organizationId: "10000000-0000-4000-8000-000000000201",
   userId: "20000000-0000-4000-8000-000000000201",
   agentId: "30000000-0000-4000-8000-000000000201",
-  nodeHistoryId: "41000000-0000-4000-8000-000000000201",
   nodeRecordId: "40000000-0000-4000-8000-000000000201",
   nodeIncarnation: "50000000-0000-4000-8000-000000000201",
   nodeId: "backup-catalogue-tenant-a-node",
@@ -80,7 +79,6 @@ const TENANT_B = {
   organizationId: "10000000-0000-4000-8000-000000000202",
   userId: "20000000-0000-4000-8000-000000000202",
   agentId: "30000000-0000-4000-8000-000000000202",
-  nodeHistoryId: "41000000-0000-4000-8000-000000000202",
   nodeRecordId: "40000000-0000-4000-8000-000000000202",
   nodeIncarnation: "50000000-0000-4000-8000-000000000202",
   nodeId: "backup-catalogue-tenant-b-node",
@@ -375,34 +373,6 @@ async function expectDatabaseCause(
   }
 }
 
-async function seedSourceAuthority(tenant: TenantFixture): Promise<void> {
-  if (!dbWrite) throw new Error("Real PostgreSQL harness was not initialized");
-  if (!tenant.nodeHistoryId) throw new Error("Source authority fixture requires a history ID");
-  const hostKeyFingerprint = `sha256:${tenant.nodeId}`;
-  await dbWrite.insert(agentNodeIncarnationHistories).values({
-    id: tenant.nodeHistoryId,
-    docker_node_record_id: tenant.nodeRecordId,
-    node_id: tenant.nodeId,
-    node_incarnation: tenant.nodeIncarnation,
-    fleet_kind: "robot",
-    infrastructure_provider: "hetzner",
-    provider_server_id: null,
-    host_key_fingerprint: hostKeyFingerprint,
-  });
-  await dbWrite.insert(dockerNodes).values({
-    id: tenant.nodeRecordId,
-    node_id: tenant.nodeId,
-    hostname: tenant.nodeId,
-    status: "healthy",
-    host_key_fingerprint: hostKeyFingerprint,
-    fleet_kind: "robot",
-    infrastructure_provider: "hetzner",
-    provider_server_id: null,
-    node_incarnation: tenant.nodeIncarnation,
-    current_node_history_id: tenant.nodeHistoryId,
-  });
-}
-
 async function seedTenant(tenant: TenantFixture, suffix: string): Promise<void> {
   if (!dbWrite) throw new Error("Real PostgreSQL harness was not initialized");
   await dbWrite
@@ -575,8 +545,9 @@ realPostgres("canonical backup catalogue contention", () => {
       dbWrite as never,
     );
     await apply();
-    await seedSourceAuthority(TENANT_A);
-    await seedSourceAuthority(TENANT_B);
+    await installAgentNodeOccurrenceTriggerForTests((statement) =>
+      dbWrite.execute(sql.raw(statement)),
+    );
     await applyBackupAdmissionMigrations();
     await installBackupMutationGuardForTests();
   }, 60_000);
@@ -674,8 +645,9 @@ realPostgres("canonical backup catalogue contention", () => {
       })
       .from(agentSandboxBackups)
       .where(eq(agentSandboxBackups.id, backupId));
+    const tenantAHistoryId = await requireCurrentNodeHistoryId(TENANT_A);
     expect(bound).toEqual({
-      sourceNodeHistoryId: TENANT_A.nodeHistoryId,
+      sourceNodeHistoryId: tenantAHistoryId,
       sourceNodeId: TENANT_A.nodeId,
     });
 
@@ -703,7 +675,7 @@ realPostgres("canonical backup catalogue contention", () => {
           state_data_storage: "inline",
           size_bytes: 0,
           backup_kind: "full",
-          source_node_history_id: TENANT_B.nodeHistoryId,
+          source_node_history_id: await requireCurrentNodeHistoryId(TENANT_B),
           source_node_record_id: TENANT_A.nodeRecordId,
           source_node_incarnation: TENANT_A.nodeIncarnation,
         })
