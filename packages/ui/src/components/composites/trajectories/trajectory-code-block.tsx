@@ -67,12 +67,21 @@ export function TrajectoryCodeBlock({
           </PagePanel.ActionRail>
         }
       />
+      {/* aria-label is prohibited on a roleless <pre> (axe
+         aria-prohibited-attr) once the element has no text content, so the
+         focus/copy affordances are only attached when there is content to
+         read. */}
       <CodeBlock
         value={displayContent}
         presentation="attachment"
         wrap
-        tabIndex={0}
-        aria-label={typeof label === "string" ? label : "Trajectory content"}
+        {...(content.length > 0
+          ? {
+              tabIndex: 0,
+              "aria-label":
+                typeof label === "string" ? label : "Trajectory content",
+            }
+          : {})}
         className="max-h-112 break-words p-4"
       />
     </PagePanel>

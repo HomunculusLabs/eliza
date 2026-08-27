@@ -66,7 +66,13 @@ function TruncatingConversationTitle({
       className={
         variant === "game-modal"
           ? `block w-full min-w-0 max-w-full truncate text-left text-sm font-medium leading-tight transition-colors ${
-              isActive ? "text-bg" : "text-white/90 group-hover:text-white"
+              // The active row was rewritten from an accent fill to an
+              // insetCompact surface (bg-surface) in the molecule-boundary
+              // refactor; the old `text-bg` (black on accent) survived and now
+              // renders ~1:1 on the near-black surface. Game-modal chrome sits
+              // on dark glass, so it uses the fixed white ladder like every
+              // other wallpaper-surface row (story-gate color-contrast).
+              isActive ? "text-white" : "text-white/90 group-hover:text-white"
             }`
           : `block min-w-0 max-w-full flex-1 truncate text-left text-sm font-normal leading-snug transition-colors ${
               isActive

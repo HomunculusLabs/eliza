@@ -54,6 +54,17 @@ describe("ChatConversationItem", () => {
     );
   });
 
+  it("keeps the ACTIVE game-modal title in the white ladder (no black-on-dark text-bg)", () => {
+    // The active game-modal row renders on a dark insetCompact surface; the
+    // pre-refactor `text-bg` (black) gave ~1:1 contrast (story-gate
+    // color-contrast on the GameModal stories). Active must stay white and
+    // keep emphasis over the inactive white/90.
+    renderItem({ variant: "game-modal", isActive: true });
+    const activeTitle = screen.getByText("Planning the launch");
+    expect(activeTitle.className).toContain("text-white");
+    expect(activeTitle.className).not.toContain("text-bg");
+  });
+
   it("fires onSelect when the row is clicked", () => {
     const { onSelect } = renderItem();
     fireEvent.click(screen.getByTestId("conv-select"));

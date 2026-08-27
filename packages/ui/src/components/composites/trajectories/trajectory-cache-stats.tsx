@@ -48,10 +48,15 @@ export function TrajectoryCacheStats({
               <dd className="mt-1 text-sm font-semibold text-[color:var(--settings-foreground)]">
                 {metric.value}
               </dd>
+              {/* A div sibling of dt/dd inside a dl group violates the
+                 definition-list content model (axe definition-list). Meta is
+                 additional description data, so it renders as a second dd —
+                 multiple dd per dt is valid and keeps the normal font weight
+                 the old sibling div had. */}
               {metric.meta ? (
-                <div className="mt-1 text-xs text-[color:var(--settings-muted)]">
+                <dd className="mt-1 text-xs text-[color:var(--settings-muted)]">
                   {metric.meta}
-                </div>
+                </dd>
               ) : null}
             </PagePanel.SummaryCard>
           ))}

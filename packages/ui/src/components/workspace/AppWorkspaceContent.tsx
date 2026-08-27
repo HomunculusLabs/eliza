@@ -100,10 +100,15 @@ export function AppWorkspaceContent({
     header ? (
       <div className="flex min-h-0 min-w-0 w-full flex-1 flex-col overflow-hidden">
         {header}
+        {/* Router-owned scrollers must be keyboard-focusable so keyboard users
+           can scroll them (axe scrollable-region-focusable); they carry no
+           focusable children of their own. */}
         <div
           data-shell-scroll-region="true"
+          // biome-ignore lint/a11y/noNoninteractiveTabindex: scrollable regions require a keyboard entry point
+          tabIndex={0}
           className={cn(
-            "eliza-chat-scroll min-h-0 min-w-0 w-full flex-1 overflow-y-auto",
+            "eliza-chat-scroll min-h-0 min-w-0 w-full flex-1 overflow-y-auto outline-none",
             clearanceClass,
             className,
           )}
@@ -114,8 +119,10 @@ export function AppWorkspaceContent({
     ) : (
       <div
         data-shell-scroll-region="true"
+        // biome-ignore lint/a11y/noNoninteractiveTabindex: scrollable regions require a keyboard entry point
+        tabIndex={0}
         className={cn(
-          "eliza-chat-scroll min-h-0 min-w-0 w-full flex-1 overflow-y-auto",
+          "eliza-chat-scroll min-h-0 min-w-0 w-full flex-1 overflow-y-auto outline-none",
           clearanceClass,
           className,
         )}

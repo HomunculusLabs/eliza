@@ -73,4 +73,22 @@ describe("AppWorkspaceContent", () => {
 
     expect(chatClearanceOwners(container)).toEqual([]);
   });
+
+  it("makes every router-owned scroll region keyboard-focusable", () => {
+    // A scroller with no focusable children is invisible to keyboard
+    // scrolling (axe scrollable-region-focusable, story-gate failure for
+    // RouterOwnedScroll). Both scroll-owning layouts must expose tabIndex.
+    for (const header of [undefined, <div key="h">Header</div>]) {
+      const { container } = render(
+        <AppWorkspaceContent layout="scroll" header={header}>
+          <div>Scrollable body</div>
+        </AppWorkspaceContent>,
+      );
+      const scroller = container.querySelector<HTMLElement>(
+        '[data-shell-scroll-region="true"]',
+      );
+      expect(scroller).not.toBeNull();
+      expect(scroller?.getAttribute("tabindex")).toBe("0");
+    }
+  });
 });
