@@ -213,6 +213,27 @@ Point `OPENAI_BASE_URL` at a Cerebras endpoint or set `ELIZA_PROVIDER=cerebras` 
 
 Set `EVOLINK_API_KEY` to use EvoLink through its OpenAI-compatible endpoint. The plugin defaults to `https://direct.evolink.ai/v1` and `gpt-5.2`; set `EVOLINK_BASE_URL` or `EVOLINK_MODEL` to override either value.
 
+## PZERO compatibility
+
+PZERO is a prepaid inference marketplace with an OpenAI-compatible **text generation** API, reachable through the existing `OPENAI_BASE_URL` seam — no first-party plugin is required. Set your PZERO key as `OPENAI_API_KEY` and point the base URL at the PZERO host:
+
+```bash
+elizaos plugins add @elizaos/plugin-openai
+
+export OPENAI_API_KEY=pzero_YOUR_KEY
+export OPENAI_BASE_URL=https://api.pzero.studio/v1
+export OPENAI_SMALL_MODEL=deepseek-v4-flash
+export OPENAI_LARGE_MODEL=deepseek-v4-flash
+```
+
+Notes:
+
+- `OPENAI_BASE_URL` is the `/v1` root, **not** `/v1/chat/completions` — the plugin appends the path.
+- Text model ids are PZERO catalog ids (for example `deepseek-v4-flash`), not `gpt-*` names. List the live catalog with `GET https://api.pzero.studio/v1/models` (public, no key required).
+- Embeddings inherit this routing: when `OPENAI_EMBEDDING_URL` is unset it falls back to `OPENAI_BASE_URL`, so embedding calls would post to PZERO's `/embeddings` — unverified there. Set `OPENAI_EMBEDDING_URL` (and the embedding key/model) to a host that actually serves embeddings, or avoid `ModelType.TEXT_EMBEDDING` with this endpoint.
+- Image, audio, and research capabilities are likewise unverified against PZERO's endpoints; only text generation is covered by its OpenAI-compatible API.
+- Keys are issued at https://pzero.studio/agents (sign-in free; minimum top-up 1 USDC on Base). Usage is prepaid — credit does not expire into free inference.
+
 ## Prompt caching
 
 Pass `providerOptions.openai.promptCacheKey` and `promptCacheRetention` on any `GenerateTextParams` call to enable OpenAI prompt caching:
