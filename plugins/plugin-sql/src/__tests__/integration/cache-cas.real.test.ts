@@ -7,8 +7,9 @@
  * cure this primitive exists for — simulated here by concurrent statements on
  * one backend, which the row-level conditional UPDATE serializes).
  */
-import { CACHE_CAS_FAILED_CODE, ElizaError } from "@elizaos/core";
+
 import type { UUID } from "@elizaos/core";
+import { CACHE_CAS_FAILED_CODE, ElizaError } from "@elizaos/core";
 import { v4 } from "uuid";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { PgDatabaseAdapter } from "../../pg/adapter";

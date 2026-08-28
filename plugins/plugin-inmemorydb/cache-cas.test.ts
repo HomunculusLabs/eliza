@@ -7,8 +7,8 @@
  * adapter + real MemoryStorage — no mocks of the system under test.
  */
 
-import { CACHE_CAS_FAILED_CODE, ElizaError } from "@elizaos/core";
 import type { UUID } from "@elizaos/core";
+import { CACHE_CAS_FAILED_CODE, ElizaError } from "@elizaos/core";
 import { describe, expect, it } from "vitest";
 import { InMemoryDatabaseAdapter } from "./adapter";
 import { MemoryStorage } from "./storage-memory";
