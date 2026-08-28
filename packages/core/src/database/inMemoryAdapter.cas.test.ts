@@ -7,6 +7,7 @@
  * must match (the SQL adapters' real-atomicity tests live in plugin-sql).
  */
 import { describe, expect, it } from "vitest";
+import { ElizaError } from "../errors";
 import {
 	assertCasValue,
 	CACHE_CAS_FAILED_CODE,
@@ -14,7 +15,6 @@ import {
 	isRepresentableCacheValue,
 	jsonValueEquals,
 } from "./cas-values";
-import { ElizaError } from "../errors";
 import { InMemoryDatabaseAdapter } from "./inMemoryAdapter";
 
 function makeAdapter(): InMemoryDatabaseAdapter {
