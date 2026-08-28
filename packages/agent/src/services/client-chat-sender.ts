@@ -19,6 +19,7 @@ import {
   type TargetInfo,
   type UUID,
 } from "@elizaos/core";
+import { compareConversationsByRecency } from "../api/conversation-sort.ts";
 import type { ConversationMeta, ServerState } from "../api/server-types.ts";
 
 /**
@@ -119,9 +120,16 @@ function resolveConversation(
     if (conv) return conv;
   }
 
-  // 3. Most recently updated conversation
+  // 3. Most recently updated conversation. `updatedAt` strings originate from
+  // persisted rows and untrusted PATCH payloads, so a bare subtraction
+  // comparator can return NaN and leave the sort order implementation-defined
+  // — `[0]` would then be an arbitrary conversation that the agent's message
+  // gets persisted and broadcast into. The total-order comparator keeps
+  // unparseable timestamps deterministic (epoch 0, id tie-break). The sibling
+  // fallback in routeAutonomyTextToUser (server-helpers-swarm.ts) guards the
+  // same hazard with its own inline finite coercion.
   const sorted = Array.from(state.conversations.values()).sort(
-    (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
+    compareConversationsByRecency,
   );
   return sorted[0];
 }

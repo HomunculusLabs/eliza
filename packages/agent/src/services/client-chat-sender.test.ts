@@ -94,6 +94,24 @@ function conv(id: string, roomId: string): ConversationMeta {
   };
 }
 
+/**
+ * Conversation fixture with an explicit updatedAt — the recency fallback keys
+ * off this field. Fixture strings used for the "unparseable" cases must be
+ * verified NaN under `new Date(...)` — V8/JSC accept surprising strings like
+ * "garbage-1" (year 2001), which would silently turn a corrupt-timestamp test
+ * into a valid-data test.
+ */
+function convAt(
+  id: string,
+  roomId: string,
+  updatedAt: string,
+): ConversationMeta {
+  return { ...conv(id, roomId), updatedAt };
+}
+
+/** Verified-unparseable timestamp: new Date("not-a-date").getTime() is NaN. */
+const UNPARSEABLE = "not-a-date";
+
 const REQUIRED_RELAY_SOURCES = [
   "client_chat",
   "agent_message_api",
@@ -304,6 +322,124 @@ describe("swarm synthesis — dashboard transport ownership", () => {
     } finally {
       await adapter.close();
     }
+  });
+});
+
+describe("registerClientChatSendHandler — recency fallback ordering", () => {
+  // These cases exercise resolveConversation's third fallback (most recently
+  // updated conversation): client_chat with a non-matching roomId and no
+  // activeConversationId. The resolved conversation is the delivery target —
+  // its room gets the persisted message and its id is broadcast.
+  function recencyTarget(state: ServerState) {
+    const { runtime, created } = makeRuntime();
+    registerClientChatSendHandler(runtime as unknown as IAgentRuntime, state);
+    return { runtime, created };
+  }
+
+  it("delivers into the most recently updated conversation on valid data", async () => {
+    const conversations = [
+      convAt("c-old", "room-old", "2026-08-20T10:00:00.000Z"),
+      convAt("c-new", "room-new", "2026-08-28T10:00:00.000Z"),
+    ];
+    const { state, broadcastWs } = makeState(conversations);
+    const { runtime, created } = recencyTarget(state);
+
+    await runtime.sendMessageToTarget(
+      { source: "client_chat", roomId: "room-unknown" as UUID },
+      { text: "proactive ping" },
+    );
+
+    expect(created).toHaveLength(1);
+    expect(created[0]?.roomId).toBe("room-new");
+    expect(broadcastWs.mock.calls[0]?.[0]).toMatchObject({
+      conversationId: "c-new",
+    });
+  });
+
+  it("never selects a corrupt-updatedAt conversation when a valid newer one exists", async () => {
+    // Insertion order intentionally places the corrupt conversation where the
+    // old NaN comparator would surface it first; the total-order comparator
+    // must sort it last (epoch 0) regardless.
+    const conversations = [
+      convAt("c-corrupt", "room-corrupt", UNPARSEABLE),
+      convAt("c-valid", "room-valid", "2026-08-28T10:00:00.000Z"),
+    ];
+    const { state, broadcastWs } = makeState(conversations);
+    const { runtime, created } = recencyTarget(state);
+
+    await runtime.sendMessageToTarget(
+      { source: "client_chat", roomId: "room-unknown" as UUID },
+      { text: "proactive ping" },
+    );
+
+    expect(created).toHaveLength(1);
+    expect(created[0]?.roomId).toBe("room-valid");
+    expect(broadcastWs.mock.calls[0]?.[0]).toMatchObject({
+      conversationId: "c-valid",
+    });
+  });
+
+  it("keeps selection deterministic when only corrupt timestamps exist", async () => {
+    const conversations = [
+      convAt("c-b", "room-b", UNPARSEABLE),
+      convAt("c-a", "room-a", "///"),
+      convAt("c-c", "room-c", "not-a-date-either"),
+    ];
+    const { state, broadcastWs } = makeState(conversations);
+    const { runtime, created } = recencyTarget(state);
+
+    await runtime.sendMessageToTarget(
+      { source: "client_chat", roomId: "room-unknown" as UUID },
+      { text: "proactive ping" },
+    );
+
+    // All timestamps coerce to epoch 0; the id tie-break picks the lowest id
+    // deterministically instead of leaving [0] to sort-engine whim.
+    expect(created[0]?.roomId).toBe("room-a");
+    expect(broadcastWs.mock.calls[0]?.[0]).toMatchObject({
+      conversationId: "c-a",
+    });
+  });
+
+  it("tie-breaks equal valid timestamps on id deterministically", async () => {
+    const conversations = [
+      convAt("c-z", "room-z", "2026-08-28T10:00:00.000Z"),
+      convAt("c-y", "room-y", "2026-08-28T10:00:00.000Z"),
+    ];
+    const { state } = makeState(conversations);
+    const { runtime, created } = recencyTarget(state);
+
+    await runtime.sendMessageToTarget(
+      { source: "client_chat", roomId: "room-unknown" as UUID },
+      { text: "proactive ping" },
+    );
+
+    expect(created[0]?.roomId).toBe("room-y");
+  });
+
+  it("does not regress explicit room matching or ambient-fallback gating", async () => {
+    // Sanity: the fix must not touch paths 1/2 of resolveConversation.
+    const conversations = [
+      convAt("c-recent", "room-recent", "2026-08-28T10:00:00.000Z"),
+      convAt("c-active", "room-active", "2026-08-20T10:00:00.000Z"),
+    ];
+    // Path 1 — explicit roomId still wins over recency.
+    const { state } = makeState(conversations);
+    const { runtime, created } = recencyTarget(state);
+    await runtime.sendMessageToTarget(
+      { source: "client_chat", roomId: "room-active" as UUID },
+      { text: "explicit" },
+    );
+    expect(created[0]?.roomId).toBe("room-active");
+
+    // Path 2 — active conversation still wins over recency.
+    const { state: state2 } = makeState(conversations, "c-active");
+    const { runtime: rt2, created: created2 } = recencyTarget(state2);
+    await rt2.sendMessageToTarget(
+      { source: "client_chat", roomId: "room-unknown" as UUID },
+      { text: "active wins" },
+    );
+    expect(created2[0]?.roomId).toBe("room-active");
   });
 });
 
