@@ -89,6 +89,14 @@ function nextId(prefix: string): string {
   return `${prefix}-${Date.now()}-${++_idCounter}`;
 }
 
+/**
+ * Defensive copy of a draft entry, including the payment intent: external
+ * callers must not hold live references into the policy's accounting state.
+ */
+function copyDraft(draft: DraftEntry): DraftEntry {
+  return { ...draft, payment: { ...draft.payment } };
+}
+
 // ─── SpendingPolicy ───────────────────────────────────────────────────────────
 
 export class SpendingPolicy {
@@ -160,32 +168,59 @@ export class SpendingPolicy {
 
   // ─── Draft queue management ─────────────────────────────────────────────────
 
-  /** Approve a queued draft by its draftId. Returns false if not found. */
+  /**
+   * Approve a queued draft by its draftId. Terminal-state safe: returns false
+   * if not found or the draft was already rejected (a rejection cannot be
+   * overridden by a later approval), and true idempotently if already
+   * approved. The first approval revalidates the rolling cap with the draft's
+   * amount and records it into the spend window exactly once: approval is
+   * refused when accrued spend in the window plus the draft amount exceeds
+   * maxAmount, so queued drafts cannot be batch-approved past the cap. When
+   * no rolling cap is configured, approval always succeeds.
+   */
   approveDraft(draftId: string): boolean {
     const draft = this.drafts.get(draftId);
-    if (!draft) return false;
+    if (!draft || draft.rejected) return false;
+    if (draft.approved) return true;
+    if (this.config.rollingCap) {
+      const { maxAmount, windowMs } = this.config.rollingCap;
+      const windowStart = Date.now() - windowMs;
+      this.spendWindow = this.spendWindow.filter((e) => e.ts >= windowStart);
+      const spent = this.spendWindow.reduce((sum, e) => sum + e.amount, 0);
+      if (spent + draft.payment.amount > maxAmount) {
+        return false;
+      }
+      this.spendWindow.push({ amount: draft.payment.amount, ts: Date.now() });
+    }
     draft.approved = true;
     return true;
   }
 
-  /** Reject a queued draft by its draftId. Returns false if not found. */
+  /**
+   * Reject a queued draft by its draftId. Terminal-state safe: returns false
+   * if not found or the draft was already approved (an approval and its
+   * recorded spend stand). A rejected draft records no spend.
+   */
   rejectDraft(draftId: string): boolean {
     const draft = this.drafts.get(draftId);
-    if (!draft) return false;
+    if (!draft || draft.approved) return false;
     draft.rejected = true;
     return true;
   }
 
   /** Return all pending drafts awaiting approval or rejection. */
   getPendingDrafts(): DraftEntry[] {
-    return Array.from(this.drafts.values()).filter(
-      (d) => !d.approved && !d.rejected,
-    );
+    // Copies, not live references: draft flags are the rolling-cap accounting
+    // guard, so external mutation of a returned entry must not reach the
+    // internal state machine.
+    return Array.from(this.drafts.values())
+      .filter((d) => !d.approved && !d.rejected)
+      .map(copyDraft);
   }
 
   /** Return all drafts. */
   getAllDrafts(): DraftEntry[] {
-    return Array.from(this.drafts.values());
+    return Array.from(this.drafts.values()).map(copyDraft);
   }
 
   // ─── Private Logic ──────────────────────────────────────────────────────────
@@ -232,7 +267,10 @@ export class SpendingPolicy {
       const draftId = nextId("draft");
       const draft: DraftEntry = {
         draftId,
-        payment,
+        // Defensive copy: the caller retains the original PaymentIntent
+        // reference; mutating it after drafting must not change the amount
+        // recorded at approval time.
+        payment: { ...payment },
         queuedAt: payment.timestamp ?? new Date().toISOString(),
         approved: false,
         rejected: false,
