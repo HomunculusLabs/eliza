@@ -447,10 +447,13 @@ export function useSlashCommandController(
       ),
     [serverCommands, customCommands, isAuthorized, isElevated],
   );
-  // Natural language belongs to the agent model. Client-side shortcuts are
-  // reserved for explicit slash protocol so host configuration cannot bypass
-  // inference for an ordinary chat message.
-  const naturalShortcutsEnabled = false;
+  // Natural navigation is deterministic and additive (#29670): an exact
+  // authorized view request switches the loaded view immediately while the
+  // original prompt still flows through the normal agent turn, so no
+  // inference is bypassed. All other natural-language client shortcuts stay
+  // reserved for the explicit slash protocol; host configuration cannot
+  // bypass inference for an ordinary chat message.
+  const naturalShortcutsEnabled = true;
 
   const resolveChoices = React.useCallback(
     (source: CommandArgSource, context?: SlashArgChoiceContext): string[] => {

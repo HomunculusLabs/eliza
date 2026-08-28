@@ -10,6 +10,7 @@ import {
   completeCommand,
   filterArgChoices,
   filterCommands,
+  isOptimisticNavigationExec,
   matchCommand,
   parseSlashDraft,
   resolveClientShortcutExecution,
@@ -338,6 +339,121 @@ describe("resolveClientShortcutExecution", () => {
         allowNatural: true,
       }),
     ).toBeNull();
+  });
+
+  it("navigation-only mode resolves navigation but not client-action phrases (#29670)", () => {
+    expect(
+      resolveClientShortcutExecution(
+        commands,
+        "open settings",
+        resolveSection,
+        {
+          allowNatural: true,
+          navigationOnly: true,
+        },
+      ),
+    ).toEqual({ kind: "navigate-settings" });
+
+    // The same phrase family that resolves as a client action in unrestricted
+    // mode must fall through to the agent turn in navigation-only mode.
+    expect(
+      resolveClientShortcutExecution(commands, "clear chat", resolveSection, {
+        allowNatural: true,
+        navigationOnly: true,
+      }),
+    ).toBeNull();
+
+    expect(
+      resolveClientShortcutExecution(
+        commands,
+        "open orchestrator",
+        resolveSection,
+        {
+          allowNatural: true,
+          navigationOnly: true,
+        },
+      ),
+    ).toEqual({
+      kind: "navigate-view",
+      viewId: "orchestrator",
+      viewPath: "/orchestrator",
+    });
+  });
+
+  it("marks every natural navigation resolution optimistic (#29670)", () => {
+    // Every execution the resolver can produce for natural navigation phrases
+    // must qualify, so ChatOverlay's optimistic path is exercised for each.
+    for (const text of [
+      "open settings",
+      "open model settings",
+      "open orchestrator",
+    ]) {
+      const exec = resolveClientShortcutExecution(
+        commands,
+        text,
+        resolveSection,
+        {
+          allowNatural: true,
+          resolveChoices: () => ["calendar"],
+        },
+      );
+      if (!exec) throw new Error(`expected resolution for: ${text}`);
+      expect(isOptimisticNavigationExec(exec), text).toBe(true);
+    }
+    // A resolved natural client action must NOT qualify.
+    const clientExec = resolveClientShortcutExecution(
+      commands,
+      "clear chat",
+      resolveSection,
+      { allowNatural: true },
+    );
+    if (!clientExec) throw new Error("expected resolution for: clear chat");
+    expect(isOptimisticNavigationExec(clientExec)).toBe(false);
+  });
+});
+
+describe("isOptimisticNavigationExec (#29670)", () => {
+  it("classifies navigation executions as optimistic", () => {
+    expect(
+      isOptimisticNavigationExec({ kind: "navigate-tab", tab: "views" }),
+    ).toBe(true);
+    expect(isOptimisticNavigationExec({ kind: "navigate-settings" })).toBe(
+      true,
+    );
+    expect(
+      isOptimisticNavigationExec({
+        kind: "navigate-settings",
+        section: "ai-model",
+      }),
+    ).toBe(true);
+    expect(
+      isOptimisticNavigationExec({ kind: "navigate-view", viewId: "notes" }),
+    ).toBe(true);
+    expect(
+      isOptimisticNavigationExec({
+        kind: "navigate-view",
+        viewId: "orchestrator",
+        viewPath: "/orchestrator",
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps client actions and sends out of optimistic navigation", () => {
+    expect(
+      isOptimisticNavigationExec({
+        kind: "client",
+        clientAction: "clear-chat",
+      }),
+    ).toBe(false);
+    expect(
+      isOptimisticNavigationExec({
+        kind: "client",
+        clientAction: "open-command-palette",
+      }),
+    ).toBe(false);
+    expect(
+      isOptimisticNavigationExec({ kind: "send", text: "/settings" }),
+    ).toBe(false);
   });
 });
 

@@ -53,6 +53,7 @@ import type {
 import { useComposerKeydown, useComposerPaste } from "../../chat/composer-core";
 import { reportComposerActivity } from "../../chat/report-composer-activity";
 import {
+  isOptimisticNavigationExec,
   parseSlashDraft,
   resolveClientShortcutExecution,
   runSlashExecution,
@@ -4492,6 +4493,9 @@ export function ChatOverlay({
             slash.resolveSection,
             {
               allowNatural: slash.naturalShortcutsEnabled,
+              // #29670: optimistic navigation applies to navigation targets
+              // only; natural client-action phrases stay plain agent turns.
+              navigationOnly: true,
               resolveChoices: slash.resolveChoices,
               // #12087 Item 20: re-apply the sender's real authority to the
               // natural-language path so it matches the visible menu.
@@ -4501,6 +4505,27 @@ export function ChatOverlay({
           )
         : null;
     if (shortcut) {
+      // Optimistic navigation (#29670): an exact authorized natural-language
+      // navigation request switches the loaded view immediately, but the
+      // original prompt still flows through the normal agent turn so the
+      // response stays model-authored. Explicit slash picks and client
+      // actions keep the consume-the-turn shortcut semantics above.
+      if (shortcut.kind !== "send" && isOptimisticNavigationExec(shortcut)) {
+        runSlashExecution(shortcut, {
+          navigateTab: slash.navigateTab,
+          navigateSettings: slash.navigateSettings,
+          navigateView: slash.navigateView,
+          clearChat: () => {},
+          newConversation: () => {},
+          toggleFullscreen: () => {},
+          openCommandPalette: () => {},
+          showCommands: () => {},
+          toggleTranscription: () => {},
+          send: (text) => submitText(text),
+        });
+        submitText(draft);
+        return;
+      }
       runExecution(shortcut);
       return;
     }

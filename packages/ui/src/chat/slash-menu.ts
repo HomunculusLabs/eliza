@@ -272,6 +272,12 @@ const SLOT_WORD_PATTERN_LAZY = "[\\p{L}\\p{N}]+(?:\\s+[\\p{L}\\p{N}]+)*?";
 
 export interface ResolveClientShortcutOptions {
   allowNatural?: boolean;
+  /**
+   * Restrict natural-language resolution to navigation targets (#29670).
+   * Client-action phrases ("open command palette") stay reserved for the
+   * explicit slash protocol and fall through to the normal agent turn.
+   */
+  navigationOnly?: boolean;
   isAuthorized?: boolean;
   isElevated?: boolean;
   resolveChoices?: (source: CommandArgSource) => string[];
@@ -460,6 +466,22 @@ function naturalShortcutDefinitions(commands: SlashCommandCatalogItem[]): {
   return { definitions, commandById };
 }
 
+/**
+ * Whether a resolved natural-language shortcut qualifies for optimistic
+ * navigation (#29670): only deterministic view/tab/settings targets switch
+ * the loaded view immediately while the original prompt still flows through
+ * the normal agent turn. Client actions (clear chat, palette, transcription)
+ * keep their consume-the-turn semantics, and explicit slash-menu picks never
+ * take this path.
+ */
+export function isOptimisticNavigationExec(exec: SlashExecution): boolean {
+  return (
+    exec.kind === "navigate-tab" ||
+    exec.kind === "navigate-settings" ||
+    exec.kind === "navigate-view"
+  );
+}
+
 function cleanSlotValue(value: string | undefined): string {
   return normalizeShortcutPhrase(value)
     .replace(/^(?:the|my)\s+/, "")
@@ -514,6 +536,16 @@ export function resolveClientShortcutExecution(
   }
 
   const { definitions, commandById } = naturalShortcutDefinitions(commands);
+  if (options.navigationOnly) {
+    // #29670: navigation-only mode keeps natural client-action phrases out of
+    // the deterministic shortcut path entirely.
+    for (let i = definitions.length - 1; i >= 0; i--) {
+      if (definitions[i].target.kind !== "navigate") {
+        commandById.delete(definitions[i].id);
+        definitions.splice(i, 1);
+      }
+    }
+  }
   const match = matchShortcut(definitions, raw, {
     allowNatural: true,
     // Fail-closed (#12087 Item 20): a caller that omits the sender's authority

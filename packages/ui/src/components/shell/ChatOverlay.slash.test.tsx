@@ -115,6 +115,19 @@ const COMMANDS: SlashCommandCatalogItem[] = [
     target: { kind: "agent" },
     source: "builtin",
   },
+  {
+    key: "views",
+    nativeName: "views",
+    description: "Open views",
+    textAliases: ["/views"],
+    scope: "both",
+    acceptsArgs: true,
+    args: [{ name: "view", description: "view", dynamicChoices: "views" }],
+    requiresAuth: false,
+    requiresElevated: false,
+    target: { kind: "navigate", tab: "views", path: "/views" },
+    source: "builtin",
+  },
 ];
 
 function makeSlash(
@@ -130,7 +143,12 @@ function makeSlash(
     resolveChoices: () => [],
     describeChoice: () => "",
     resolveSection: (t: string) =>
-      ({ model: "ai-model", voice: "voice", connectors: "connectors" })[t],
+      ({
+        model: "ai-model",
+        "ai-model": "ai-model",
+        voice: "voice",
+        connectors: "connectors",
+      })[t],
     navigateTab: vi.fn(),
     navigateSettings: vi.fn(),
     navigateView: vi.fn(),
@@ -235,13 +253,91 @@ describe("ChatOverlay slash commands", () => {
     expect(slash.navigateSettings).not.toHaveBeenCalled();
   });
 
-  it("feature-flagged natural navigation runs through the client command path", () => {
+  it("feature-flagged natural navigation still navigates locally (#29670)", () => {
+    const slash = makeSlash({ naturalShortcutsEnabled: true });
+    const { input } = renderOverlay(slash);
+    fireEvent.change(input, { target: { value: "open settings" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(slash.navigateSettings).toHaveBeenCalledWith(undefined);
+    expect(input.value).toBe("");
+  });
+
+  it("optimistic navigation sends the original prompt after switching views (#29670)", () => {
     const slash = makeSlash({ naturalShortcutsEnabled: true });
     const { input, controller } = renderOverlay(slash);
     fireEvent.change(input, { target: { value: "open settings" } });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(slash.navigateSettings).toHaveBeenCalledWith(undefined);
+    expect(controller.send).toHaveBeenCalledWith("open settings");
+    expect(input.value).toBe("");
+  });
+
+  it("explicit slash picks still consume the turn without an agent turn (#29670)", () => {
+    const slash = makeSlash({ naturalShortcutsEnabled: true });
+    const { input, controller } = renderOverlay(slash);
+    fireEvent.change(input, { target: { value: "/settings" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(slash.navigateSettings).toHaveBeenCalledWith(undefined);
     expect(controller.send).not.toHaveBeenCalled();
+    expect(input.value).toBe("");
+  });
+
+  it("optimistic navigation resolves a section argument and still sends (#29670)", () => {
+    const slash = makeSlash({ naturalShortcutsEnabled: true });
+    const { input, controller } = renderOverlay(slash);
+    fireEvent.change(input, { target: { value: "open model settings" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(slash.navigateSettings).toHaveBeenCalledWith("ai-model");
+    expect(controller.send).toHaveBeenCalledWith("open model settings");
+    expect(input.value).toBe("");
+  });
+
+  it("optimistic navigation routes a view id through navigate-view and still sends (#29670)", () => {
+    const slash = makeSlash({
+      naturalShortcutsEnabled: true,
+      resolveChoices: (source) => (source === "views" ? ["notes"] : []),
+    });
+    const { input, controller } = renderOverlay(slash);
+    fireEvent.change(input, { target: { value: "open notes view" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(slash.navigateView).toHaveBeenCalledWith({
+      viewId: "notes",
+      viewPath: undefined,
+    });
+    expect(controller.send).toHaveBeenCalledWith("open notes view");
+    expect(input.value).toBe("");
+  });
+
+  it("optimistic navigation routes a tab target through navigate-tab and still sends (#29670)", () => {
+    const slash = makeSlash({ naturalShortcutsEnabled: true });
+    const { input, controller } = renderOverlay(slash);
+    fireEvent.change(input, { target: { value: "open views" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(slash.navigateTab).toHaveBeenCalledWith("views");
+    expect(controller.send).toHaveBeenCalledWith("open views");
+    expect(input.value).toBe("");
+  });
+
+  it("natural client-action phrases stay plain agent turns (navigation-only, #29670)", () => {
+    const slash = makeSlash({ naturalShortcutsEnabled: true });
+    const { input, controller } = renderOverlay(slash);
+    fireEvent.change(input, { target: { value: "open command palette" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(slash.openCommandPalette).not.toHaveBeenCalled();
+    expect(controller.send).toHaveBeenCalledWith("open command palette");
+    expect(input.value).toBe("");
+  });
+
+  it("unknown view names stay plain agent turns under optimistic navigation (#29670)", () => {
+    const slash = makeSlash({
+      naturalShortcutsEnabled: true,
+      resolveChoices: (source) => (source === "views" ? ["notes"] : []),
+    });
+    const { input, controller } = renderOverlay(slash);
+    fireEvent.change(input, { target: { value: "open nonexistent view" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(slash.navigateView).not.toHaveBeenCalled();
+    expect(controller.send).toHaveBeenCalledWith("open nonexistent view");
     expect(input.value).toBe("");
   });
 
