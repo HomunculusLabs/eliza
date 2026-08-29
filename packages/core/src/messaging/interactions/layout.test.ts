@@ -9,6 +9,7 @@ import {
 	FORM_FREE_TEXT_INVITE,
 	renderContentInteractionsAsPlainText,
 	renderInteractionsAsPlainText,
+	TASK_EMPTY_TITLE_PLACEHOLDER,
 	toNeutralLayout,
 	toPlainTextFallback,
 } from "./layout.js";
@@ -367,16 +368,33 @@ describe("messaging interactions layout branch coverage", () => {
 			expect(layout.needsFallback).toBe(false);
 		});
 
-		it("renders an unresolvable task as dashboard-only with no dangling title", () => {
+		it("renders an unresolvable task as title prose with a free-text fallback", () => {
+			// #29850: without a link the title must still reach the user (with
+			// a free-text affordance) instead of silently vanishing.
 			const block: InteractionBlock = {
 				kind: "task",
 				threadId: "task-2",
 				title: "Daily Quote Page",
 			};
 			const layout = toNeutralLayout(block);
-			expect(layout.text).toBe("");
+			expect(layout.text).toBe("Daily Quote Page");
 			expect(layout.rows).toEqual([]);
-			expect(layout.needsFallback).toBe(false);
+			expect(layout.needsFallback).toBe(true);
+		});
+
+		it("keeps an empty-title task visibly distinct from a missing one (#29850)", () => {
+			// The text parser rejects empty titles (parse.ts: `!rawTitle`), so
+			// this guards the programmatic layout API: an explicitly empty
+			// task renders a visible placeholder plus the fallback flag,
+			// while a missing task simply never reaches the layout.
+			const layout = toNeutralLayout({
+				kind: "task",
+				threadId: "task-empty",
+				title: "",
+			});
+			expect(layout.text).toBe(TASK_EMPTY_TITLE_PLACEHOLDER);
+			expect(layout.rows).toEqual([]);
+			expect(layout.needsFallback).toBe(true);
 		});
 
 		it("links a form out with the configured submit label", () => {

@@ -118,6 +118,16 @@ describe("renderDiscordInteractions", () => {
 		expect(out.components).toHaveLength(0);
 	});
 
+	it("retains a url-less task title exactly with a free-text reply (#29850)", () => {
+		const id = "abc12345-def6-7890-abcd-ef1234567890";
+		const out = renderDiscordInteractions({
+			text: `Created the task.\n\n[TASK:${id}]Ship it[/TASK]`,
+		} as Content);
+		expect(out.text).toBe("Created the task.\n\nShip it");
+		expect(out.components).toHaveLength(0);
+		expect(out.needsFreeTextReply).toBe(true);
+	});
+
 	it("caps action rows at the Discord limit of 5", () => {
 		const options = Array.from(
 			{ length: 30 },

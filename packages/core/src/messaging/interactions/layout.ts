@@ -83,6 +83,13 @@ export interface LayoutOptions {
  */
 export const FORM_FREE_TEXT_INVITE = "Reply with your answer.";
 
+/**
+ * Visible placeholder for a task card whose title is empty/blank, so a
+ * legitimately empty task stays structurally distinct from a missing one on
+ * transports that render the neutral layout (#29850).
+ */
+export const TASK_EMPTY_TITLE_PLACEHOLDER = "(untitled task)";
+
 function firstNonBlankText(
 	...values: Array<string | undefined>
 ): string | undefined {
@@ -177,17 +184,24 @@ export function toNeutralLayout(
 			return { rows: chunk(buttons, perRow).map((b) => ({ buttons: b })) };
 		}
 		case "task": {
-			// Without a resolvable link the card is dashboard-only; its bare
-			// title rendered as a dangling duplicate line under the ack on chat
-			// connectors ("On it — building that now.\n\nWater Tracker Page",
-			// 2026-08-19). With a URL the title labels the button as before.
+			// Without a resolvable link the card cannot open anywhere; the
+			// title must still reach the user as prose (with a free-text
+			// affordance) rather than silently vanishing — the drop-silent
+			// behavior lost the task name on chat connectors (#29850). With
+			// a URL the title labels the button as before. An empty/blank
+			// title keeps a visible placeholder plus the fallback flag so a
+			// legitimately empty task stays distinguishable from a missing
+			// one (criterion 2); parseInteractionBlocks already rejects
+			// empty titles at the text boundary, so this only guards the
+			// programmatic layout API.
 			const url = resolveUrl?.(block);
+			const title = block.title?.trim() || TASK_EMPTY_TITLE_PLACEHOLDER;
 			return {
-				text: url ? block.title : "",
+				text: title,
 				rows: url
 					? [{ buttons: [{ label: "Open task", url, style: "primary" }] }]
 					: [],
-				needsFallback: false,
+				needsFallback: !url,
 			};
 		}
 		case "form": {

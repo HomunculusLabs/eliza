@@ -71,16 +71,18 @@ describe("renderTelegramInteractions", () => {
     expect(button.url).toContain(id);
   });
 
-  it("drops a url-less task card entirely instead of a dangling title line", () => {
-    // Core contract since 2026-08-19: without a resolvable link the task
-    // widget contributes nothing to chat text — the bare title rendered as a
-    // duplicate line under the ack prose on chat transports.
+  it("preserves a url-less task card title as prose with a free-text fallback", () => {
+    // Core contract since #29850: without a resolvable link the task title
+    // still reaches the user as prose, and the connector reports a free-text
+    // fallback — the task name never silently vanishes from chat.
     const id = "abc12345-def6-7890-abcd-ef1234567890";
     const out = renderTelegramInteractions({
       text: `Created the task.\n\n[TASK:${id}]Ship it[/TASK]`,
     } as Content);
-    expect(out.text).toBe("Created the task.");
+    expect(out.text).toContain("Created the task.");
+    expect(out.text).toContain("Ship it");
     expect(out.keyboardRows).toHaveLength(0);
+    expect(out.needsFreeTextReply).toBe(true);
   });
 
   it("renders a navigate followup as a URL button via resolveNavigateUrl (#8908)", () => {
@@ -136,15 +138,17 @@ describe("dashboard-only marker stripping (Finding B)", () => {
     expect(rendered.keyboardRows).toHaveLength(0);
   });
 
-  it("drops a url-less task card even when its title carries a marker", () => {
-    // Mirrors core's renderInteractionsAsPlainText contract: the url-less
-    // task widget contributes NOTHING, so neither title nor marker leaks.
+  it("preserves a url-less task title (marker stripped) with a free-text fallback", () => {
+    // Mirrors core's renderInteractionsAsPlainText-adjacent contract since
+    // #29850: the url-less task title survives as prose and the [CONFIG:…]
+    // marker never leaks into the delivered text.
     const id = "abc12345-def6-7890-abcd-ef1234567890";
     const rendered = renderTelegramInteractions({
       text: `[TASK:${id}]Ship it [CONFIG:@elizaos/plugin-gmail][/TASK]`,
     } as Content);
-    expect(rendered.text).toBe("");
+    expect(rendered.text).toBe("Ship it");
     expect(rendered.keyboardRows).toHaveLength(0);
+    expect(rendered.needsFreeTextReply).toBe(true);
   });
 
   it("strips [CONFIG:…] from fallback prose contributed by a parsed block", () => {
