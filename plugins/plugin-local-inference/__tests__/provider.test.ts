@@ -3,7 +3,7 @@
  * `LocalInferenceUnavailableError` contract: which model types register and how
  * handlers behave when no backend service is present. Uses a mock runtime.
  */
-import { ModelType } from "@elizaos/core";
+import { canonicalPromptForModelCall, ModelType } from "@elizaos/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	createLocalInferenceModelHandlers,
@@ -55,7 +55,7 @@ describe("local inference provider", () => {
 		);
 	});
 
-	it("renders v5 message arrays before delegating text generation", async () => {
+	it("serializes v5 message arrays canonically before delegating text generation", async () => {
 		const generate = vi.fn(async (args: { prompt: string }) => args.prompt);
 		const runtime = runtimeWithService({ generate });
 		const handlers = createLocalInferenceModelHandlers();
@@ -72,12 +72,23 @@ describe("local inference provider", () => {
 			topP: 0.9,
 		} as never);
 
-		expect(result).toBe(
-			"system:\nYou are Eliza.\n\nuser:\nhello. say hello back",
+		// Structured content stays JSON-serialized so tool-call and tool-result parts survive the local backend boundary.
+		const canonical = canonicalPromptForModelCall({
+			messages: [
+				{ role: "system", content: "You are Eliza." },
+				{
+					role: "user",
+					content: [{ type: "text", text: "hello. say hello back" }],
+				},
+			],
+		});
+		expect(canonical).toBe(
+			'system:\nYou are Eliza.\n\nuser:\n[{"type":"text","text":"hello. say hello back"}]',
 		);
+		expect(result).toBe(canonical);
 		expect(generate).toHaveBeenCalledWith(
 			expect.objectContaining({
-				prompt: "system:\nYou are Eliza.\n\nuser:\nhello. say hello back",
+				prompt: canonical,
 				maxTokens: 32,
 				topP: 0.9,
 			}),
