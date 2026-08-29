@@ -90,6 +90,7 @@ import {
 import {
   classifyInferenceRamClass,
   InferenceIdleUnloader,
+  type InferenceRamClass,
   makeProcMeminfoPressureCheck,
   resolveInferenceIdleUnloadMs,
 } from "./inference-memory-policy.js";
@@ -1863,6 +1864,108 @@ async function ensureAospLoaderOwner(
   }
 }
 
+export interface AospBackgroundOutputCeilingPolicy {
+  /**
+   * Largest explicit output-token request a background-priority generation may
+   * carry (#29839). Mirrors the device-class ceilings `47e047d` defined for the
+   * core gate before #28112 moved the boundary to the backend: a phone must
+   * never burn its whole context window on one autonomous decode. Interactive
+   * requests are never checked — user-facing turns own the lane.
+   */
+  maxTokens: number;
+}
+
+const CONSTRAINED_BACKGROUND_OUTPUT_CEILING: AospBackgroundOutputCeilingPolicy =
+  { maxTokens: 192 };
+
+const STANDARD_BACKGROUND_OUTPUT_CEILING: AospBackgroundOutputCeilingPolicy = {
+  maxTokens: 1_024,
+};
+
+/**
+ * Resolve the background output-ceiling policy for a device RAM class. Only
+ * `maxTokens` is policy here; the bounded gate wait still comes from core's
+ * `resolveBackgroundInferenceBudget` (#11914).
+ */
+export function resolveAospBackgroundOutputCeiling(
+  ramClass: InferenceRamClass,
+): AospBackgroundOutputCeilingPolicy {
+  return ramClass === "constrained"
+    ? CONSTRAINED_BACKGROUND_OUTPUT_CEILING
+    : STANDARD_BACKGROUND_OUTPUT_CEILING;
+}
+
+/**
+ * Resolve the largest completion budget supported by the loaded fused context
+ * after the complete prompt is tokenized (#29839). Nothing is ever clamped or
+ * truncated: an omitted ceiling uses every token remaining after the prompt,
+ * an explicit request is preserved exactly when it fits, and any request that
+ * cannot fit — or a prompt that consumes the whole context — fails typed
+ * before the loader is asked to decode.
+ *
+ * Exported for unit tests; production callers are the fused generate closure
+ * and (via `generateOnPriorityLane`) the background output-ceiling gate.
+ */
+export function resolveAospCompletionBudget(options: {
+  requestedMaxTokens?: number;
+  contextSize: number | null;
+  promptTokenCount: number;
+}): number {
+  const { contextSize, promptTokenCount, requestedMaxTokens } = options;
+  if (
+    !Number.isSafeInteger(contextSize) ||
+    contextSize == null ||
+    contextSize <= 0
+  ) {
+    throw new ElizaError(
+      "A positive loaded context size is required before generation",
+      {
+        code: "INFERENCE_AOSP_CONTEXT_SIZE_REQUIRED",
+        context: { contextSize },
+      },
+    );
+  }
+  if (!Number.isSafeInteger(promptTokenCount) || promptTokenCount < 0) {
+    throw new ElizaError(
+      "Prompt token count must be a non-negative safe integer",
+      {
+        code: "INFERENCE_AOSP_PROMPT_TOKEN_COUNT_INVALID",
+        context: { promptTokenCount },
+      },
+    );
+  }
+  const available = contextSize - promptTokenCount;
+  if (available <= 0) {
+    throw new ElizaError(
+      `Complete prompt requires ${promptTokenCount} tokens but the loaded context supports ${contextSize}; refusing to truncate it`,
+      {
+        code: "INFERENCE_AOSP_PROMPT_EXCEEDS_CONTEXT",
+        context: { promptTokenCount, contextSize },
+      },
+    );
+  }
+  if (requestedMaxTokens === undefined) return available;
+  if (!Number.isSafeInteger(requestedMaxTokens) || requestedMaxTokens <= 0) {
+    throw new ElizaError(
+      "Requested maxTokens must be a positive safe integer",
+      {
+        code: "INFERENCE_AOSP_OUTPUT_BUDGET_INVALID",
+        context: { requestedMaxTokens, available },
+      },
+    );
+  }
+  if (requestedMaxTokens > available) {
+    throw new ElizaError(
+      `Requested ${requestedMaxTokens} output tokens but only ${available} fit after the complete prompt; refusing to clamp the request`,
+      {
+        code: "INFERENCE_AOSP_OUTPUT_BUDGET_EXCEEDED",
+        context: { requestedMaxTokens, available },
+      },
+    );
+  }
+  return requestedMaxTokens;
+}
+
 /**
  * Route one text generation through the process-wide interactive-over-
  * background lane (elizaOS/eliza#11914). The fused context runs one decode at
@@ -1886,9 +1989,34 @@ export async function generateOnPriorityLane(
   const args = buildGenerateArgsFromParams(params);
   let lockWaitMs: number | undefined;
   if (priority === "background") {
-    const budget = resolveBackgroundInferenceBudget(
-      classifyInferenceRamClass(),
-    );
+    const ramClass = classifyInferenceRamClass();
+    const budget = resolveBackgroundInferenceBudget(ramClass);
+    // #29839: after #28112 the core gate preserves requests byte-for-byte
+    // (scheduling policy only), so the plugin owns the device-class output
+    // ceiling. An explicit background request larger than the RAM-class
+    // ceiling rejects BEFORE the gate or loader — the decode would otherwise
+    // hold the phone lane for minutes and come back capped, which #28112
+    // correctly calls a silent content loss. An omitted ceiling stays
+    // permissive: deferred reasoning callers (PII scrub, prompt batcher)
+    // legitimately omit it and the fused boundary budgets them against every
+    // token remaining in the loaded context.
+    const ceiling = resolveAospBackgroundOutputCeiling(ramClass);
+    if (
+      Number.isSafeInteger(args.maxTokens) &&
+      (args.maxTokens ?? 0) > ceiling.maxTokens
+    ) {
+      throw new ElizaError(
+        `Background inference output request exceeds the device-class ceiling on the local lane (requested ${args.maxTokens}, supported ${ceiling.maxTokens}); failing before dispatch instead of returning a capped result`,
+        {
+          code: "INFERENCE_BACKGROUND_OUTPUT_BUDGET_EXCEEDED",
+          context: {
+            requestedMaxTokens: args.maxTokens,
+            supportedMaxTokens: ceiling.maxTokens,
+            ramClass,
+          },
+        },
+      );
+    }
     const budgetedArgs = applyBackgroundInferenceBudget(
       { prompt: args.prompt, maxTokens: args.maxTokens },
       budget,
@@ -3369,9 +3497,16 @@ export async function tryBuildAospFusedTextLoader(): Promise<AospLoader | null> 
         throw new Error("[aosp-local-inference] fused text generate aborted");
       }
       const promptTokens = tokenizeFused(active, args.prompt);
-      const maxTokens =
-        args.maxTokens ??
-        Math.max(1, (active.contextSize ?? 32_768) - promptTokens.length);
+      // #29839: budget against the REAL loaded context — an omitted ceiling
+      // uses every token remaining after the complete prompt, an explicit
+      // request that cannot fit rejects typed instead of silently capping the
+      // decode (a partial generation must never be returned as the requested
+      // result).
+      const maxTokens = resolveAospCompletionBudget({
+        requestedMaxTokens: args.maxTokens,
+        contextSize: active.contextSize,
+        promptTokenCount: promptTokens.length,
+      });
       const config: AospLlmStreamConfig = {
         maxTokens,
         temperature: args.temperature ?? 0.7,
