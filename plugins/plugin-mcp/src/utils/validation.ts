@@ -3,6 +3,11 @@
  * used to re-prompt on failure. A selection must target a connected server and an
  * existing tool/resource, and tool arguments must satisfy the tool's own input
  * schema; an explicit noTool/noResourceAvailable signal is accepted as valid.
+ *
+ * Tool-argument schema validation runs in a throwaway worker with a two-phase
+ * deadline: a bounded startup window (spawn + Ajv load) followed by the
+ * validation budget, which starts at the worker's ready handshake so host load
+ * during startup cannot fail valid schemas closed.
  */
 
 import { createRequire } from "node:module";
@@ -35,6 +40,7 @@ export interface ToolSelection {
 
 const MAX_TOOL_ARGUMENTS_JSON_BYTES = 1024 * 1024;
 const TOOL_SCHEMA_VALIDATION_TIMEOUT_MS = 250;
+const TOOL_SCHEMA_WORKER_STARTUP_TIMEOUT_MS = 10_000;
 const MAX_CONCURRENT_SCHEMA_VALIDATIONS = 4;
 let activeSchemaValidations = 0;
 
@@ -46,22 +52,45 @@ interface SchemaWorkerResult {
   readonly error?: string;
 }
 
+// The worker loads Ajv, constructs the validator instance, and signals readiness
+// before compiling the request it was spawned with. Loading Ajv is
+// machine-dependent (tens of ms idle, hundreds of ms on a loaded CI host), so the
+// host measures the validation budget from the ready signal, not from worker
+// spawn — a loaded host must not fail valid schemas closed because Ajv boot was
+// charged against the validation deadline. Because compile+validate begin only
+// after the ready post, the host-observed ready→result gap stays near zero for
+// valid schemas even when the host thread itself is scheduled late.
+// ELIZA_TEST_MCP_SCHEMA_WORKER_STARTUP_DELAY_MS is a test-only hook that delays
+// the ready signal so tests can prove startup time is excluded from the budget.
 const SCHEMA_WORKER_SOURCE = `
   const { parentPort, workerData } = require("node:worker_threads");
   const AjvImport = require(workerData.ajvModulePath);
   const Ajv = AjvImport.default ?? AjvImport;
-
-  try {
-    const schema = JSON.parse(workerData.schemaJson);
-    const data = JSON.parse(workerData.dataJson);
-    const validate = new Ajv({ allErrors: true }).compile(schema);
-    const valid = validate(data);
-    parentPort.postMessage({ success: Boolean(valid), errors: validate.errors ?? [] });
-  } catch (error) {
-    parentPort.postMessage({
-      success: false,
-      error: error instanceof Error ? error.message : String(error),
-    });
+  const ajv = new Ajv({ allErrors: true });
+  const sendReady = () => {
+    parentPort.postMessage({ ready: true });
+    try {
+      const schema = JSON.parse(workerData.schemaJson);
+      const data = JSON.parse(workerData.dataJson);
+      const validate = ajv.compile(schema);
+      const valid = validate(data);
+      parentPort.postMessage({ success: Boolean(valid), errors: validate.errors ?? [] });
+    } catch (error) {
+      parentPort.postMessage({
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+  const startupDelayMs = Number(process.env.ELIZA_TEST_MCP_SCHEMA_WORKER_STARTUP_DELAY_MS ?? 0);
+  if (startupDelayMs > 0) {
+    const readyAt = Date.now() + startupDelayMs;
+    (function waitForStartupDelay() {
+      if (Date.now() >= readyAt) return sendReady();
+      setTimeout(waitForStartupDelay, Math.min(25, readyAt - Date.now()));
+    })();
+  } else {
+    sendReady();
   }
 `;
 
@@ -149,11 +178,14 @@ async function validateUntrustedToolArguments(
         },
       });
       let settled = false;
+      let validationTimer: NodeJS.Timeout | undefined;
+      let startupTimer: NodeJS.Timeout | undefined;
 
       const finish = (result: ValidationResult<unknown>): void => {
         if (settled) return;
         settled = true;
-        clearTimeout(timer);
+        clearTimeout(startupTimer);
+        clearTimeout(validationTimer);
         worker.removeAllListeners();
         void worker.terminate().then(
           () => resolve(result),
@@ -161,22 +193,42 @@ async function validateUntrustedToolArguments(
         );
       };
 
-      const timer = setTimeout(() => {
+      // Startup phase: the worker must signal readiness within a bounded window.
+      // Worker spawn and the Ajv require are machine-dependent and deliberately
+      // excluded from the validation budget, but a worker that never becomes
+      // ready still fails closed rather than hanging the selection loop.
+      startupTimer = setTimeout(() => {
         finish({
           success: false,
-          error: `MCP JSON schema validation exceeded ${TOOL_SCHEMA_VALIDATION_TIMEOUT_MS}ms`,
+          error: `MCP schema validation worker failed to become ready within ${TOOL_SCHEMA_WORKER_STARTUP_TIMEOUT_MS}ms`,
         });
-      }, TOOL_SCHEMA_VALIDATION_TIMEOUT_MS);
+      }, TOOL_SCHEMA_WORKER_STARTUP_TIMEOUT_MS);
 
-      worker.once("message", (message: SchemaWorkerResult & { errors?: unknown }) => {
-        if (message.success) {
-          finish({ success: true, data });
-        } else if (message.error) {
-          finish({ success: false, error: `schema validation failed: ${message.error}` });
-        } else {
-          finish({ success: false, error: formatWorkerErrors(message.errors) });
+      worker.on(
+        "message",
+        (message: { ready?: boolean } & SchemaWorkerResult & { errors?: unknown }) => {
+          if (message.ready) {
+            // Validation phase starts at the ready handshake: Ajv is loaded and the
+            // worker is already compiling the spawned request, so the remaining
+            // budget covers schema compile and data validation only.
+            clearTimeout(startupTimer);
+            validationTimer = setTimeout(() => {
+              finish({
+                success: false,
+                error: `MCP JSON schema validation exceeded ${TOOL_SCHEMA_VALIDATION_TIMEOUT_MS}ms`,
+              });
+            }, TOOL_SCHEMA_VALIDATION_TIMEOUT_MS);
+            return;
+          }
+          if (message.success) {
+            finish({ success: true, data });
+          } else if (message.error) {
+            finish({ success: false, error: `schema validation failed: ${message.error}` });
+          } else {
+            finish({ success: false, error: formatWorkerErrors(message.errors) });
+          }
         }
-      });
+      );
       worker.once("error", (error) => {
         const message = error instanceof Error ? error.message : String(error);
         finish({ success: false, error: `schema validation failed: ${message}` });

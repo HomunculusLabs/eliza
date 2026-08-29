@@ -4,12 +4,18 @@
  */
 
 import type { State } from "@elizaos/core";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   validateResourceSelection,
   validateToolSelectionArgument,
   validateToolSelectionName,
 } from "../src/utils/validation.js";
+
+const STARTUP_DELAY_ENV = "ELIZA_TEST_MCP_SCHEMA_WORKER_STARTUP_DELAY_MS";
+
+afterEach(() => {
+  delete process.env[STARTUP_DELAY_ENV];
+});
 
 const stateWith = (mcp: Record<string, unknown>): State =>
   ({ values: { mcp }, data: {}, text: "" }) as unknown as State;
@@ -137,6 +143,44 @@ describe("validateToolSelectionArgument", () => {
         (result) => !result.success && result.error.includes("validation capacity of 4 exceeded")
       )
     ).toHaveLength(8);
+  });
+
+  it("accepts an empty object schema (no properties) as valid for any object arguments", async () => {
+    const res = await validateToolSelectionArgument(
+      { toolArguments: { anything: "goes" } },
+      { type: "object" }
+    );
+    expect(res.success).toBe(true);
+  });
+
+  it("fails closed on a malformed schema through the structured error contract", async () => {
+    const res = await validateToolSelectionArgument(
+      { toolArguments: { q: "hi" } },
+      { type: "object", required: "q" }
+    );
+    expect(res.success).toBe(false);
+    if (!res.success) expect(res.error).toMatch(/Invalid arguments: schema validation failed:/);
+  });
+
+  it("does not charge worker startup against the 250ms validation budget", async () => {
+    // Deterministic CI repro: the test hook delays the worker's ready signal by
+    // 400ms — longer than the entire old 250ms combined deadline. The fixed
+    // handshake still validates successfully because startup runs inside its own
+    // window and the validation budget starts at readiness. Pristine code has no
+    // hook (call finishes in ~100ms), so the wall-time floor fails there.
+    process.env[STARTUP_DELAY_ENV] = "400";
+    const startedAt = performance.now();
+    try {
+      const res = await validateToolSelectionArgument(
+        { toolArguments: { q: "hi" } },
+        { type: "object", properties: { q: { type: "string" } }, required: ["q"] }
+      );
+      const elapsedMs = performance.now() - startedAt;
+      expect(res.success).toBe(true);
+      expect(elapsedMs).toBeGreaterThanOrEqual(350);
+    } finally {
+      delete process.env[STARTUP_DELAY_ENV];
+    }
   });
 });
 
