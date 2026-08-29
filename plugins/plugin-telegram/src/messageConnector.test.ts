@@ -320,6 +320,13 @@ describe("Telegram message connector adapter", () => {
 
   it("pages full room reads and filters them to the target account", async () => {
     const roomId = "room-1" as never;
+    const fullPage = Array.from({ length: 500 }, (_, i) => ({
+      id: `memory-page1-${i}`,
+      roomId,
+      content: { text: `page one message ${i}` },
+      metadata: { accountId: "acct-a" },
+      createdAt: 1000 - i,
+    })) as Memory[];
     const acctAMemory = {
       id: "memory-a",
       roomId,
@@ -343,8 +350,11 @@ describe("Telegram message connector adapter", () => {
     } as Memory;
     const runtime = {
       ...createRuntime(),
+      // First call returns a full 500-item page (paging must continue);
+      // second call returns a short page (paging must stop).
       getMemories: vi
         .fn()
+        .mockResolvedValueOnce(fullPage)
         .mockResolvedValue([acctAMemory, legacyMemory, acctBMemory]),
     };
     const service = createTelegramService({
@@ -365,9 +375,8 @@ describe("Telegram message connector adapter", () => {
       },
     );
 
-    // Post-#28112 the room read is an offset-driven paging loop with
-    // TELEGRAM_MEMORY_PAGE_SIZE = 500 instead of a single capped read.
-    expect(runtime.getMemories).toHaveBeenCalledWith({
+    expect(runtime.getMemories).toHaveBeenCalledTimes(2);
+    expect(runtime.getMemories).toHaveBeenNthCalledWith(1, {
       tableName: "messages",
       roomId,
       limit: 500,
@@ -375,7 +384,20 @@ describe("Telegram message connector adapter", () => {
       orderBy: "createdAt",
       orderDirection: "desc",
     });
-    expect(result).toEqual([acctAMemory, legacyMemory]);
+    expect(runtime.getMemories).toHaveBeenNthCalledWith(2, {
+      tableName: "messages",
+      roomId,
+      limit: 500,
+      offset: 500,
+      orderBy: "createdAt",
+      orderDirection: "desc",
+    });
+    // Result keeps every page-one memory (acct-a) plus the page-two items the
+    // account filter admits: acct-a and the legacy (unscoped) memory — never acct-b.
+    expect(result).toHaveLength(502);
+    expect(result.slice(0, 500)).toEqual(fullPage);
+    expect(result[500]).toEqual(acctAMemory);
+    expect(result[501]).toEqual(legacyMemory);
   });
 
   it("rejects a non-positive connector search limit with the typed error instead of clamping", async () => {
@@ -391,8 +413,8 @@ describe("Telegram message connector adapter", () => {
       accountStates: new Map([["acct-a", { accountId: "acct-a" }]]),
     });
 
-    // Post-#28112 the connector fails fast on invalid limits (error policy
-    // J3): an explicit invalid result, never a silently substituted default.
+    // Invalid limits fail fast (error policy J3): an explicit invalid
+    // result, never a silently substituted default.
     expect(() =>
       service.searchConnectorMessages(
         { runtime, accountId: "acct-a" } as never,
@@ -468,8 +490,8 @@ describe("Telegram message connector adapter", () => {
       },
     );
 
-    // The valid limit slices the filtered matches; the room read itself pages
-    // uncapped (fetch runs with limit: undefined in the search path).
+    // The valid limit slices the filtered matches; the search path reads the
+    // room uncapped (fetch runs with limit: undefined) before slicing.
     expect(runtime.getMemories).toHaveBeenCalledWith(
       expect.objectContaining({ limit: 500, offset: 0 }),
     );
