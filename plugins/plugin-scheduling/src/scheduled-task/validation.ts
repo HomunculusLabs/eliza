@@ -277,15 +277,28 @@ function validateTaskRef(
   }
   if (!isRecord(ref)) return [`${path} must be a task id or task input`];
   if (seen.has(ref)) return [`${path} must not contain a cyclic task ref`];
-  const input =
-    "taskId" in ref || "state" in ref
-      ? stripServerManaged(ref as ScheduledTask)
-      : (ref as ScheduledTaskInput);
-  return validateScheduledTaskInput(input, deps, {
+  // Persisted-shaped refs (taskId/state) are stripped to a FRESH object for
+  // validation, so tracking only the stripped copy would miss cycles made
+  // entirely of persisted refs. Track the original ref around the recursion;
+  // bare input refs are tracked by validateScheduledTaskInput itself.
+  const persistedShape = "taskId" in ref || "state" in ref;
+  if (persistedShape) {
+    seen.add(ref);
+  }
+  const input = persistedShape
+    ? stripServerManaged(ref as ScheduledTask)
+    : (ref as ScheduledTaskInput);
+  const issues = validateScheduledTaskInput(input, deps, {
     path,
     depth: depth + 1,
     seen,
   });
+  // Path-scoped cycle detection: forget the ref when its branch completes so
+  // sibling branches may legitimately share (fan-in) the same task object.
+  if (persistedShape) {
+    seen.delete(ref);
+  }
+  return issues;
 }
 
 export function validateScheduledTaskInput(
@@ -296,8 +309,9 @@ export function validateScheduledTaskInput(
   const path = opts.path ?? "task";
   const depth = opts.depth ?? 0;
   const seen = opts.seen ?? new WeakSet<object>();
-  const issues: string[] = [];
 
+  // Depth precedence matches the original single-function form: the nesting
+  // cap is evaluated before any cycle/object checks.
   if (depth > 8) {
     return [`${path}.pipeline nesting exceeds 8 levels`];
   }
@@ -308,17 +322,34 @@ export function validateScheduledTaskInput(
     return [`${path} must not contain cyclic pipeline refs`];
   }
   seen.add(input);
+  const issues = walkScheduledTaskInput(input, deps, path, depth, seen);
+  // Path-scoped cycle detection: forget this object once its subtree walk
+  // completes, so DAG fan-in (the same task object referenced by sibling
+  // branches) is not misreported as a cycle. Only a ref that rejoins the
+  // CURRENT recursion path is cyclic.
+  seen.delete(input);
+  return issues;
+}
 
-  if (!TASK_KINDS.has(input.kind)) {
+function walkScheduledTaskInput(
+  input: Record<string, unknown>,
+  deps: ScheduledTaskValidationDeps,
+  path: string,
+  depth: number,
+  seen: WeakSet<object>,
+): string[] {
+  const issues: string[] = [];
+
+  if (!TASK_KINDS.has(input.kind as ScheduledTaskKind)) {
     issues.push(`${path}.kind is invalid`);
   }
   if (!isNonEmptyString(input.promptInstructions)) {
     issues.push(`${path}.promptInstructions must be a non-empty string`);
   }
-  if (!TASK_PRIORITIES.has(input.priority)) {
+  if (!TASK_PRIORITIES.has(input.priority as ScheduledTaskPriority)) {
     issues.push(`${path}.priority is invalid`);
   }
-  if (!TASK_SOURCES.has(input.source)) {
+  if (!TASK_SOURCES.has(input.source as ScheduledTaskSource)) {
     issues.push(`${path}.source is invalid`);
   }
   if (!isNonEmptyString(input.createdBy)) {
@@ -495,7 +526,9 @@ export function validateScheduledTaskInput(
 
   if (
     input.executionProfile !== undefined &&
-    !TASK_EXECUTION_PROFILES.includes(input.executionProfile)
+    !TASK_EXECUTION_PROFILES.includes(
+      input.executionProfile as (typeof TASK_EXECUTION_PROFILES)[number],
+    )
   ) {
     issues.push(`${path}.executionProfile is invalid`);
   }
