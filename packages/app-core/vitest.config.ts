@@ -381,6 +381,30 @@ export default defineConfig({
         replacement: `${toVitePath(appTaskCoordinatorSrc)}/$1`,
       },
       {
+        // Mirrors Agent's own vitest.config.ts: app-core aliases @elizaos/agent
+        // to source, so todo-cutover-import.ts's plugin-todos subpath imports
+        // must also resolve to source before workspace dist builds exist.
+        find: /^@elizaos\/plugin-todos\/plugin$/,
+        replacement: path.join(
+          monorepoRoot,
+          "plugins/plugin-todos/src/plugin.ts",
+        ),
+      },
+      {
+        find: /^@elizaos\/plugin-todos\/service$/,
+        replacement: path.join(
+          monorepoRoot,
+          "plugins/plugin-todos/src/service.ts",
+        ),
+      },
+      {
+        find: /^@elizaos\/plugin-todos\/db\/schema$/,
+        replacement: path.join(
+          monorepoRoot,
+          "plugins/plugin-todos/src/db/schema.ts",
+        ),
+      },
+      {
         find: /^@elizaos\/plugin-scheduling$/,
         replacement: path.join(pluginSchedulingSrc, "index.ts"),
       },
