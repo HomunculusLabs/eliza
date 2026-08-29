@@ -586,6 +586,49 @@ describe("telegram membership authority vertical (real PGlite)", () => {
     await ensurePrincipal(harness, entityId);
     const runtimeMap = { worldId: null, roomId: null, entityId };
 
+    // Pinned absolute timeline seeded once per test (#29932): every observedAt
+    // is derived from t0 instead of ad-hoc Date.now() calls, so the test's
+    // ordering semantics no longer depend on where millisecond ticks land.
+    // - pre-removal join: t0 - 5s
+    // - backlogged redelivery: t0 - 1s (still older than the re-add below,
+    //   keeping the out-of-order guard deterministic)
+    // - post-re-add evidence: Date.now() + 1s, stamped AFTER the awaited
+    //   clearScopeRemoval so it strictly exceeds the re-add watermark even
+    //   under a sub-second wall-clock step-back (the authority permits
+    //   observations stamped up to 5 minutes in the future).
+    const t0 = Date.now();
+    const preRemovalAt = new Date(t0 - 5_000).toISOString();
+    const backloggedAt = new Date(t0 - 1_000).toISOString();
+
+    // Failure-signature capture (#29932): if any assertion in this test
+    // fails, dump the durable authority state so the failure can be
+    // classified (watermark skip vs tombstone skip vs idempotency replay)
+    // instead of guessing. All accessors are public read-only APIs.
+    const dumpAuthorityState = async (stage: string) => {
+      const health = await authority.scopeHealth({
+        chatId: String(CHAT_ID),
+        chatRoomKey: String(CHAT_ID),
+      });
+      return `--- failure signature (${stage}) ---
+pinned t0: ${new Date(t0).toISOString()}
+preRemovalAt: ${preRemovalAt}
+backloggedAt: ${backloggedAt}
+scopeHealth: ${JSON.stringify(health)}`;
+    };
+    let signature = "";
+    const expectDecision = async (
+      stage: string,
+      actual: { decision: string },
+      expected: "allowed" | "denied",
+      why: string,
+    ) => {
+      if (actual.decision !== expected) {
+        signature = await dumpAuthorityState(stage);
+        console.error(signature);
+      }
+      expect(actual.decision, `${why}\n${signature}`).toBe(expected);
+    };
+
     await authority.recordEvent({
       chatId: String(CHAT_ID),
       chatRoomKey: String(CHAT_ID),
@@ -595,14 +638,19 @@ describe("telegram membership authority vertical (real PGlite)", () => {
       messageId: 1,
       telegramUserId: String(MEMBER_TG_ID),
       runtime: runtimeMap,
-      observedAt: new Date(Date.now() - 5_000).toISOString(),
+      observedAt: preRemovalAt,
     });
     const beforeDecision = await authority.authorize({
       chatId: String(CHAT_ID),
       chatRoomKey: String(CHAT_ID),
       canonicalPrincipalId: entityId,
     });
-    expect(beforeDecision.decision).toBe("allowed");
+    await expectDecision(
+      "initial join admitted",
+      beforeDecision,
+      "allowed",
+      "join evidence admits the member before the bot is removed",
+    );
 
     // The bot is removed from the chat: the scope degrades to unavailable.
     await authority.markScopeUnavailable({
@@ -622,23 +670,31 @@ describe("telegram membership authority vertical (real PGlite)", () => {
       messageId: 2,
       telegramUserId: String(MEMBER_TG_ID),
       runtime: runtimeMap,
-      observedAt: new Date().toISOString(),
+      observedAt: backloggedAt,
     });
     const tombstonedDecision = await authority.authorize({
       chatId: String(CHAT_ID),
       chatRoomKey: String(CHAT_ID),
       canonicalPrincipalId: entityId,
     });
-    expect(
-      tombstonedDecision.decision,
+    await expectDecision(
+      "tombstone holds",
+      tombstonedDecision,
+      "denied",
       "backlogged evidence cannot restore a bot-removed scope",
-    ).toBe("denied");
+    );
 
     // The bot is re-added: the tombstone clears and fresh evidence works.
-    authority.clearScopeRemoval({
+    // AWAIT the clear (production call sites in service.ts both await it):
+    // the re-add watermark (Date.now() inside the serialized chain) must be
+    // sampled before the post-re-add evidence is stamped, or a millisecond
+    // tick between the un-awaited clear's queueing and the evidence write
+    // stamps evidence "before" the re-add and the final assertion denies.
+    await authority.clearScopeRemoval({
       chatId: String(CHAT_ID),
       chatRoomKey: String(CHAT_ID),
     });
+    const readdedAt = new Date(Date.now() + 1_000).toISOString();
     await authority.recordEvent({
       chatId: String(CHAT_ID),
       chatRoomKey: String(CHAT_ID),
@@ -648,17 +704,19 @@ describe("telegram membership authority vertical (real PGlite)", () => {
       messageId: 3,
       telegramUserId: String(MEMBER_TG_ID),
       runtime: runtimeMap,
-      observedAt: new Date().toISOString(),
+      observedAt: readdedAt,
     });
     const readdedDecision = await authority.authorize({
       chatId: String(CHAT_ID),
       chatRoomKey: String(CHAT_ID),
       canonicalPrincipalId: entityId,
     });
-    expect(
-      readdedDecision.decision,
+    await expectDecision(
+      "re-add restores authority",
+      readdedDecision,
+      "allowed",
       "after a bot re-add, fresh evidence re-establishes authority",
-    ).toBe("allowed");
+    );
   }, 120_000);
 
   it("rejects a reconcile response describing a different user than requested (subject mismatch)", async () => {
