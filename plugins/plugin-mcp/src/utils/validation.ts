@@ -76,6 +76,7 @@ const SCHEMA_WORKER_SOURCE = `
       const valid = validate(data);
       parentPort.postMessage({ success: Boolean(valid), errors: validate.errors ?? [] });
     } catch (error) {
+      // error-policy:J3 malformed schemas produce an explicit validation failure
       parentPort.postMessage({
         success: false,
         error: error instanceof Error ? error.message : String(error),
