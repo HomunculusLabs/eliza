@@ -88,12 +88,19 @@ vi.mock("../voice/local-asr-capture", () => ({
 
 // Force selection to a null transport by default so the injected factory is the
 // only source (the connection uses createTransport override in these tests).
-vi.mock("@capacitor/core", () => ({
-  Capacitor: {
-    isNativePlatform: () => false,
-    getPlatform: () => "web",
-  },
-}));
+vi.mock("@capacitor/core", async () => {
+  const canonical = await vi.importActual<
+    typeof import("../../test/stubs/capacitor-core")
+  >("../../test/stubs/capacitor-core");
+  return {
+    ...canonical,
+    Capacitor: {
+      ...canonical.Capacitor,
+      isNativePlatform: () => false,
+      getPlatform: () => "web",
+    },
+  };
+});
 
 import { PendantConnection, type PendantState } from "./pendant-connection";
 import type { PendantTranscriptSegmentDetail } from "./transcript-segment-event";

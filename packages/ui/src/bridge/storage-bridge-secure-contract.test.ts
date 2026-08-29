@@ -37,12 +37,19 @@ const nativeStores = vi.hoisted(() => ({
   operations: [] as string[],
 }));
 
-vi.mock("@capacitor/core", () => ({
-  Capacitor: {
-    getPlatform: () => "android",
-    isNativePlatform: () => true,
-  },
-}));
+vi.mock("@capacitor/core", async () => {
+  const canonical = await vi.importActual<
+    typeof import("../../test/stubs/capacitor-core")
+  >("../../test/stubs/capacitor-core");
+  return {
+    ...canonical,
+    Capacitor: {
+      ...canonical.Capacitor,
+      getPlatform: () => "android",
+      isNativePlatform: () => true,
+    },
+  };
+});
 
 vi.mock("@capacitor/preferences", () => ({
   Preferences: {

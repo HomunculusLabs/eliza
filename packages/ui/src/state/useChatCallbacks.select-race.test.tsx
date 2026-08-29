@@ -74,10 +74,24 @@ vi.mock("./switch-runtime", () => ({
   },
 }));
 
-vi.mock("@capacitor/core", () => ({
-  Capacitor: { isNativePlatform: () => false, getPlatform: () => "web" },
-  CapacitorHttp: { get: vi.fn(), post: vi.fn(), request: vi.fn() },
-}));
+vi.mock("@capacitor/core", async () => {
+  const canonical = await vi.importActual<
+    typeof import("../../test/stubs/capacitor-core")
+  >("../../test/stubs/capacitor-core");
+  return {
+    ...canonical,
+    Capacitor: {
+      ...canonical.Capacitor,
+      isNativePlatform: () => false,
+      getPlatform: () => "web",
+    },
+    CapacitorHttp: {
+      get: vi.fn(),
+      post: vi.fn(),
+      request: vi.fn(),
+    },
+  };
+});
 
 // useChatLifecycle owns start/stop/reset flows that are irrelevant here and
 // starts readiness-poll timers on mount; stub it so this suite exercises ONLY

@@ -16,14 +16,21 @@ const capacitorState = vi.hoisted(() => ({ isNative: false }));
 const capacitorMocks = vi.hoisted(() => ({ request: vi.fn() }));
 const desktopTransportMocks = vi.hoisted(() => ({ request: vi.fn() }));
 
-vi.mock("@capacitor/core", () => ({
-  Capacitor: {
-    isNativePlatform: () => capacitorState.isNative,
-  },
-  CapacitorHttp: {
-    request: capacitorMocks.request,
-  },
-}));
+vi.mock("@capacitor/core", async () => {
+  const canonical = await vi.importActual<
+    typeof import("../../../test/stubs/capacitor-core")
+  >("../../../test/stubs/capacitor-core");
+  return {
+    ...canonical,
+    Capacitor: {
+      ...canonical.Capacitor,
+      isNativePlatform: () => capacitorState.isNative,
+    },
+    CapacitorHttp: {
+      request: capacitorMocks.request,
+    },
+  };
+});
 
 vi.mock("../../api/desktop-http-transport", () => ({
   desktopHttpTransportForUrl: (url: string) =>

@@ -28,12 +28,19 @@ const h = vi.hoisted(() => ({
   })),
 }));
 
-vi.mock("@capacitor/core", () => ({
-  Capacitor: {
-    getPlatform: () => "android",
-    isNativePlatform: () => true,
-  },
-}));
+vi.mock("@capacitor/core", async () => {
+  const canonical = await vi.importActual<
+    typeof import("../../test/stubs/capacitor-core")
+  >("../../test/stubs/capacitor-core");
+  return {
+    ...canonical,
+    Capacitor: {
+      ...canonical.Capacitor,
+      getPlatform: () => "android",
+      isNativePlatform: () => true,
+    },
+  };
+});
 
 vi.mock("../bridge/native-plugins", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../bridge/native-plugins")>()),

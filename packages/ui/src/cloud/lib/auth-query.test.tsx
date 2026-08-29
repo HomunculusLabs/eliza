@@ -13,11 +13,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const capacitorState = vi.hoisted(() => ({ isNative: false }));
 
-vi.mock("@capacitor/core", () => ({
-  Capacitor: {
-    isNativePlatform: () => capacitorState.isNative,
-  },
-}));
+vi.mock("@capacitor/core", async () => {
+  const canonical = await vi.importActual<
+    typeof import("../../../test/stubs/capacitor-core")
+  >("../../../test/stubs/capacitor-core");
+  return {
+    ...canonical,
+    Capacitor: {
+      ...canonical.Capacitor,
+      isNativePlatform: () => capacitorState.isNative,
+    },
+  };
+});
 
 // The query gate every cloud domain shares (analytics, api-keys, mcps,
 // applications, approvals, instances) must resolve the session the same way

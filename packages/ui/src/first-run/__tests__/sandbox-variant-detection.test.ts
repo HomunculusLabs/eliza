@@ -26,11 +26,18 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("@capacitor/core", () => ({
-  Capacitor: {
-    isNativePlatform: () => true,
-  },
-}));
+vi.mock("@capacitor/core", async () => {
+  const canonical = await vi.importActual<
+    typeof import("../../../test/stubs/capacitor-core")
+  >("../../../test/stubs/capacitor-core");
+  return {
+    ...canonical,
+    Capacitor: {
+      ...canonical.Capacitor,
+      isNativePlatform: () => true,
+    },
+  };
+});
 
 vi.mock("@capacitor/preferences", () => ({
   Preferences: {

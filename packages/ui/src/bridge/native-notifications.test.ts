@@ -18,12 +18,19 @@ vi.mock("@elizaos/logger", () => ({
   logger: { info: loggerInfo },
 }));
 
-vi.mock("@capacitor/core", () => ({
-  Capacitor: {
-    getPlatform: () => platform.value,
-    isNativePlatform: () => platform.value !== "web",
-  },
-}));
+vi.mock("@capacitor/core", async () => {
+  const canonical = await vi.importActual<
+    typeof import("../../test/stubs/capacitor-core")
+  >("../../test/stubs/capacitor-core");
+  return {
+    ...canonical,
+    Capacitor: {
+      ...canonical.Capacitor,
+      getPlatform: () => platform.value,
+      isNativePlatform: () => platform.value !== "web",
+    },
+  };
+});
 
 vi.mock("./native-plugins", () => ({
   getNativePlugin: (name: string) => plugins[name] ?? {},

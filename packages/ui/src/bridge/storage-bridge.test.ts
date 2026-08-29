@@ -33,12 +33,19 @@ const mockDesktopSecure = {
   failRemovals: false,
 };
 
-vi.mock("@capacitor/core", () => ({
-  Capacitor: {
-    getPlatform: () => (mockRuntime.native ? "android" : "web"),
-    isNativePlatform: () => mockRuntime.native,
-  },
-}));
+vi.mock("@capacitor/core", async () => {
+  const canonical = await vi.importActual<
+    typeof import("../../test/stubs/capacitor-core")
+  >("../../test/stubs/capacitor-core");
+  return {
+    ...canonical,
+    Capacitor: {
+      ...canonical.Capacitor,
+      getPlatform: () => (mockRuntime.native ? "android" : "web"),
+      isNativePlatform: () => mockRuntime.native,
+    },
+  };
+});
 
 vi.mock("@capacitor/preferences", () => ({
   Preferences: {

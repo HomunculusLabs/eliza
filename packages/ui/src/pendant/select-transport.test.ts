@@ -6,12 +6,19 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 // Mock @capacitor/core so we can flip platform per test.
 const capacitorState = { native: false, platform: "web" as string };
-vi.mock("@capacitor/core", () => ({
-  Capacitor: {
-    isNativePlatform: () => capacitorState.native,
-    getPlatform: () => capacitorState.platform,
-  },
-}));
+vi.mock("@capacitor/core", async () => {
+  const canonical = await vi.importActual<
+    typeof import("../../test/stubs/capacitor-core")
+  >("../../test/stubs/capacitor-core");
+  return {
+    ...canonical,
+    Capacitor: {
+      ...canonical.Capacitor,
+      isNativePlatform: () => capacitorState.native,
+      getPlatform: () => capacitorState.platform,
+    },
+  };
+});
 
 import { NativeBlePendantTransport } from "./native-ble-transport";
 import {

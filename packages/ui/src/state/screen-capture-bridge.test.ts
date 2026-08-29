@@ -5,9 +5,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Make isNativeMobile() true and the capture plugin present so the poller runs.
-vi.mock("@capacitor/core", () => ({
-  Capacitor: { getPlatform: () => "android" },
-}));
+vi.mock("@capacitor/core", async () => {
+  const canonical = await vi.importActual<
+    typeof import("../../test/stubs/capacitor-core")
+  >("../../test/stubs/capacitor-core");
+  return {
+    ...canonical,
+    Capacitor: {
+      ...canonical.Capacitor,
+      getPlatform: () => "android",
+    },
+  };
+});
 vi.mock("../bridge/native-plugins", () => ({
   getScreenCapturePlugin: () => ({}),
 }));

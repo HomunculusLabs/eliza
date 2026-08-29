@@ -36,10 +36,23 @@ import {
   vi,
 } from "vitest";
 
-vi.mock("@capacitor/core", () => ({
-  Capacitor: { isNativePlatform: () => false },
-  CapacitorHttp: { get: vi.fn(), post: vi.fn(), request: vi.fn() },
-}));
+vi.mock("@capacitor/core", async () => {
+  const canonical = await vi.importActual<
+    typeof import("../../test/stubs/capacitor-core")
+  >("../../test/stubs/capacitor-core");
+  return {
+    ...canonical,
+    Capacitor: {
+      ...canonical.Capacitor,
+      isNativePlatform: () => false,
+    },
+    CapacitorHttp: {
+      get: vi.fn(),
+      post: vi.fn(),
+      request: vi.fn(),
+    },
+  };
+});
 
 import { DEFAULT_BOOT_CONFIG, setBootConfig } from "../config/boot-config";
 import { ElizaClient } from "./client-base";
@@ -846,9 +859,13 @@ describe("mock-cloud connect e2e — dedicated cold boot + shared chat bridge", 
         authToken: "wrong-token",
         name: "Eliza",
       }),
-    ).rejects.toThrow(
-      /401|unauthorized|cloud request failed|find your agents/i,
-    );
+      // directCloudRequest clears on the authoritative 401 STATUS alone and
+      // deliberately does not consume the body (a rejecting/stalled body must
+      // not be able to mask the status) — see client-cloud.ts and the
+      // "clears an authoritative HTTP 401 without consuming its body" cases in
+      // client-cloud-personal-shared.test.ts. The rejection therefore carries
+      // the status, not the server's error detail.
+    ).rejects.toThrow(/Cloud request failed \(401\)/);
     // No create POST reached the control plane.
     expect(
       state.requests.filter(

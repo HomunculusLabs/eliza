@@ -5,11 +5,21 @@
 // @vitest-environment jsdom
 
 import {
+  registerStewardTokenPersistence,
+  registerStewardTokenRemoval,
   STEWARD_SESSION_CHANGE_EVENT,
   STEWARD_TOKEN_KEY,
   type StewardSessionChangeDetail,
 } from "@elizaos/shared/steward-session-client";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 
 const platform = vi.hoisted(() => ({
   native: false,
@@ -29,14 +39,24 @@ vi.mock("../bridge/electrobun-rpc", async (importOriginal) => ({
   }),
 }));
 
-vi.mock("@capacitor/core", () => ({
-  Capacitor: { isNativePlatform: () => platform.native },
-  CapacitorHttp: {
-    get: vi.fn(),
-    post: vi.fn(),
-    request: platform.request,
-  },
-}));
+
+vi.mock("@capacitor/core", async () => {
+  const canonical = await vi.importActual<
+    typeof import("../../test/stubs/capacitor-core")
+  >("../../test/stubs/capacitor-core");
+  return {
+    ...canonical,
+    Capacitor: {
+      ...canonical.Capacitor,
+      isNativePlatform: () => platform.native,
+    },
+    CapacitorHttp: {
+      get: vi.fn(),
+      post: vi.fn(),
+      request: platform.request,
+    },
+  };
+});
 
 import { setBootConfig } from "../config/boot-config";
 import { ElizaClient } from "./client-base";
@@ -151,6 +171,21 @@ function assertStewardRequests(
   }
 }
 
+// This suite pins the HTTP trust boundary (which transport may reach which
+// origin with which credential). The durable native/desktop protected-store
+// removal boundary has its own contract suite
+// (src/bridge/storage-bridge-secure-contract.test.ts); storage-bridge.ts
+// installs its protected-store handlers at module scope, so re-register
+// localStorage-backed handlers here to keep this suite on its subject.
+const disposeStewardRemoval = registerStewardTokenRemoval(async () => {
+  await window.localStorage.removeItem(STEWARD_TOKEN_KEY);
+});
+const disposeStewardPersistence = registerStewardTokenPersistence(
+  async (token: string) => {
+    await window.localStorage.setItem(STEWARD_TOKEN_KEY, token);
+  },
+);
+
 beforeEach(() => {
   platform.native = false;
   platform.request.mockReset();
@@ -169,6 +204,11 @@ afterEach(() => {
     Object.defineProperty(window, "location", originalLocationDescriptor);
   }
   vi.restoreAllMocks();
+});
+
+afterAll(() => {
+  disposeStewardPersistence();
+  disposeStewardRemoval();
 });
 
 describe("dedicated Cloud account boundary on trusted app shells", () => {

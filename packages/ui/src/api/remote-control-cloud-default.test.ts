@@ -9,10 +9,23 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("@capacitor/core", () => ({
-  Capacitor: { isNativePlatform: () => false },
-  CapacitorHttp: { get: vi.fn(), post: vi.fn(), request: vi.fn() },
-}));
+vi.mock("@capacitor/core", async () => {
+  const canonical = await vi.importActual<
+    typeof import("../../test/stubs/capacitor-core")
+  >("../../test/stubs/capacitor-core");
+  return {
+    ...canonical,
+    Capacitor: {
+      ...canonical.Capacitor,
+      isNativePlatform: () => false,
+    },
+    CapacitorHttp: {
+      get: vi.fn(),
+      post: vi.fn(),
+      request: vi.fn(),
+    },
+  };
+});
 
 import { STEWARD_TOKEN_KEY } from "@elizaos/shared/steward-session-client";
 import { getBootConfig, setBootConfig } from "../config/boot-config";

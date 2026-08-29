@@ -91,14 +91,19 @@ vi.mock("../api", () => ({
 // loads cleanly under jsdom. We deliberately do NOT mock client-cloud: these
 // freeze tests must exercise the production `isDirectCloudSharedAgentBase`
 // classifier, not a hand-copied regex that can silently drift from it.
-vi.mock("@capacitor/core", () => ({
-  Capacitor: {
-    isNativePlatform: () => false,
-    getPlatform: () => "web",
-    registerPlugin: () => ({}),
-  },
-  CapacitorHttp: { get: vi.fn(), post: vi.fn(), request: vi.fn() },
-}));
+vi.mock("@capacitor/core", async () => {
+  const canonical = await vi.importActual<
+    typeof import("../../test/stubs/capacitor-core")
+  >("../../test/stubs/capacitor-core");
+  return {
+    ...canonical,
+    Capacitor: {
+      ...canonical.Capacitor,
+      isNativePlatform: () => false,
+      getPlatform: () => "web",
+    },
+  };
+});
 
 function conversation(id: string, roomId: string): Conversation {
   return {

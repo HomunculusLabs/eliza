@@ -35,11 +35,18 @@ const { capacitorState, preferencesRemoveMock, preferencesSetMock } =
     preferencesSetMock: vi.fn(async (_input: PreferencesSetInput) => undefined),
   }));
 
-vi.mock("@capacitor/core", () => ({
-  Capacitor: {
-    isNativePlatform: () => capacitorState.isNative,
-  },
-}));
+vi.mock("@capacitor/core", async () => {
+  const canonical = await vi.importActual<
+    typeof import("../../../test/stubs/capacitor-core")
+  >("../../../test/stubs/capacitor-core");
+  return {
+    ...canonical,
+    Capacitor: {
+      ...canonical.Capacitor,
+      isNativePlatform: () => capacitorState.isNative,
+    },
+  };
+});
 
 vi.mock("@capacitor/preferences", () => ({
   Preferences: {

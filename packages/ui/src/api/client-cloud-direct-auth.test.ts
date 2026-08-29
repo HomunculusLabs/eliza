@@ -10,16 +10,23 @@ const capacitorMocks = vi.hoisted(() => ({
   request: vi.fn(),
 }));
 
-vi.mock("@capacitor/core", () => ({
-  Capacitor: {
-    isNativePlatform: () => true,
-  },
-  CapacitorHttp: {
-    get: capacitorMocks.get,
-    post: capacitorMocks.post,
-    request: capacitorMocks.request,
-  },
-}));
+vi.mock("@capacitor/core", async () => {
+  const canonical = await vi.importActual<
+    typeof import("../../test/stubs/capacitor-core")
+  >("../../test/stubs/capacitor-core");
+  return {
+    ...canonical,
+    Capacitor: {
+      ...canonical.Capacitor,
+      isNativePlatform: () => true,
+    },
+    CapacitorHttp: {
+      get: capacitorMocks.get,
+      post: capacitorMocks.post,
+      request: capacitorMocks.request,
+    },
+  };
+});
 
 import { ElizaClient } from "./client-base";
 import "./client-cloud";

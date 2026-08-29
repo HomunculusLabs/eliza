@@ -11,14 +11,23 @@ const { capacitorHttpRequestMock, capacitorState } = vi.hoisted(() => ({
   capacitorState: { isNative: false },
 }));
 
-vi.mock("@capacitor/core", () => ({
-  Capacitor: { isNativePlatform: () => capacitorState.isNative },
-  CapacitorHttp: {
-    get: vi.fn(),
-    post: vi.fn(),
-    request: capacitorHttpRequestMock,
-  },
-}));
+vi.mock("@capacitor/core", async () => {
+  const canonical = await vi.importActual<
+    typeof import("../../test/stubs/capacitor-core")
+  >("../../test/stubs/capacitor-core");
+  return {
+    ...canonical,
+    Capacitor: {
+      ...canonical.Capacitor,
+      isNativePlatform: () => capacitorState.isNative,
+    },
+    CapacitorHttp: {
+      get: vi.fn(),
+      post: vi.fn(),
+      request: capacitorHttpRequestMock,
+    },
+  };
+});
 
 import {
   loadAgentProfileRegistry,

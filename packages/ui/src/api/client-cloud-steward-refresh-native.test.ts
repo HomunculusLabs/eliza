@@ -13,14 +13,21 @@ const capacitorMocks = vi.hoisted(() => ({
   request: vi.fn(),
 }));
 
-vi.mock("@capacitor/core", () => ({
-  Capacitor: {
-    isNativePlatform: () => true,
-  },
-  CapacitorHttp: {
-    request: capacitorMocks.request,
-  },
-}));
+vi.mock("@capacitor/core", async () => {
+  const canonical = await vi.importActual<
+    typeof import("../../test/stubs/capacitor-core")
+  >("../../test/stubs/capacitor-core");
+  return {
+    ...canonical,
+    Capacitor: {
+      ...canonical.Capacitor,
+      isNativePlatform: () => true,
+    },
+    CapacitorHttp: {
+      request: capacitorMocks.request,
+    },
+  };
+});
 
 vi.mock("../bridge/electrobun-runtime", () => ({
   isElectrobunRuntime: () => false,

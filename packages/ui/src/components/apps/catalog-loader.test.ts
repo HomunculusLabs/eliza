@@ -28,11 +28,18 @@ vi.mock("../../api", () => ({
   },
 }));
 
-vi.mock("@capacitor/core", () => ({
-  Capacitor: {
-    getPlatform: () => capacitorState.platform,
-  },
-}));
+vi.mock("@capacitor/core", async () => {
+  const canonical = await vi.importActual<
+    typeof import("../../../test/stubs/capacitor-core")
+  >("../../../test/stubs/capacitor-core");
+  return {
+    ...canonical,
+    Capacitor: {
+      ...canonical.Capacitor,
+      getPlatform: () => capacitorState.platform,
+    },
+  };
+});
 
 vi.stubGlobal("Capacitor", {
   getPlatform: () => capacitorState.platform,

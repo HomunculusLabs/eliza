@@ -9,14 +9,21 @@ const { capacitorState, capacitorHttpRequestMock } = vi.hoisted(() => ({
   capacitorHttpRequestMock: vi.fn(),
 }));
 
-vi.mock("@capacitor/core", () => ({
-  Capacitor: {
-    isNativePlatform: () => capacitorState.isNative,
-  },
-  CapacitorHttp: {
-    request: capacitorHttpRequestMock,
-  },
-}));
+vi.mock("@capacitor/core", async () => {
+  const canonical = await vi.importActual<
+    typeof import("../../test/stubs/capacitor-core")
+  >("../../test/stubs/capacitor-core");
+  return {
+    ...canonical,
+    Capacitor: {
+      ...canonical.Capacitor,
+      isNativePlatform: () => capacitorState.isNative,
+    },
+    CapacitorHttp: {
+      request: capacitorHttpRequestMock,
+    },
+  };
+});
 
 import { DEFAULT_DIRECT_CLOUD_API_BASE_URL } from "./direct-cloud-endpoints";
 import { nativeCloudHttpTransportForUrl } from "./native-cloud-http-transport";
