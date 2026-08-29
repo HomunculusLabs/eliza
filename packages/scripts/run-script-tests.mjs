@@ -476,9 +476,10 @@ export function runScriptTests(options = {}) {
         }),
       );
     }
-    throw new Error("could not start Bun script-test runner", {
-      cause: result.error,
-    });
+    throw new Error(
+      `could not start Bun script-test runner: ${result.error.message}`,
+      { cause: result.error },
+    );
   }
   const childExitCode =
     typeof result.status === "number" && result.signal === null

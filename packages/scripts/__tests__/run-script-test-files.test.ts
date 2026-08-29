@@ -1,4 +1,4 @@
-/** Verifies the isolated script-test runner rejects invalid bounds before execution. */
+/** Verifies the isolated script-test runner argument bounds and failure attribution. */
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -85,7 +85,7 @@ describe("isolated script-test runner arguments", () => {
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain(
-      `[script-tests] failed: ${missingTestFile} (exit 1)`,
+      `[script-tests] file=${missingTestFile} exitCode=1 signal=null`,
     );
   });
 });
@@ -174,6 +174,38 @@ describe("isolated script-test runner failure attribution", () => {
     expect(result.stderr).toContain("1 of 1 script test file(s) failed");
     expect(result.stderr).toContain("exitCode=1");
     expect(result.stderr).toContain("signal=SIGKILL");
+  });
+
+  test("a spawn error prints the underlying cause alongside the file attribution", () => {
+    const fixture = temporaryFixture(
+      "needs-bun.test.ts",
+      'import { expect, test } from "bun:test"; test("runs", () => expect(1).toBe(1));\n',
+    );
+    const emptyBin = path.join(fixture.root, "empty-bin");
+    fs.mkdirSync(emptyBin, { recursive: true });
+    const result = spawnSync(
+      process.execPath,
+      [
+        driver,
+        "--concurrency=1",
+        `--config=${repoBunfig}`,
+        "--",
+        path.join(fixture.root, "needs-bun.test.ts"),
+      ],
+      {
+        cwd: fixture.root,
+        env: { ...process.env, PATH: emptyBin },
+        encoding: "utf8",
+      },
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("1 of 1 script test file(s) failed");
+    expect(result.stderr).toContain(
+      `file=${path.join(fixture.root, "needs-bun.test.ts")} exitCode=1 signal=null`,
+    );
+    expect(result.stderr).toContain("error=");
+    expect(result.stderr).toContain("Executable not found");
   });
 
   test("the per-file child receives the bunfig script-tests config before the test command", () => {

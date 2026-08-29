@@ -147,10 +147,18 @@ function mergeJunit(fragments, destination) {
   const totals = { tests: 0, assertions: 0, failures: 0, skipped: 0 };
   const bodies = [];
   for (const { file, path: fragmentPath } of fragments) {
-    const { body, counts } = rootCounts(
-      readFileSync(fragmentPath, "utf8"),
-      file,
-    );
+    let xml;
+    try {
+      xml = readFileSync(fragmentPath, "utf8");
+    } catch (error) {
+      // error-policy:J2 wrap fragment-read failures with the source test file
+      // so a missing/partial fragment attributes to a real path, not a temp one.
+      throw new Error(
+        `JUnit fragment for ${file} is unreadable: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+    const { body, counts } = rootCounts(xml, file);
     for (const key of Object.keys(totals)) totals[key] += counts[key];
     bodies.push(body);
   }
