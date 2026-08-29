@@ -2066,3 +2066,72 @@ describe("money-spend questions route to the finances reader (non-possessive)", 
 		}
 	});
 });
+
+// #29915: a declarative view-state sentence must surface a view-surface
+// candidate for every state adjective the current-view inspection layer itself
+// recognizes ("open" through the `open` operation group, "active"/"visible"
+// through VIEW_STATE_ADJECTIVE_TOKENS), while the adjective alone — with no UI
+// surface noun — must never constitute operation evidence.
+describe("view-state adjective parity (open vs active/visible, #29915)", () => {
+	const viewsAction: Pick<Action, "name" | "similes" | "tags"> = {
+		name: "VIEWS",
+		similes: ["VIEW", "SHOW_VIEW", "OPEN_VIEW", "OPEN_SETTINGS"],
+		tags: ["views", "ui", "panel", "view-capability", "settings"],
+	};
+
+	// The full matrix from the issue: {this, the} x {screen, window, view} x
+	// {is, remains, stays} x {active, open, visible} — 54 combinations, every
+	// one a declarative view-state sentence that must route identically.
+	it.each(
+		["this", "the"].flatMap((determiner) =>
+			["screen", "window", "view"].flatMap((noun) =>
+				["is", "remains", "stays"].flatMap((verb) =>
+					["active", "open", "visible"].map(
+						(state) => `${determiner} ${noun} ${verb} ${state}`,
+					),
+				),
+			),
+		),
+	)('produces a VIEWS/view-surface candidate for "%s"', (message: string) => {
+		expect(
+			inferDirectCurrentRequestCandidateInference([viewsAction], message),
+		).toEqual({ names: ["VIEWS"], kind: "view-surface" });
+	});
+
+	it("matches plural view surfaces the same way", () => {
+		expect(
+			inferDirectCurrentRequestCandidateInference(
+				[viewsAction],
+				"the windows are active",
+			),
+		).toEqual({ names: ["VIEWS"], kind: "view-surface" });
+	});
+
+	it("does not treat a bare state adjective as view evidence (#17028)", () => {
+		for (const message of [
+			"stay active and healthy",
+			"active reminders",
+			"active goals",
+			"active notifications",
+			"is the budget visible",
+			"the reminder is active",
+			"make the status visible",
+		]) {
+			expect(
+				inferDirectCurrentRequestCandidateInference([viewsAction], message),
+			).toEqual({ names: [], kind: null });
+		}
+	});
+
+	it("keeps read-only current-view questions off the navigation path", () => {
+		for (const message of [
+			"tell me what the current screen is",
+			"what is the active screen",
+			"identify the current view",
+		]) {
+			expect(
+				inferDirectCurrentRequestCandidateInference([viewsAction], message),
+			).toEqual({ names: [], kind: null });
+		}
+	});
+});

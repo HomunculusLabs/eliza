@@ -1555,6 +1555,29 @@ const VIEW_REQUEST_GENERIC_TOKENS: ReadonlySet<string> = new Set<string>([
 	"WITH",
 ]);
 
+// State adjectives that describe a view ("this view is active"). Like layout
+// directions, they are qualifier evidence, not operations: they carry no
+// imperative force, so they relax only the view-shell detector's evidence
+// gate and can produce a candidate only through the surface-noun leg — the
+// no-surface legs still demand a real operation group. Deliberately NOT in
+// VIEW_REQUEST_OPERATION_GROUPS: making ACTIVE/VISIBLE operation tokens arms
+// the view-capability detector ("active reminders", #17028) and defeats
+// looksLikeCurrentViewInspection, whose adjective-state exemption is
+// OPEN-only. Adding them to VIEW_NAVIGATION_OPERATION_GROUP_NAMES (the
+// reporter's attempt in #29915) is structurally inert — that array selects
+// existing group names and no group named "active"/"visible" exists.
+const VIEW_STATE_ADJECTIVE_TOKENS: ReadonlySet<string> = new Set<string>([
+	"ACTIVE",
+	"VISIBLE",
+]);
+
+/** True when any token declares view state (singular-normalized on the way in). */
+function hasViewStateAdjectiveToken(tokens: readonly string[]): boolean {
+	return tokens.some((token) =>
+		VIEW_STATE_ADJECTIVE_TOKENS.has(normalizeSingularToken(token)),
+	);
+}
+
 const VIEW_REQUEST_SURFACE_TOKENS: ReadonlySet<string> = new Set<string>([
 	"APP",
 	"APPLICATION",
@@ -1861,19 +1884,24 @@ function findViewShellActionName(
 	const tokenSet = new Set(messageTokens);
 	if (
 		messageOperationGroups.size === 0 &&
-		!hasLayoutDirectionToken(messageTokens)
+		!hasLayoutDirectionToken(messageTokens) &&
+		!hasViewStateAdjectiveToken(messageTokens)
 	) {
 		return undefined;
 	}
 
 	// Surface-noun leg: an explicit UI surface plus any operation OR
-	// directional evidence ("move it to the left of the screen").
+	// directional evidence ("move it to the left of the screen"). A view-state
+	// adjective counts as evidence here too — "this screen remains active" is
+	// the same declarative view-state sentence as "this screen remains open",
+	// whose OPEN token reaches this leg through the `open` operation group
+	// (#29915).
 	for (const token of VIEW_REQUEST_SURFACE_TOKENS) {
 		if (tokenSet.has(token)) return viewActionName;
 	}
 
 	// The remaining legs have no surface anchor, so they need a real
-	// operation — a bare direction is not enough.
+	// operation — a bare direction or state adjective is not enough.
 	if (messageOperationGroups.size === 0) return undefined;
 	if (
 		(tokenSet.has("PLUGIN") || tokenSet.has("PLUGINS")) &&
