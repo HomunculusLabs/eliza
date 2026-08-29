@@ -253,7 +253,7 @@ describe("OpenAI REST handler request shapes", () => {
 
     await expect(
       handleImageDescription(createRuntime(), "https://example.com/image.png")
-    ).rejects.toMatchObject({ code: "MODEL_INCOMPLETE_OUTPUT" });
+    ).rejects.toMatchObject({ code: "MODEL_OUTPUT_INCOMPLETE" });
   });
 
   it("rejects blank TTS text and invalid voices before calling the provider", async () => {

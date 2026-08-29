@@ -3003,7 +3003,7 @@ function makeIosNativeGenerateHandler(slot: string): GenerateTextHandler {
 			throw new ElizaError(
 				"The iOS local model exhausted its generation boundary before completing the response",
 				{
-					code: "MODEL_INCOMPLETE_OUTPUT",
+					code: "MODEL_OUTPUT_INCOMPLETE",
 					context: {
 						provider: IOS_NATIVE_LLAMA_PROVIDER,
 						modelId: nativeLlamaState.modelId,

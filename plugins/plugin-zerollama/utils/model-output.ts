@@ -21,7 +21,7 @@ export function assertCompleteOllamaGeneration(
   throw new ElizaError(
     `${provider} reached its output boundary; refusing to return partial model output`,
     {
-      code: "MODEL_INCOMPLETE_OUTPUT",
+      code: "MODEL_OUTPUT_INCOMPLETE",
       context: { provider, finishReason },
     }
   );
@@ -36,7 +36,7 @@ export function assertZerollamaStreamTerminated(finishReason: string | undefined
   throw new ElizaError(
     "zerollama stream ended without a terminal event; refusing potentially partial model output",
     {
-      code: "MODEL_INCOMPLETE_OUTPUT",
+      code: "MODEL_OUTPUT_INCOMPLETE",
       context: { provider: "zerollama", finishReason: null },
     }
   );

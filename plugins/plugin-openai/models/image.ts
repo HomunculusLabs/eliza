@@ -238,7 +238,7 @@ export async function handleImageDescription(
       throw new ElizaError(
         "OpenAI reached its output boundary; refusing partial image description",
         {
-          code: "MODEL_INCOMPLETE_OUTPUT",
+          code: "MODEL_OUTPUT_INCOMPLETE",
           context: { provider: "openai", finishReason: "length" },
         }
       );

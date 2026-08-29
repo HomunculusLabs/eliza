@@ -92,7 +92,7 @@ describe("claude CLI stdio budget", () => {
 
     await expect(
       generateViaCli(runtimeStub(), "hello", "claude-test", "TEXT_SMALL")
-    ).rejects.toMatchObject({ code: "MODEL_INCOMPLETE_OUTPUT" });
+    ).rejects.toMatchObject({ code: "MODEL_OUTPUT_INCOMPLETE" });
   });
 
   it("signals a max-token streaming CLI result after its final delta", async () => {
@@ -113,10 +113,10 @@ describe("claude CLI stdio budget", () => {
 
     await expect(async () => {
       for await (const chunk of result.textStream) chunks.push(chunk);
-    }).rejects.toMatchObject({ code: "MODEL_INCOMPLETE_OUTPUT" });
+    }).rejects.toMatchObject({ code: "MODEL_OUTPUT_INCOMPLETE" });
     expect(chunks).toEqual(["partial"]);
-    await expect(result.text).rejects.toMatchObject({ code: "MODEL_INCOMPLETE_OUTPUT" });
-    await expect(result.finishReason).rejects.toMatchObject({ code: "MODEL_INCOMPLETE_OUTPUT" });
+    await expect(result.text).rejects.toMatchObject({ code: "MODEL_OUTPUT_INCOMPLETE" });
+    await expect(result.finishReason).rejects.toMatchObject({ code: "MODEL_OUTPUT_INCOMPLETE" });
   });
 
   it("rejects a never-ending stdout stream instead of awaiting text() forever", async () => {

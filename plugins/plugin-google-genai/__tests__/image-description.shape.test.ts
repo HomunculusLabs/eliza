@@ -245,6 +245,6 @@ describe("Google GenAI image description", () => {
         createRuntime(),
         "https://example.com/partial.png",
       ),
-    ).rejects.toMatchObject({ code: "MODEL_INCOMPLETE_OUTPUT" });
+    ).rejects.toMatchObject({ code: "MODEL_OUTPUT_INCOMPLETE" });
   });
 });

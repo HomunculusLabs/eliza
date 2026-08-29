@@ -4,7 +4,7 @@
  * failures; `formatModelError` produces a caller-facing message and
  * `sanitizeUrlForLogs` strips secrets from URLs before they reach the logger.
  */
-import { isElizaError, logger } from "@elizaos/core";
+import { ElizaError, isElizaError, logger } from "@elizaos/core";
 
 interface RetryConfig {
   readonly maxRetries: number;
@@ -149,9 +149,6 @@ export async function executeWithRetry<T>(
 }
 
 export function formatModelError(operationName: string, error: unknown): Error {
-  if (isElizaError(error)) {
-    return error;
-  }
   const statusCode = getStatusCode(error);
   const providerMessage = readProviderErrorMessage(error);
   let reason = "An unexpected error occurred while processing the request.";
@@ -172,6 +169,17 @@ export function formatModelError(operationName: string, error: unknown): Error {
     reason = "The request timed out. Retry with a shorter prompt or a smaller max token limit.";
   } else if (statusCode === 529 || hasOverloadMessage(error)) {
     reason = "Anthropic is temporarily overloaded. Retry in a moment.";
+  } else if (isElizaError(error)) {
+    // Typed failures (e.g. MODEL_OUTPUT_INCOMPLETE from
+    // assertModelOutputComplete, budget validation) already carry an
+    // actionable code and context; wrap with `cause` so the caller-facing
+    // message adds the operation while the typed contract stays reachable
+    // on `.cause.code` (#29840: never swallow the typed error class).
+    return new ElizaError(`[Anthropic] ${operationName} failed: ${error.message}`, {
+      code: error.code,
+      context: error.context,
+      cause: error,
+    });
   } else if (statusCode !== undefined && statusCode >= 500) {
     reason = "Anthropic is temporarily unavailable. Retry in a moment.";
   }
