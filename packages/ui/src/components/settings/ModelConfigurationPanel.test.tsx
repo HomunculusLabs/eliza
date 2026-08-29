@@ -131,6 +131,12 @@ function fixtureCatalog(): ModelCatalog {
           defaultEffort: "xhigh",
           roles: ["coding"],
         },
+        {
+          id: "claude-sonnet-5",
+          display: "Claude Sonnet 5",
+          efforts: ["low", "medium", "high"],
+          roles: ["coding"],
+        },
       ],
       cerebras: [
         {
@@ -186,12 +192,11 @@ function fixtureConfig(): ModelsConfigResponse {
           source: "default",
         },
         ELIZA_CODEX_EFFORT: { value: "medium", source: "config.env" },
-        ELIZA_CLAUDE_MODEL_POWERFUL: null,
-        ELIZA_CLAUDE_EFFORT: null,
-        ELIZA_OPENCODE_MODEL_POWERFUL: {
-          value: "custom-oss-model",
+        ELIZA_CLAUDE_MODEL_POWERFUL: {
+          value: "claude-opus-4-8",
           source: "config.env",
         },
+        ELIZA_CLAUDE_EFFORT: null,
         ELIZA_ELIZAOS_MODEL_POWERFUL: null,
       },
     },
@@ -577,6 +582,30 @@ describe("prefill and option filtering", () => {
       "medium",
       "high",
       "xhigh",
+    ]);
+  });
+
+  it("keeps a configured claude coding model visible and offers its efforts", async () => {
+    await renderReady();
+
+    fill("models-coding-backend", "claude");
+    const options = agentElements.get("models-coding-model")?.options ?? [];
+    // The configured claude-opus-4-8 stays visible in the backend's catalog
+    // slice, so the operator can see (and keep) the active configured model.
+    expect(options).toContain("claude-opus-4-8");
+    // A non-configured catalog model must also appear: this proves the slice
+    // renders from the catalog itself, not merely from preserved config values
+    // (the configured id alone would stay visible even with an empty catalog).
+    expect(options).toContain("claude-sonnet-5");
+    expect(options.every((id) => id !== "gpt-5.6-terra")).toBe(true);
+    // Claude efforts are not clamped (unlike the codex ACP pin), and the
+    // configured model resolves an entry so the effort control appears.
+    expect(agentElements.get("models-coding-effort")?.options).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
     ]);
   });
 

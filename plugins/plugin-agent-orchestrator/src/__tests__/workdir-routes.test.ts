@@ -387,6 +387,13 @@ describe("resolvePinnedAdapter", () => {
     expect(resolvePinnedAdapter(undefined)).toBeUndefined();
   });
 
+  it("resolves an unsupported OpenCode pin to undefined (#29823)", () => {
+    // OpenCode was removed from the supported spawn catalog; a stale operator
+    // pin must fail closed (undefined), never resolve to a legacy adapter.
+    process.env.ELIZA_DEFAULT_AGENT_TYPE = "opencode";
+    expect(resolvePinnedAdapter(undefined)).toBeUndefined();
+  });
+
   it("normalises case", () => {
     process.env.ELIZA_DEFAULT_AGENT_TYPE = "CODEX";
     expect(resolvePinnedAdapter(undefined)).toBe("codex");
