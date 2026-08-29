@@ -1432,6 +1432,31 @@ export function createScheduledTaskRunner(
         throw new Error(`edit: ${key} is read-only`);
       }
     }
+    // An edit must never persist a task `schedule()` would have rejected:
+    // validate the post-edit shape with the same structural validation and
+    // A11 channel-key registration check before mutating the stored record
+    // (#29956 — a corrupt trigger silently drops the row from the
+    // next_fire_at index; an unregistered channelKey breaks dispatch).
+    const { taskId: _taskId, state: _state, ...editable } = task;
+    const candidate = { ...editable, ...payload };
+    const validationIssues = validateScheduledTaskInput(candidate, deps);
+    if (validationIssues.length > 0) {
+      throw new ScheduledTaskValidationError(
+        validationIssues,
+        `edit:${task.taskId}`,
+      );
+    }
+    if (deps.channelKeys && candidate.escalation?.steps) {
+      const registered = deps.channelKeys();
+      for (const step of candidate.escalation.steps) {
+        if (!registered.has(step.channelKey)) {
+          throw new ChannelKeyError(
+            step.channelKey,
+            Array.from(registered).sort(),
+          );
+        }
+      }
+    }
     Object.assign(task, payload);
     await persist(task);
     await logger.log(task.taskId, "edited", {
