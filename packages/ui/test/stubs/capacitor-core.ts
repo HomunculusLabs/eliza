@@ -76,9 +76,14 @@ function createPluginStub(name: string): CanonicalCapacitorPluginStub {
   };
   // Unknown methods still surface as callable (matching the runtime proxy
   // shape) and reject with a descriptive error when invoked without an
-  // implementation.
+  // implementation. `then` is special-cased to undefined so registered
+  // plugins are never accidentally thenable — a synthetic `then` callable
+  // would make Promise.resolve(plugin) hang on a never-settling callback.
   return new Proxy(base as CanonicalCapacitorPluginStub, {
     get(target, prop: string) {
+      if (prop === "then") {
+        return undefined;
+      }
       if (prop in target) {
         return target[prop as keyof CanonicalPluginBase];
       }

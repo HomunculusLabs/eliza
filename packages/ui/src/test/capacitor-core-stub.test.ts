@@ -92,6 +92,16 @@ describe("canonical @capacitor/core stub contract", () => {
     );
   });
 
+  it("never makes registered plugins accidentally thenable", async () => {
+    canonical.__resetCapacitorForTests();
+    const plugin = canonical.Capacitor.registerPlugin("Probe");
+    // A synthetic `then` callable would make Promise.resolve(plugin) invoke a
+    // never-settling callback and hang the awaiting caller.
+    expect((plugin as { then?: unknown }).then).toBeUndefined();
+    const resolved = await Promise.resolve(plugin);
+    expect(resolved).toBe(plugin);
+  });
+
   it("keeps listener add/remove semantics intact on registered plugins", async () => {
     canonical.__resetCapacitorForTests();
     const plugin = canonical.Capacitor.registerPlugin("Probe");

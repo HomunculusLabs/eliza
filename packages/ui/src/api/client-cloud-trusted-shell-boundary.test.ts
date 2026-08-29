@@ -39,7 +39,6 @@ vi.mock("../bridge/electrobun-rpc", async (importOriginal) => ({
   }),
 }));
 
-
 vi.mock("@capacitor/core", async () => {
   const canonical = await vi.importActual<
     typeof import("../../test/stubs/capacitor-core")
