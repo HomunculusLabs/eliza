@@ -110,6 +110,16 @@ describe("dist packaging (#15779)", () => {
     expect(existsSync(distFile("index.browser.js"))).toBe(false);
   });
 
+  it("the appRegister side-effect subpath keeps runtime and declaration artifacts", () => {
+    // The `elizaos.appRegister` entry is excluded from tsc declaration emit
+    // (its dynamic import would drag vite-only components into dist, #29841);
+    // a build.ts dtsShim supplies its declaration. Both halves must exist or
+    // external default-condition TS consumers of the `./register` subpath
+    // (types: ./dist/*.d.ts) get TS2307 with every in-repo gate green.
+    expect(existsSync(distFile("register.js"))).toBe(true);
+    expect(existsSync(distFile("register.d.ts"))).toBe(true);
+  });
+
   it("a default-conditions Node process resolves the bare package to the built node entry", () => {
     const result = spawnSync(
       "node",
