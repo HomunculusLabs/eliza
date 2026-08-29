@@ -624,7 +624,6 @@ scopeHealth: ${JSON.stringify(health)}`;
     ) => {
       if (actual.decision !== expected) {
         signature = await dumpAuthorityState(stage);
-        console.error(signature);
       }
       expect(actual.decision, `${why}\n${signature}`).toBe(expected);
     };
@@ -659,8 +658,11 @@ scopeHealth: ${JSON.stringify(health)}`;
       reason: "bot_removed",
     });
 
-    // A backlogged join redelivery (observed AFTER the removal) must NOT
-    // advance the scope back to current — the tombstone holds.
+    // A backlogged join redelivery — an event STAMPED before the removal and
+    // delivered late — must NOT advance the scope back to current. (The
+    // t0-1s stamp is deliberate: post-removal-stamped events are covered by
+    // the my_chat_member e2e; do not "correct" it to now(), which would
+    // reintroduce same-millisecond luck against the removal ordering.)
     await authority.recordEvent({
       chatId: String(CHAT_ID),
       chatRoomKey: String(CHAT_ID),
