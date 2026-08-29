@@ -9,6 +9,7 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
+import type { CanonicalCapacitorPluginStub } from "../../test/stubs/capacitor-core";
 
 const canonical = await vi.importActual<
   typeof import("../../test/stubs/capacitor-core")
@@ -62,15 +63,46 @@ describe("canonical @capacitor/core stub contract", () => {
 
   it("keeps a registered plugin replaceable for suites that exercise it", async () => {
     canonical.__resetCapacitorForTests();
-    const replacement = {
+    // Suites can inject a shaped plugin before importing the consumer module;
+    // a later registerPlugin for the same name returns the replacement.
+    const base = canonical.Capacitor.registerPlugin("Shaped");
+    const shaped: CanonicalCapacitorPluginStub = {
+      addListener: (eventName, listener) =>
+        base.addListener(eventName, listener),
+      removeListener: (eventName, listener) =>
+        base.removeListener(eventName, listener),
+      removeAllListeners: (eventName) => base.removeAllListeners(eventName),
       start: async () => ({ ok: true }),
     };
-    canonical.__setPluginForTests("Probe", replacement);
-    // A later registerPlugin for the same name returns the replacement, so
-    // suites can inject a shaped plugin before importing the consumer module.
+    canonical.__setPluginForTests("Probe", shaped);
     const plugin = canonical.Capacitor.registerPlugin("Probe");
-    expect(plugin).toBe(replacement);
+    expect(plugin).toBe(shaped);
     await expect(plugin.start()).resolves.toEqual({ ok: true });
+  });
+
+  it("exposes callable methods on registered plugins, rejecting unimplemented ones descriptively", async () => {
+    canonical.__resetCapacitorForTests();
+    const plugin = canonical.Capacitor.registerPlugin("Probe");
+    // Unknown methods must be callable (runtime proxy shape), not undefined —
+    // production code reaching an unmocked method gets the runtime-style
+    // descriptive rejection, never "undefined is not a function".
+    expect(typeof plugin.getOrCreateIdentity).toBe("function");
+    await expect(plugin.getOrCreateIdentity()).rejects.toThrow(
+      /not implemented in the canonical test stub/,
+    );
+  });
+
+  it("keeps listener add/remove semantics intact on registered plugins", async () => {
+    canonical.__resetCapacitorForTests();
+    const plugin = canonical.Capacitor.registerPlugin("Probe");
+    const events: unknown[] = [];
+    const listener = (event: unknown) => events.push(event);
+    const handle = await plugin.addListener("state", listener);
+    expect(typeof handle.remove).toBe("function");
+    await plugin.removeAllListeners();
+    expect(typeof plugin.removeListener).toBe("function");
+    // removeListener is callable and settles.
+    await plugin.removeListener("state", listener);
   });
 
   it("exposes the CapacitorHttp surface suites override per-case", () => {
