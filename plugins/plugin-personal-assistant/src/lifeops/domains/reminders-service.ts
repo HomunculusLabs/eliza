@@ -1147,6 +1147,15 @@ export class RemindersDomain {
    */
   private telemetryRollupLastRunDate: string | null = null;
   private readonly loggedMorningCheckinSuppressionKeys = new Set<string>();
+  /**
+   * Episode key of the last foreign-block conflict notice emitted by
+   * `syncWebsiteAccessState` (#29888). The sweep ticks every ~60s and a manual
+   * indefinite block can hold the conflict open for days, so without episode
+   * dedup the owner-visible notice would repeat on every tick. Cleared to null
+   * whenever the conflict branch is not taken so a later episode re-notifies;
+   * one repeat per process restart is acceptable.
+   */
+  private lastWebsiteAccessConflictNoticeKey: string | null = null;
 
   protected async emitInAppReminderNudge(args: {
     text: string;
@@ -4238,6 +4247,34 @@ export class RemindersDomain {
     const activeLifeOpsBlock = status.active && status.managedBy === "lifeops";
     if (status.active && !activeLifeOpsBlock) {
       if (blockedWebsites.length > 0) {
+        // #29888: a foreign block (manual, block-rule, or native backend)
+        // holds the OS slot while coverage is demanded. Do not silently
+        // swallow the lapse — tell the owner once per conflict episode and
+        // keep the demand visible until the foreign block ends.
+        const conflictKey = `${status.managedBy ?? "null"}:${blockedWebsites.join(",")}`;
+        if (this.lastWebsiteAccessConflictNoticeKey !== conflictKey) {
+          this.lastWebsiteAccessConflictNoticeKey = conflictKey;
+          const conflictContext = {
+            managedBy: status.managedBy,
+            currentWebsites: status.websites,
+            blockedWebsites,
+            blockedGroups,
+          };
+          const delivered = this.ctx.emitAssistantEvent(
+            `Heads up: the websites ${blockedWebsites.join(", ")} are supposed to be blocked by LifeOps earned access, but another website block (started outside LifeOps${status.managedBy ? `, managed by ${status.managedBy}` : ""}) is already active, so LifeOps enforcement is paused. Enforced blocking resumes automatically once that block ends. To enforce now, end the other block or ask me to re-lock the group.`,
+            "lifeops-website-access-conflict",
+            conflictContext,
+          );
+          if (!delivered) {
+            // error-policy:J4 assistant stream unavailable — surface the
+            // degraded delivery explicitly instead of fabricated success.
+            this.ctx.logLifeOpsWarn(
+              "website_access_sync",
+              "[lifeops] Website-block conflict notice could not reach the owner: assistant event stream unavailable.",
+              conflictContext,
+            );
+          }
+        }
         this.ctx.logLifeOpsWarn(
           "website_access_sync",
           "[lifeops] Website blocker is already active outside LifeOps; skipping blocker sync.",
@@ -4247,9 +4284,14 @@ export class RemindersDomain {
             blockedWebsites,
           },
         );
+      } else {
+        // No coverage demanded (e.g. a valid unlock window): a foreign block
+        // here is the owner exercising their unlock — not a conflict.
+        this.lastWebsiteAccessConflictNoticeKey = null;
       }
       return;
     }
+    this.lastWebsiteAccessConflictNoticeKey = null;
 
     if (blockedWebsites.length === 0) {
       if (!activeLifeOpsBlock) {
