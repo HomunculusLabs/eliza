@@ -429,7 +429,14 @@ export async function fetchWithSsrfGuard(
 				if (redirectCount > maxRedirects) {
 					cancelResponseBody(response);
 					await release();
-					throw new Error(`Too many redirects (limit: ${maxRedirects})`);
+					// Deterministic policy block, not a transient transport
+					// failure: maxRedirects pinners (managed-provider client,
+					// maps adapter) classify SsrfBlockedError as a
+					// non-retryable ENDPOINT_BLOCKED, while a plain Error
+					// would surface to callers as retryable PROVIDER_NETWORK.
+					throw new SsrfBlockedError(
+						`Too many redirects (limit: ${maxRedirects})`,
+					);
 				}
 				// No redirect response body is consumed by this guard. Dispose it
 				// before parsing or validating the next hop so malformed Location
@@ -439,7 +446,10 @@ export async function fetchWithSsrfGuard(
 				const nextUrl = nextParsedUrl.toString();
 				if (visited.has(nextUrl)) {
 					await release();
-					throw new Error("Redirect loop detected");
+					// Deterministic policy block (same rationale as the
+					// redirect-limit overflow above): a loop can never succeed
+					// on retry and must not classify as a transient failure.
+					throw new SsrfBlockedError("Redirect loop detected");
 				}
 				visited.add(nextUrl);
 				// 301/302 on a POST, and any 303, are rewritten to a bodyless GET

@@ -363,6 +363,28 @@ describe("ManagedProviderHttpClient", () => {
 		).rejects.toMatchObject({ code: "PROVIDER_REJECTED" });
 	});
 
+	it("classifies an upstream redirect attempt as ENDPOINT_BLOCKED, not a retryable network failure", async () => {
+		// The client pins maxRedirects to zero; a provider answering 3xx is a
+		// deterministic policy block. It must classify as ENDPOINT_BLOCKED —
+		// plugin action boundaries mark PROVIDER_NETWORK retryable, so a plain
+		// transport classification would tell the planner to retry a block.
+		const redirect = managedClient(
+			async () =>
+				new Response(null, {
+					status: 302,
+					headers: { location: "https://elsewhere.example.test/x" },
+				}),
+		);
+		const failure = await redirect
+			.requestJson(redirect.url("/items"), { method: "GET" }, itemsSchema)
+			.then(
+				() => null,
+				(error: unknown) => error,
+			);
+		expect(failure).toBeInstanceOf(ManagedProviderError);
+		expect(failure).toMatchObject({ code: "ENDPOINT_BLOCKED" });
+	});
+
 	it("rejects private, blocked, and plain-HTTP origins outside the test seam", () => {
 		expect(
 			() =>

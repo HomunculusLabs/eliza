@@ -485,3 +485,53 @@ describe("method + body across redirects", () => {
 		await release();
 	});
 });
+
+describe("redirect policy violations classify as network-policy blocks", () => {
+	it("throws SsrfBlockedError (not a plain Error) when the redirect budget is exhausted", async () => {
+		const fetchImpl = vi.fn(
+			async () =>
+				new Response(null, {
+					status: 302,
+					headers: { location: "https://hop.example.com/next" },
+				}),
+		);
+		// maxRedirects: 0 mirrors the managed-provider client and maps adapter,
+		// which pin the redirect budget to zero and must see a policy block —
+		// a plain Error here would surface as retryable PROVIDER_NETWORK.
+		const failure = await fetchWithSsrfGuard({
+			url: "https://example.com/page",
+			fetchImpl,
+			maxRedirects: 0,
+		}).then(
+			() => null,
+			(error: unknown) => error,
+		);
+		expect(failure).toBeInstanceOf(SsrfBlockedError);
+		expect((failure as Error).message).toContain("Too many redirects");
+	});
+
+	it("throws SsrfBlockedError when a redirect chain revisits the same URL", async () => {
+		const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+			if (String(input).includes("loop-a")) {
+				return new Response(null, {
+					status: 302,
+					headers: { location: "https://example.com/loop-b" },
+				});
+			}
+			return new Response(null, {
+				status: 302,
+				headers: { location: "https://example.com/loop-a" },
+			});
+		});
+		const failure = await fetchWithSsrfGuard({
+			url: "https://example.com/loop-a",
+			fetchImpl,
+			maxRedirects: 10,
+		}).then(
+			() => null,
+			(error: unknown) => error,
+		);
+		expect(failure).toBeInstanceOf(SsrfBlockedError);
+		expect((failure as Error).message).toContain("Redirect loop detected");
+	});
+});
