@@ -83,6 +83,10 @@ function terminate(child) {
   }
 }
 
+function formatError(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function runOne(file, options, fragmentPath, active) {
   return new Promise((resolve) => {
     const args = [
@@ -112,7 +116,7 @@ function runOne(file, options, fragmentPath, active) {
     child.once("error", (error) => {
       clearTimeout(timer);
       active.delete(child);
-      resolve({ error, exitCode: 1, file, timedOut });
+      resolve({ error, exitCode: 1, file, signal: null, timedOut });
     });
     child.once("exit", (code, signal) => {
       clearTimeout(timer);
@@ -178,27 +182,31 @@ export async function runIsolatedScriptTests(options) {
         runOne(file, options, fragmentPath, active),
       options.concurrency,
     );
-    const failures = results
-      .map((result, index) => ({ file: fragments[index].file, result }))
-      .filter(
-        ({ result }) =>
-          !result.ok || result.value.exitCode !== 0 || result.value.timedOut,
-      );
-    for (const failure of failures) {
-      const detail = failure.result.ok
-        ? failure.result.value.timedOut
-          ? "timed out"
-          : `exit ${failure.result.value.exitCode}${failure.result.value.signal ? ` (${failure.result.value.signal})` : ""}`
-        : failure.result.error instanceof Error
-          ? failure.result.error.message
-          : String(failure.result.error);
+    const failureIndexes = results.flatMap((result, index) =>
+      !result.ok || result.value.exitCode !== 0 || result.value.timedOut
+        ? [index]
+        : [],
+    );
+    if (failureIndexes.length > 0) {
       process.stderr.write(
-        `[script-tests] failed: ${failure.file} (${detail})\n`,
+        `[script-tests] ${failureIndexes.length} of ${results.length} script test file(s) failed:\n`,
       );
+      for (const index of failureIndexes) {
+        const result = results[index];
+        if (!result.ok) {
+          process.stderr.write(
+            `[script-tests] file=${fragments[index].file} pool-error=${formatError(result.error)}\n`,
+          );
+          continue;
+        }
+        process.stderr.write(
+          `[script-tests] file=${result.value.file} exitCode=${result.value.exitCode} signal=${result.value.signal ?? "null"}${result.value.timedOut ? " timedOut=true" : ""}${result.value.error ? ` error=${formatError(result.value.error)}` : ""}\n`,
+        );
+      }
     }
-    if (failures.length === 0 && options.junit)
+    if (failureIndexes.length === 0 && options.junit)
       mergeJunit(fragments, options.junit);
-    return failures.length === 0 ? 0 : 1;
+    return failureIndexes.length === 0 ? 0 : 1;
   } finally {
     process.removeListener("SIGTERM", stop);
     process.removeListener("SIGINT", stop);

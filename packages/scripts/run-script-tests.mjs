@@ -504,6 +504,9 @@ export function runScriptTests(options = {}) {
         error: error instanceof Error ? error.message : String(error),
       };
       evidenceExitCode = 1;
+      process.stderr.write(
+        `[script-tests] junit evidence invalid: ${normalizedJunitPath}: ${junit.error}\n`,
+      );
     }
   }
   const exitCode = childExitCode || evidenceExitCode || 0;

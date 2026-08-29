@@ -469,6 +469,44 @@ jobs:
     });
   });
 
+  test("prints a junit evidence diagnostic naming path and error before exiting 1", () => {
+    const file = "packages/scripts/example.test.ts";
+    const synthetic = inventory([file]);
+    const originalWrite = process.stderr.write.bind(process.stderr);
+    const lines: string[] = [];
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      lines.push(
+        typeof chunk === "string" ? chunk : Buffer.from(chunk).toString(),
+      );
+      return true;
+    }) as typeof process.stderr.write;
+    let status: number | undefined;
+    try {
+      status = runScriptTests({
+        inventory: synthetic,
+        junitPath: "reports/script-tests/missing-fragment.xml",
+        reportPath: "reports/script-tests/missing-fragment.json",
+        spawn: () => ({ error: undefined, signal: null, status: 0 }),
+        readJunit: () => {
+          throw Object.assign(
+            new Error("ENOENT: no such file or directory, open 'junit.xml'"),
+            { code: "ENOENT" },
+          );
+        },
+        writeReport: () => {},
+      });
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+    expect(status).toBe(1);
+    const diagnostic = lines.find((line) =>
+      line.includes("[script-tests] junit evidence invalid"),
+    );
+    expect(diagnostic).toBeDefined();
+    expect(diagnostic).toContain("reports/script-tests/missing-fragment.xml");
+    expect(diagnostic).toContain("ENOENT");
+  });
+
   test("contains generated evidence under canonical reports paths", () => {
     expect(
       resolveReportArtifactPath(
