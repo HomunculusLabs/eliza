@@ -12,6 +12,14 @@
  *   - parent directory created with mkdir recursive
  *
  * On failure, the temp file is best-effort removed.
+ *
+ * Same-target writes are serialized through a per-resolved-path tail queue:
+ * on Windows, concurrent `rename` calls that replace the same destination can
+ * fail with EPERM/EBUSY because `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` does
+ * not retry a destination race (delete-pending/FCB hold → ERROR_ACCESS_DENIED).
+ * The queue key is uppercased on Windows only, so differently-cased spellings
+ * of one destination share one queue; the stored tail is rejection-proof so
+ * one failing write never poisons later writes to the same path.
  */
 
 import fs from "node:fs";
@@ -60,22 +68,11 @@ function tmpPathFor(filePath: string): string {
 	return `${filePath}.tmp-${process.pid}-${Date.now()}-${tmpSequenceCounter}`;
 }
 
-function serialize(value: unknown, opts: NormalizedWriteOptions): string {
-	const body = JSON.stringify(value, null, opts.indent);
-	return opts.trailingNewline ? `${body}\n` : body;
-}
-
-function assertFilePath(filePath: string): void {
-	if (typeof filePath !== "string" || filePath.trim().length === 0) {
-		throw new TypeError("filePath must be a non-empty string");
-	}
-}
-
 async function serializeAsyncWrite<T>(
 	filePath: string,
 	write: () => Promise<T>,
 ): Promise<T> {
-	const target = path.resolve(filePath);
+	const target = writeKeyFor(filePath);
 	const previous = asyncWriteTails.get(target) ?? Promise.resolve();
 	const pending = previous.then(write);
 	// error-policy:J5 The returned pending promise reports the write failure to
@@ -89,6 +86,31 @@ async function serializeAsyncWrite<T>(
 		return await pending;
 	} finally {
 		if (asyncWriteTails.get(target) === tail) asyncWriteTails.delete(target);
+	}
+}
+
+/**
+ * Serializes same-target writes. Keyed by the resolved target path,
+ * uppercased on Windows only: NTFS name comparison is case-insensitive via
+ * the OS upcase table (ordinal, non-contextual), so differently-cased
+ * spellings of one destination share one queue. JavaScript `toLowerCase` is
+ * contextual (final-sigma Σ→ς splits keys that Windows treats as one file),
+ * so the uppercase form is used instead; on case-sensitive filesystems the
+ * exact resolved path is used.
+ */
+function writeKeyFor(filePath: string): string {
+	const resolved = path.resolve(filePath);
+	return process.platform === "win32" ? resolved.toUpperCase() : resolved;
+}
+
+function serialize(value: unknown, opts: NormalizedWriteOptions): string {
+	const body = JSON.stringify(value, null, opts.indent);
+	return opts.trailingNewline ? `${body}\n` : body;
+}
+
+function assertFilePath(filePath: string): void {
+	if (typeof filePath !== "string" || filePath.trim().length === 0) {
+		throw new TypeError("filePath must be a non-empty string");
 	}
 }
 
@@ -146,6 +168,11 @@ export function writeJsonAtomicSync(
 		});
 	}
 	const tmp = tmpPathFor(filePath);
+	// Sync commits do not join the async per-target queue: awaiting a promise
+	// chain synchronously is impossible, and sync-vs-sync callers are already
+	// serialized by single-threaded execution. Mixing writeJsonAtomicSync with
+	// an in-flight async write to the same target remains a documented
+	// residual; no production caller mixes the two on one path.
 	try {
 		fs.writeFileSync(tmp, serialize(value, o), {
 			encoding: "utf-8",
