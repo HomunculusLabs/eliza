@@ -1,6 +1,15 @@
 /**
  * HTTP boundary coverage for voice-profile lifecycle management using a real
  * temporary VoiceProfileStore and synthetic enrollment samples.
+ *
+ * Bodies are streamed as real bytes through core's `readJsonBody` (the
+ * production read path), so these cases exercise the same
+ * stream-read → parse → memoize sequence a live server request takes. Each
+ * case carries its own bounded deadline far below the repo-wide 120s
+ * timeout, so a never-settling handler fails in seconds with a typed
+ * timeout error instead of stalling the shard; synthetic sockets are
+ * tracked and destroyed in teardown so no case leaks a request into the
+ * next.
  */
 
 import { mkdtempSync, rmSync } from "node:fs";
@@ -20,13 +29,23 @@ import {
 } from "./voice-profiles-management-routes";
 
 const OWNER_ENTITY_ID = "entity-owner";
-const JSON_BODY = Symbol.for("eliza.http.cachedJsonBody");
+/**
+ * Package-local per-case deadline (issue #29843): a hung handler must fail
+ * with vitest's typed timeout in seconds, never the repo-wide 120s.
+ */
+const CASE_TIMEOUT_MS = 10_000;
 
 let rootDir: string;
 let store: VoiceProfileStore;
 let owner: VoiceProfileRecord;
 let guest: VoiceProfileRecord;
 let previousOwnerEntityId: string | undefined;
+const openSockets: Socket[] = [];
+
+function trackSocket(socket: Socket): Socket {
+	openSockets.push(socket);
+	return socket;
+}
 
 function unit(values: number[]): Float32Array {
 	const magnitude = Math.sqrt(
@@ -49,11 +68,13 @@ function request(
 	pathname: string,
 	body?: Record<string, unknown>,
 ): http.IncomingMessage {
-	const req = new http.IncomingMessage(new Socket());
+	const req = new http.IncomingMessage(trackSocket(new Socket()));
 	req.method = method;
 	req.url = pathname;
 	if (body !== undefined) {
-		(req as http.IncomingMessage & { [JSON_BODY]?: unknown })[JSON_BODY] = body;
+		// Real streamed bytes: readJsonBody consumes the stream end-to-end.
+		req.push(Buffer.from(JSON.stringify(body), "utf8"));
+		req.push(null);
 	}
 	return req;
 }
@@ -63,7 +84,7 @@ function response(): {
 	body: () => Record<string, unknown>;
 } {
 	let raw = "";
-	const req = new http.IncomingMessage(new Socket());
+	const req = new http.IncomingMessage(trackSocket(new Socket()));
 	const res = new http.ServerResponse(req);
 	res.setHeader = () => res;
 	res.end = ((chunk?: string | Buffer) => {
@@ -132,10 +153,16 @@ afterEach(() => {
 		process.env.ELIZA_ADMIN_ENTITY_ID = previousOwnerEntityId;
 	}
 	rmSync(rootDir, { recursive: true, force: true });
+	for (const socket of openSockets) {
+		socket.destroy();
+	}
+	openSockets.length = 0;
 });
 
 describe("voice profile management routes", () => {
-	it("lists retained split samples without exposing audio hashes", async () => {
+	it("lists retained split samples without exposing audio hashes", {
+		timeout: CASE_TIMEOUT_MS,
+	}, async () => {
 		const result = await call("GET", "/api/voice/profiles");
 		expect(result.status).toBe(200);
 		const profiles = result.body.profiles as Array<Record<string, unknown>>;
@@ -157,7 +184,9 @@ describe("voice profile management routes", () => {
 		expect(JSON.stringify(listedGuest)).not.toContain("wavSha256");
 	});
 
-	it("binds and unbinds a non-owner profile", async () => {
+	it("binds and unbinds a non-owner profile", {
+		timeout: CASE_TIMEOUT_MS,
+	}, async () => {
 		const bound = await call(
 			"POST",
 			`/api/voice/profiles/${guest.profileId}/bind`,
@@ -178,7 +207,9 @@ describe("voice profile management routes", () => {
 		expect(unbound.body.entityId).toBeNull();
 	});
 
-	it("refuses to merge away, rebind, or unbind the owner profile", async () => {
+	it("refuses to merge away, rebind, or unbind the owner profile", {
+		timeout: CASE_TIMEOUT_MS,
+	}, async () => {
 		const merge = await call(
 			"POST",
 			`/api/voice/profiles/${owner.profileId}/merge`,
@@ -210,7 +241,9 @@ describe("voice profile management routes", () => {
 		expect((await store.get(owner.profileId))?.entityId).toBe(OWNER_ENTITY_ID);
 	});
 
-	it("splits a proper subset and refuses an all-sample split", async () => {
+	it("splits a proper subset and refuses an all-sample split", {
+		timeout: CASE_TIMEOUT_MS,
+	}, async () => {
 		const rejected = await call(
 			"POST",
 			`/api/voice/profiles/${guest.profileId}/split`,
