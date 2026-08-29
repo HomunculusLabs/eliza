@@ -2,7 +2,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { BionicHostLoader, deriveBundleDir } from "./bionic-host-loader";
 
 /**
@@ -165,16 +165,21 @@ describeLinuxOnly("BionicHostLoader (real abstract-UDS)", () => {
 		const out = await loader.generate({
 			prompt: "what is 2+2?",
 			maxTokens: 32,
-			stopSequences: ["<end_of_turn>", "<start_of_turn>", "<endoftext>"],
+			stopSequences: ["<end_of_turn>"],
 		});
 		expect(out).toBe("Two plus two equals four.");
-		// bundleDir derived from the .../text/<model>.gguf layout.
-		expect(seen).toMatchObject({
+		// bundleDir derived from the .../text/<model>.gguf layout. The merge
+		// helper always carries the full canonical turn-stop set — passing a
+		// partial caller list proves it adds <start_of_turn>/<endoftext> — and
+		// the full key set (incl. temperature) is the exact buffered wire
+		// shape the Android host receives.
+		expect(seen).toEqual({
 			op: "generate",
+			bundleDir: "/data/x/eliza-1/bundle",
 			prompt: "what is 2+2?",
 			maxTokens: 32,
-			stopSequences: ["<end_of_turn>", "<start_of_turn>"],
-			bundleDir: "/data/x/eliza-1/bundle",
+			temperature: 0,
+			stopSequences: ["<end_of_turn>", "<start_of_turn>", "<endoftext>"],
 		});
 	});
 
@@ -188,10 +193,17 @@ describeLinuxOnly("BionicHostLoader (real abstract-UDS)", () => {
 		await loader.loadModel({ modelPath: "/models/flat-model.gguf" });
 		await loader.generate({ prompt: "hi" });
 		expect((seen as { bundleDir?: string } | null)?.bundleDir).toBe("");
-		expect(seen).not.toHaveProperty("maxTokens");
-		expect(
-			(seen as { stopSequences?: string[] } | null)?.stopSequences,
-		).toEqual(["<end_of_turn>", "<start_of_turn>", "<endoftext>"]);
+		// A request without a caller maxTokens carries the current default
+		// output boundary (256) — full exact wire shape for the flat-model
+		// path (empty bundleDir, default boundary, merged canonical stops).
+		expect(seen).toEqual({
+			op: "generate",
+			bundleDir: "",
+			prompt: "hi",
+			maxTokens: 256,
+			temperature: 0,
+			stopSequences: ["<end_of_turn>", "<start_of_turn>", "<endoftext>"],
+		});
 	});
 
 	it("throws when the host returns ok:false", async () => {
@@ -380,13 +392,14 @@ describeLinuxOnly("BionicHostLoader streaming generate (#11913)", () => {
 		});
 		expect(out).toBe("Four is the answer.");
 		expect(chunks).toEqual(["Four", " is", " the answer."]);
-		expect(seen).toMatchObject({
+		expect(seen).toEqual({
 			op: "generateStream",
+			bundleDir: "/data/x/eliza-1/bundle",
 			prompt: "what is 2+2?",
 			maxTokens: 20,
+			temperature: 0,
 			streamStep: 8,
-			stopSequences: ["<end_of_turn>"],
-			bundleDir: "/data/x/eliza-1/bundle",
+			stopSequences: ["<end_of_turn>", "<start_of_turn>", "<endoftext>"],
 		});
 	});
 
@@ -470,7 +483,68 @@ describeLinuxOnly("BionicHostLoader streaming generate (#11913)", () => {
 		await loader.loadModel({ modelPath: "/m/text/x.gguf" });
 		await expect(
 			loader.generate({ prompt: "x", onTextChunk: () => {} }),
-		).rejects.toMatchObject({ code: "MODEL_INCOMPLETE_OUTPUT" });
+		).rejects.toMatchObject({ code: "MODEL_OUTPUT_INCOMPLETE" });
+	});
+
+	it("throws on a malformed buffered response frame", async () => {
+		host = net.createServer((sock) => {
+			let buf = Buffer.alloc(0);
+			let expected = -1;
+			sock.on("data", (d: Buffer) => {
+				buf = Buffer.concat([buf, d]);
+				if (expected < 0 && buf.length >= 4) expected = buf.readUInt32BE(0);
+				if (expected >= 0 && buf.length >= 4 + expected) {
+					sock.write(frame("this is not json"));
+				}
+			});
+		});
+		host.listen({ path: `\0${SOCK}` });
+		const loader = new BionicHostLoader(SOCK);
+		await loader.loadModel({ modelPath: "/m/text/x.gguf" });
+		await expect(loader.generate({ prompt: "x" })).rejects.toThrow(
+			/malformed response/,
+		);
+	});
+
+	it("throws on a malformed streaming frame", async () => {
+		host = net.createServer((sock) => {
+			let buf = Buffer.alloc(0);
+			let expected = -1;
+			sock.on("data", (d: Buffer) => {
+				buf = Buffer.concat([buf, d]);
+				if (expected < 0 && buf.length >= 4) expected = buf.readUInt32BE(0);
+				if (expected >= 0 && buf.length >= 4 + expected) {
+					sock.write(frame("not json either"));
+				}
+			});
+		});
+		host.listen({ path: `\0${SOCK}` });
+		const loader = new BionicHostLoader(SOCK);
+		await loader.loadModel({ modelPath: "/m/text/x.gguf" });
+		await expect(
+			loader.generate({ prompt: "x", onTextChunk: () => {} }),
+		).rejects.toThrow(/malformed stream frame/);
+	});
+
+	it("throws when an oversized response frame length is announced", async () => {
+		host = net.createServer((sock) => {
+			let buf = Buffer.alloc(0);
+			sock.on("data", (d: Buffer) => {
+				buf = Buffer.concat([buf, d]);
+				if (buf.length >= 4) {
+					const evil = Buffer.alloc(4);
+					// MAX_FRAME_BYTES + 1 — far above the defensive ceiling.
+					evil.writeUInt32BE(64 * 1024 * 1024 + 1, 0);
+					sock.write(evil);
+				}
+			});
+		});
+		host.listen({ path: `\0${SOCK}` });
+		const loader = new BionicHostLoader(SOCK);
+		await loader.loadModel({ modelPath: "/m/text/x.gguf" });
+		await expect(loader.generate({ prompt: "x" })).rejects.toThrow(
+			/bad response frame length/,
+		);
 	});
 
 	it("throws when the host closes mid-stream before the done frame", async () => {
@@ -509,5 +583,62 @@ describeLinuxOnly("BionicHostLoader streaming generate (#11913)", () => {
 				},
 			}),
 		).rejects.toThrow(/onTextChunk failed: consumer exploded/);
+	});
+
+	it("times out a buffered request when the host accepts but never responds", async () => {
+		vi.useFakeTimers({ shouldAdvanceTime: true });
+		try {
+			// Accept the request frame, then go silent — the whole-turn
+			// REQUEST_TIMEOUT_MS deadline must reject the generate call.
+			host = net.createServer((sock) => {
+				sock.on("data", () => {
+					// deliberately never reply
+				});
+			});
+			host.listen({ path: `\0${SOCK}` });
+			const loader = new BionicHostLoader(SOCK);
+			await loader.loadModel({ modelPath: "/m/text/x.gguf" });
+			const pending = loader.generate({ prompt: "x" });
+			const assertion = expect(pending).rejects.toThrow(/request timed out/);
+			await vi.advanceTimersByTimeAsync(120_000);
+			await assertion;
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("times out a stream that stalls before the done frame", async () => {
+		vi.useFakeTimers({ shouldAdvanceTime: true });
+		try {
+			// Push one token frame, then stop — the per-frame idle deadline
+			// (not the whole-turn budget) must reject the streaming turn.
+			let replied = false;
+			host = net.createServer((sock) => {
+				sock.on("error", () => {
+					// client-side timeout destroys the socket mid-write
+				});
+				sock.on("data", () => {
+					if (replied) return;
+					replied = true;
+					sock.write(frame(JSON.stringify({ type: "token", text: "h" })));
+				});
+			});
+			host.listen({ path: `\0${SOCK}` });
+			const loader = new BionicHostLoader(SOCK);
+			await loader.loadModel({ modelPath: "/m/text/x.gguf" });
+			const pending = loader.generate({ prompt: "x", onTextChunk: () => {} });
+			// Once the token frame lands, bumpIdleTimer re-arms the deadline
+			// with the per-frame stall message — the stepped advance below
+			// lets that I/O land, so the rejection must be the stall one.
+			const assertion = expect(pending).rejects.toThrow(/stream stalled/);
+			// Advance in steps so real socket I/O (connect + the token frame)
+			// lands between ticks before the 120s deadline expires.
+			for (let i = 0; i < 150; i++) {
+				await vi.advanceTimersByTimeAsync(1_000);
+			}
+			await assertion;
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });
