@@ -76,10 +76,13 @@ export const DIRECT_ROUTE_CASES: readonly DirectRouteCase[] = [
   },
   {
     // Retired bare My Apps route (#17031): same consolidated Projects surface,
-    // Apps segment pre-selected with the app-management copy visible.
+    // Apps segment pre-selected. Structural testids, not prose (#29948).
     name: "bare /apps compat deep link",
     path: "/apps",
-    readyChecks: [{ text: "Projects" }, { text: "Install, create, and run" }],
+    readyChecks: [
+      { selector: '[data-testid="tasks-view"]' },
+      { selector: '[data-testid="projects-apps-segment"]' },
+    ],
     timeoutMs: 90_000,
   },
   {

@@ -7,13 +7,19 @@
 
 import { expect, type Page, test } from "@playwright/test";
 import {
+  assertReadyChecks,
   installDefaultAppRoutes,
   openAppPath,
   seedAppStorage,
 } from "./helpers";
 
 test.beforeEach(async ({ page }) => {
-  await seedAppStorage(page);
+  await seedAppStorage(page, {
+    // The relationships app-shell registration is a developer-kind view; its
+    // route only mounts a renderer when developer mode is on (the clicksafe
+    // sweep seeds the same flag).
+    "eliza:developerMode": "1",
+  });
   await installDefaultAppRoutes(page);
 });
 
@@ -138,11 +144,21 @@ test("trajectories view loads and search re-queries", async ({ page }) => {
 test("relationships view loads the graph and platform filter re-queries", async ({
   page,
 }) => {
-  const relReqs = countRequests(page, /\/api\/relationships\/(graph|people)/);
+  // The plugin-owned RelationshipsView (registered by
+  // @elizaos/plugin-relationships at /apps/relationships) fetches the LifeOps
+  // graph endpoints — GET /api/lifeops/entities + /api/lifeops/relationships
+  // (mocked with populated payloads by installDefaultAppRoutes).
+  const relReqs = countRequests(
+    page,
+    /\/api\/lifeops\/(entities|relationships)/,
+  );
   await openAppPath(page, "/apps/relationships");
-  await expect(page.getByTestId("relationships-view")).toBeVisible({
-    timeout: 60_000,
-  });
+  // The app-shell registration arrives on the deferred idle module path, so a
+  // cold deep link can transiently render the unavailable fallback; the ready
+  // check helper replays navigation after startup to cover that window.
+  await assertReadyChecks(page, "relationships-view", [
+    { selector: '[data-testid="relationships-view"]' },
+  ]);
   await expect.poll(relReqs).toBeGreaterThan(0);
 });
 
@@ -156,9 +172,7 @@ test("stream view renders the offline status surface", async ({ page }) => {
 test("rolodex renders its designed unavailable boundary", async ({ page }) => {
   await openAppPath(page, "/rolodex");
   await expect(
-    page.locator(
-      '[data-view-status="unavailable"][data-view-id="rolodex"]',
-    ),
+    page.locator('[data-view-status="unavailable"][data-view-id="rolodex"]'),
   ).toBeVisible({ timeout: 60_000 });
   await expect(page.getByRole("button", { name: "Retry" })).toBeVisible();
 });

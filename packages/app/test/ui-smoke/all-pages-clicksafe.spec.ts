@@ -172,8 +172,14 @@ const CORE_ROUTE_PROBES: readonly RouteProbe[] = [
     path: "/apps",
     // Retired My Apps deep link (#17031): lands on the consolidated Projects
     // surface with the Apps segment pre-selected. The launcher grid remains
-    // available at `/views`.
-    readyChecks: [{ text: "Install, create, and run your elizaOS apps." }],
+    // available at `/views`. Ready checks anchor on structural testids, not
+    // prose — the former copy anchor was removed with the Apps management
+    // redesign (#29741) while the surface testids stayed stable (#29948).
+    readyChecks: [
+      { selector: '[data-testid="tasks-view"]' },
+      { selector: '[data-testid="projects-apps-segment"]' },
+    ],
+    mode: "all",
     timeoutMs: 60_000,
     requireViewHeader: true,
     viewHeaderTitle: "Projects",
@@ -229,8 +235,7 @@ const CORE_ROUTE_PROBES: readonly RouteProbe[] = [
     // recoverable unavailable state instead of presenting a healthy launcher.
     readyChecks: [
       {
-        selector:
-          '[data-view-status="unavailable"][data-view-id="rolodex"]',
+        selector: '[data-view-status="unavailable"][data-view-id="rolodex"]',
       },
     ],
     timeoutMs: 60_000,
@@ -433,9 +438,10 @@ const SETTING_SECTIONS_TO_CLICK: readonly {
   { label: /^Capabilities$/, expectedHash: "capabilities" },
   { label: /^Apps$/, expectedHash: "apps" },
   { label: /^Connectors$/, expectedHash: "connectors" },
-  { label: /^My Runtimes$/, expectedHash: "my-runtimes" },
   { label: /^Runtime$/, expectedHash: "runtime" },
-  { label: /^Appearance$/, expectedHash: "appearance" },
+  // The appearance section (hash `appearance`) was re-labelled "General"
+  // without changing its id (#29948) — anchor on the rendered label.
+  { label: /^General$/, expectedHash: "appearance" },
   { label: /^Background$/, expectedHash: "background" },
   { label: /^Wallet & RPC\b/, expectedHash: "wallet-rpc" },
   { label: /^Updates$/, expectedHash: "updates" },
@@ -452,6 +458,11 @@ const SETTING_DEEP_LINKS: readonly {
   { hash: "wallet-rpc" },
   { hash: "advanced" },
   { hash: "cloud-agents" },
+  // Devices & Runtimes (`my-runtimes`) is a developer-gated secondary section
+  // since #29150: its hub row is hidden by design, but the route/deep link
+  // stays registered. Cover it through the deep-link loop instead of the
+  // hub-click loop (#29948).
+  { hash: "my-runtimes" },
 ];
 const SMOKE_GENERATED_AT = "2026-01-01T00:00:00.000Z";
 const ONE_PIXEL_PNG_BASE64 =
