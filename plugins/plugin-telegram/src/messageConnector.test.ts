@@ -318,7 +318,7 @@ describe("Telegram message connector adapter", () => {
     expect(result?.metadata).toMatchObject({ accountId: "acct-b" });
   });
 
-  it("clamps fetch limits and filters room reads to the target account", async () => {
+  it("pages full room reads and filters them to the target account", async () => {
     const roomId = "room-1" as never;
     const acctAMemory = {
       id: "memory-a",
@@ -365,17 +365,66 @@ describe("Telegram message connector adapter", () => {
       },
     );
 
+    // Post-#28112 the room read is an offset-driven paging loop with
+    // TELEGRAM_MEMORY_PAGE_SIZE = 500 instead of a single capped read.
     expect(runtime.getMemories).toHaveBeenCalledWith({
       tableName: "messages",
       roomId,
-      limit: 200,
+      limit: 500,
+      offset: 0,
       orderBy: "createdAt",
       orderDirection: "desc",
     });
     expect(result).toEqual([acctAMemory, legacyMemory]);
   });
 
-  it("searches fetched connector messages case-insensitively with a sane fallback limit", async () => {
+  it("rejects a non-positive connector search limit with the typed error instead of clamping", async () => {
+    const roomId = "room-1" as never;
+    const runtime = {
+      ...createRuntime(),
+      getMemories: vi.fn().mockResolvedValue([]),
+    };
+    const service = createTelegramService({
+      runtime,
+      bot: null,
+      defaultAccountId: "acct-a",
+      accountStates: new Map([["acct-a", { accountId: "acct-a" }]]),
+    });
+
+    // Post-#28112 the connector fails fast on invalid limits (error policy
+    // J3): an explicit invalid result, never a silently substituted default.
+    expect(() =>
+      service.searchConnectorMessages(
+        { runtime, accountId: "acct-a" } as never,
+        {
+          target: { source: "telegram", accountId: "acct-a", roomId },
+          query: "deploy",
+          limit: -5,
+        },
+      ),
+    ).rejects.toMatchObject({
+      name: "ElizaError",
+      code: "TELEGRAM_MESSAGE_LIMIT_INVALID",
+      context: { limit: -5 },
+    });
+    expect(() =>
+      service.fetchConnectorMessages(
+        { runtime, accountId: "acct-a" } as never,
+        {
+          target: { source: "telegram", accountId: "acct-a", roomId },
+          limit: 2.5,
+        },
+      ),
+    ).rejects.toMatchObject({
+      name: "ElizaError",
+      code: "TELEGRAM_MESSAGE_LIMIT_INVALID",
+      context: { limit: 2.5 },
+    });
+    // Fail-fast happens up front: no memory read is attempted for invalid input.
+    expect(runtime.getMemories).not.toHaveBeenCalled();
+  });
+
+  it("searches fetched connector messages case-insensitively and honors a valid limit", async () => {
     const roomId = "room-1" as never;
     const runtime = {
       ...createRuntime(),
@@ -415,14 +464,16 @@ describe("Telegram message connector adapter", () => {
       {
         target: { source: "telegram", accountId: "acct-a", roomId },
         query: "deploy",
-        limit: -5,
+        limit: 1,
       },
     );
 
+    // The valid limit slices the filtered matches; the room read itself pages
+    // uncapped (fetch runs with limit: undefined in the search path).
     expect(runtime.getMemories).toHaveBeenCalledWith(
-      expect.objectContaining({ limit: 100 }),
+      expect.objectContaining({ limit: 500, offset: 0 }),
     );
-    expect(result.map((memory) => memory.id)).toEqual(["memory-1", "memory-3"]);
+    expect(result.map((memory) => memory.id)).toEqual(["memory-1"]);
   });
 
   it("starts non-default accounts when the default account has no token", async () => {
