@@ -8,12 +8,15 @@
  * duplicate root entrypoints in dist), and a child Node process with default
  * conditions resolves the bare package name to the real built entry. Runs
  * against a fresh real `build.ts` run inside the test process so changed-source
- * coverage and the asserted artifacts describe the same build.
+ * coverage and the asserted artifacts describe the same build. The beforeAll
+ * seeds a stale dist/components artifact to prove the build is idempotent —
+ * the declaration phase must not recreate it from excluded view sources
+ * (#29841).
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -50,6 +53,13 @@ function collectExportTargets(value: unknown, skipCondition: string, out: string
 }
 
 beforeAll(async () => {
+  // Seed a stale vite-only artifact before the build: `clean: true` must wipe
+  // it, proving idempotency — no stale dist/components output can survive a
+  // rebuild even when a previous (broken) build left one behind (#29841).
+  const staleDir = path.join(distDir, "components");
+  mkdirSync(staleDir, { recursive: true });
+  writeFileSync(path.join(staleDir, "stale-artifact.js"), "// stale\n", "utf8");
+
   // Importing the build entry keeps the real build inside the test process, so
   // the changed-source coverage gate can observe the production path it proves.
   const previousCwd = process.cwd();

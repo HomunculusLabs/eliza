@@ -48,6 +48,13 @@ const subpathEntries = Array.from(new Bun.Glob("src/**/*.{ts,tsx}").scanSync("."
 const nodeReexport =
   "export * from '../index.node.js';\nexport { default } from '../index.node.js';\n";
 const browserReexport = "export * from '../index.js';\nexport { default } from '../index.js';\n";
+// register.ts is the boot-time app-shell side-effect entry (its loader
+// dynamically imports vite-only src/components). It is excluded from tsc
+// declaration emit (which would otherwise drag the excluded components into
+// dist via its dynamic import — exclude filters root names only), so this
+// shim keeps `@elizaos/plugin-elizacloud/register` types-resolvable for
+// consumers while matching the runtime module's `export {}` shape.
+const registerShim = "export {};\n";
 
 await buildPlugin({
   name: "@elizaos/plugin-elizacloud",
@@ -107,5 +114,6 @@ await buildPlugin({
     { path: "node/index.d.ts", content: nodeReexport },
     { path: "browser/index.d.ts", content: browserReexport },
     { path: "cjs/index.d.ts", content: nodeReexport },
+    { path: "register.d.ts", content: registerShim },
   ],
 });
