@@ -856,6 +856,73 @@ describe("admin personal Dedicated adoption selection", () => {
     expect(await dbWrite.select().from(jobs)).toHaveLength(0);
   });
 
+  test("re-reviews a sole remaining candidate and durably records the re-reviewing admin", async () => {
+    const original = await seedStaleSelection();
+    await dbWrite.delete(agentSandboxes).where(eq(agentSandboxes.id, STALE));
+    const secondAdmin = "dddddddd-6666-4666-8666-666666666666";
+    await dbWrite.insert(users).values({
+      id: secondAdmin,
+      organization_id: ORG_B,
+      steward_user_id: "selection-rereview-actor",
+      role: "owner",
+    });
+
+    const preview = await rereviewPreview(RETAINED);
+    expect(preview).toMatchObject({
+      receiptFingerprint: original.inventory_fingerprint,
+      previousRetainedAgentId: RETAINED,
+      retainedAgentId: RETAINED,
+      candidateCount: 1,
+      replacesTarget: false,
+    });
+    expect(preview.inventoryFingerprint).not.toBe(
+      original.inventory_fingerprint,
+    );
+
+    adminIdentity = {
+      id: secondAdmin,
+      email: "second-admin@example.test",
+      organization_id: ORG_B,
+      organization: { id: ORG_B, name: "Admin Org", is_active: true },
+    };
+    const response = await post(rereviewRequestBody(RETAINED, false, preview));
+    expect(response.status).toBe(200);
+    const [refreshed] = await dbWrite
+      .select()
+      .from(personalDedicatedAdoptionSelections);
+    expect(refreshed).toMatchObject({
+      id: original.id,
+      dedicated_agent_id: RETAINED,
+      selected_by_user_id: original.selected_by_user_id,
+      selected_at: original.selected_at,
+      created_at: original.created_at,
+      rereviewed_by_user_id: secondAdmin,
+      candidate_count: 1,
+      inventory_fingerprint: preview.inventoryFingerprint,
+    });
+
+    expect(
+      await resolvePersonalDedicatedAdoption({
+        organizationId: ORG_A,
+        userId: USER_A,
+        sourceAgentId: SOURCE_A,
+      }),
+    ).toMatchObject({ state: "available", agent: { id: RETAINED } });
+    expect(await dbWrite.select().from(agentSandboxes)).toHaveLength(1);
+    expect(await dbWrite.select().from(jobs)).toHaveLength(0);
+
+    // The initial select boundary still requires a genuinely ambiguous
+    // inventory; the relaxed floor exists only for explicit re-review.
+    await dbWrite
+      .delete(personalDedicatedAdoptionSelections)
+      .where(eq(personalDedicatedAdoptionSelections.id, original.id));
+    const selectResponse = await post(requestBody(true));
+    expect(selectResponse.status).toBe(409);
+    expect(await selectResponse.json()).toMatchObject({
+      code: "personal_dedicated_selection_conflict",
+    });
+  });
+
   test("rejects re-review when the named target is deleted or ineligible", async () => {
     const original = await seedStaleSelection();
     await dbWrite
@@ -1093,6 +1160,7 @@ describe("admin personal Dedicated adoption selection", () => {
       .select()
       .from(personalDedicatedAdoptionSelections);
     expect(afterActorDelete?.selected_by_user_id).toBeNull();
+    expect(afterActorDelete?.rereviewed_by_user_id).toBeNull();
 
     await dbWrite.delete(users).where(eq(users.id, USER_A));
     expect(

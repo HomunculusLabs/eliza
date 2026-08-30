@@ -277,6 +277,7 @@ export const PROVISIONING_JOB_TEST_TABLES: readonly string[] = [
   "backup_schedule_attempts" integer NOT NULL DEFAULT 0,
   "backup_schedule_last_error_code" text,
   "backup_schedule_last_protected_at" timestamptz,
+  "backup_admission_xid" text,
   "created_at" timestamptz NOT NULL DEFAULT now(),
   "updated_at" timestamptz NOT NULL DEFAULT now(),
   "deleted_at" timestamptz,
@@ -318,6 +319,7 @@ export const PROVISIONING_JOB_TEST_TABLES: readonly string[] = [
   "source_agent_id" text NOT NULL,
   "dedicated_agent_id" uuid NOT NULL,
   "selected_by_user_id" uuid,
+  "rereviewed_by_user_id" uuid,
   "selection_reason" text NOT NULL,
   "state_disposition" text NOT NULL,
   "activation_kind" text NOT NULL,
@@ -342,6 +344,8 @@ export const PROVISIONING_JOB_TEST_TABLES: readonly string[] = [
     FOREIGN KEY ("user_id") REFERENCES "users"("id") ON DELETE CASCADE,
   CONSTRAINT "personal_dedicated_adoption_selections_selected_by_user_id_fk"
     FOREIGN KEY ("selected_by_user_id") REFERENCES "users"("id") ON DELETE SET NULL,
+  CONSTRAINT "personal_dedicated_adoption_selections_rereviewed_by_user_id_fk"
+    FOREIGN KEY ("rereviewed_by_user_id") REFERENCES "users"("id") ON DELETE SET NULL,
   CONSTRAINT "personal_dedicated_adoption_selections_activation_check"
     CHECK (("activation_kind" = 'fresh_boot' AND "activation_backup_id" IS NULL
         AND "activation_backup_hash" IS NULL AND "activation_backup_chain" IS NULL)

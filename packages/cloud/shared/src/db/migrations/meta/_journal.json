@@ -2507,6 +2507,12 @@
       "when": 1796083200001,
       "tag": "0374_subscription_funding_transaction_uniqueness",
       "breakpoints": true
+    },
+    {
+      "idx": 358,
+      "version": "_personal_dedicated_rereview_residuals",
+      "when": 1796083200002,
+      "tag": "0377_personal_dedicated_rereview_residuals"
     }
   ]
 }

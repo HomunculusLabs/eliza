@@ -20,6 +20,10 @@ const adoptionMigration = readFileSync(
   new URL("./migrations/0329_personal_dedicated_adoption_selections.sql", import.meta.url),
   "utf8",
 );
+const rereviewMigration = readFileSync(
+  new URL("./migrations/0376_personal_dedicated_rereview_residuals.sql", import.meta.url),
+  "utf8",
+);
 
 let database: PGlite;
 
@@ -40,6 +44,7 @@ beforeAll(async () => {
   `);
   await database.exec(authorityMigration);
   await database.exec(adoptionMigration);
+  await database.exec(rereviewMigration);
 }, 60_000);
 
 afterAll(async () => {
@@ -76,6 +81,7 @@ describe("personal Dedicated adoption selection migration", () => {
       "selected_at",
       "created_at",
       "updated_at",
+      "rereviewed_by_user_id",
     ]);
 
     const triggerEvents = await database.query<{ event_manipulation: string }>(`
@@ -133,6 +139,46 @@ describe("personal Dedicated adoption selection migration", () => {
       SELECT count(*)::text AS count FROM agent_sandbox_backups WHERE id = '${BACKUP}'
     `);
     expect(backups.rows).toEqual([{ count: "1" }]);
+  });
+
+  test("re-review residual migration records the actor and allows a sole remaining candidate", async () => {
+    await database.exec(
+      `DELETE FROM personal_dedicated_adoption_selections WHERE dedicated_agent_id = '${AGENT}'`,
+    );
+    await database.exec(`
+      INSERT INTO personal_dedicated_adoption_selections (
+        organization_id, user_id, source_agent_id, dedicated_agent_id,
+        selected_by_user_id, rereviewed_by_user_id, selection_reason,
+        state_disposition, activation_kind, inventory_fingerprint, candidate_count
+      ) VALUES (
+        '${ORGANIZATION}', '${USER}', '${SOURCE_AGENT}', '${AGENT}',
+        '${USER}', '${ACTOR}', 'duplicate_owned_dedicated_inventory',
+        'fresh_boot_no_verified_backup', 'fresh_boot', '${HASH}', 1
+      )
+    `);
+
+    const soleCandidate = await database.query<{ count: string }>(`
+      SELECT count(*)::text AS count
+      FROM personal_dedicated_adoption_selections
+      WHERE candidate_count = 1 AND rereviewed_by_user_id = '${ACTOR}'
+    `);
+    expect(soleCandidate.rows).toEqual([{ count: "1" }]);
+
+    await expect(
+      database.exec(`
+        UPDATE personal_dedicated_adoption_selections
+        SET candidate_count = 0
+        WHERE dedicated_agent_id = '${AGENT}'
+      `),
+    ).rejects.toThrow(/candidate_count_check/);
+
+    await database.exec(`DELETE FROM users WHERE id = '${ACTOR}'`);
+    const nulled = await database.query<{ rereviewed_by: string | null }>(`
+      SELECT rereviewed_by_user_id AS rereviewed_by
+      FROM personal_dedicated_adoption_selections
+      WHERE dedicated_agent_id = '${AGENT}'
+    `);
+    expect(nulled.rows).toEqual([{ rereviewed_by: null }]);
   });
 
   test("preserves selection and upgrade tombstones after target deletion", async () => {

@@ -23,6 +23,12 @@ export const personalDedicatedAdoptionSelections = pgTable(
     selected_by_user_id: uuid("selected_by_user_id").references(() => users.id, {
       onDelete: "set null",
     }),
+    // Written only by the explicit re-review execute path; the original
+    // selected_by_user_id/selected_at columns keep recording who first made
+    // the selection, so a stale-receipt replacement is fully attributable.
+    rereviewed_by_user_id: uuid("rereviewed_by_user_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
     selection_reason: text("selection_reason").notNull(),
     state_disposition: text("state_disposition").notNull(),
     activation_kind: text("activation_kind").notNull(),
