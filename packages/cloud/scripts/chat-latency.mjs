@@ -258,8 +258,21 @@ export function consumeAgentEvent(event) {
       ? [event.text, event.delta, event.token]
       : [event?.delta, event?.token];
   const content = candidates.find((value) => typeof value === "string") || "";
+  // A string `fullText` on a token frame is ALWAYS authoritative — this
+  // mirrors the first-party frontend rule (applyStreamChatTokenEvent in
+  // packages/ui/src/api/client-base.ts): delta-v2 periodic self-heal frames
+  // carry BOTH an incremental `text` chunk and the accumulated `fullText`,
+  // and legacy frames carry per-token `text` + `fullText` the same way.
+  // Only `writeSnapshot` frames arrive as fullText alone. When fullText is
+  // present the incremental field must NOT also be appended (the chunk is
+  // already contained in the snapshot).
+  const snapshot =
+    event?.type === "token" && typeof event?.fullText === "string"
+      ? event.fullText
+      : undefined;
   return {
-    content,
+    content: snapshot !== undefined ? "" : content,
+    snapshot,
     terminal: event?.type === "done" || event?.type === "error" ? event : null,
   };
 }
@@ -310,6 +323,14 @@ export async function readSse(
         firstReasoningMs = elapsed(now, startedAt);
       }
       reasoningCharacters += observation.reasoning.length;
+    }
+    if (observation.snapshot !== undefined) {
+      // Authoritative replace: a delta-v2 snapshot resets the accumulated
+      // output rather than appending (drop/reordered-delta self-heal and
+      // single-frame replies).
+      outputText = observation.snapshot;
+      outputCharacters = observation.snapshot.length;
+      if (firstTokenMs === null) firstTokenMs = elapsed(now, startedAt);
     }
     if (observation.content) {
       if (firstTokenMs === null) firstTokenMs = elapsed(now, startedAt);
@@ -615,29 +636,19 @@ export async function probeDedicated({
       fetchImpl,
     );
     const startedAt = performance.now();
-    const response = await fetchImpl(
-      baseUrl +
-        "/api/conversations/" +
-        encodeURIComponent(conversationId) +
-        "/messages/stream",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-          Accept: "text/event-stream",
-          "X-Eliza-Trace-Id": traceId,
-          "X-Eliza-Telemetry": "full",
-          "User-Agent": "eliza-chat-latency/1.0",
-        },
-        body: JSON.stringify({
-          text: prompt,
-          channelType: "DM",
-          clientMessageId: randomUUID(),
-        }),
-        signal: requestSignal(timeoutMs),
-      },
-    );
+    const request = buildDedicatedStreamRequest({
+      baseUrl,
+      conversationId,
+      apiKey,
+      prompt,
+      traceId,
+    });
+    const response = await fetchImpl(request.url, {
+      method: request.method,
+      headers: request.headers,
+      body: request.body,
+      signal: requestSignal(timeoutMs),
+    });
     const responseHeadersMs = round(performance.now() - startedAt);
     const headers = selectedResponseHeaders(response.headers);
     const serverTiming = parseServerTiming(
@@ -659,7 +670,16 @@ export async function probeDedicated({
     }
     const stream = await readSse(response.body, startedAt, consumeAgentEvent);
     const totalMs = round(performance.now() - startedAt);
-    const proofMatched = stream.outputText.includes(expectedProof);
+    // The terminal done frame carries the authoritative final reply text
+    // (writeConversationDoneSse in packages/agent/src/api/
+    // conversation-routes.ts): a dropped or rewritten delta must not corrupt
+    // proof matching, so the done frame's fullText wins over the accumulated
+    // stream when present.
+    const outputText =
+      typeof stream.terminal?.fullText === "string"
+        ? stream.terminal.fullText
+        : stream.outputText;
+    const proofMatched = outputText.includes(expectedProof);
     const terminalType = stream.terminal?.type ?? null;
     const cleanCompletion =
       terminalType === "done" && stream.malformedEvents === 0;
@@ -686,7 +706,7 @@ export async function probeDedicated({
       terminalType,
       malformedEvents: stream.malformedEvents,
       cleanCompletion,
-      outputCharacters: stream.outputCharacters,
+      outputCharacters: outputText.length,
       headers,
       serverTiming,
       preforward: parsePreforwardHeader(
@@ -732,6 +752,53 @@ export async function probeDedicated({
       }
     }
   }
+}
+
+// Wire parity for the dedicated probe's streaming turn. The first-party
+// frontend negotiates delta framing with `streamProtocol: "delta-v2"`
+// (packages/ui/src/api/client-base.ts, constant in
+// packages/shared/src/utils/streaming-text.ts) and attaches an opaque
+// per-turn `X-ElizaOS-Turn-Correlation` UUID (server constant in
+// packages/cloud/shared/src/lib/services/shared-runtime/shared-turn-observability.ts).
+// Browser requests to dedicated-cloud URLs strip the correlation header
+// before dispatch (DEDICATED_CLOUD_CORS_BLOCKED_HEADERS in client-base.ts —
+// the dedicated container CORS contract does not allowlist it); this probe
+// is a non-browser Node client with no preflight, so it sends the full
+// negotiated contract per the issue's acceptance. The correlation id exists
+// only for short-lived attempt telemetry and is never written into probe
+// records.
+export const DELTA_STREAM_PROTOCOL = "delta-v2";
+export const SHARED_TURN_CORRELATION_HEADER = "X-ElizaOS-Turn-Correlation";
+
+export function buildDedicatedStreamRequest({
+  baseUrl,
+  conversationId,
+  apiKey,
+  prompt,
+  traceId,
+  userAgent = "eliza-chat-latency/1.0",
+  correlationId = randomUUID(),
+  clientMessageId = randomUUID(),
+}) {
+  return {
+    url: `${baseUrl}/api/conversations/${encodeURIComponent(conversationId)}/messages/stream`,
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+      "X-Eliza-Trace-Id": traceId,
+      "X-Eliza-Telemetry": "full",
+      "User-Agent": userAgent,
+      [SHARED_TURN_CORRELATION_HEADER]: correlationId,
+    },
+    body: JSON.stringify({
+      text: prompt,
+      channelType: "DM",
+      clientMessageId,
+      streamProtocol: DELTA_STREAM_PROTOCOL,
+    }),
+  };
 }
 
 export async function runPairedProbes({

@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildDedicatedStreamRequest,
   buildOpenAiRequestBody,
   buildProofPrompt,
+  consumeAgentEvent,
   consumeOpenAiEvent,
   parseProbeCase,
   parseServerTiming,
@@ -17,6 +19,17 @@ import {
   selectedResponseHeaders,
   summarizeLatencyRecords,
 } from "./chat-latency.mjs";
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function headerValue(headers, name) {
+  const target = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers ?? {})) {
+    if (key.toLowerCase() === target) return value;
+  }
+  return undefined;
+}
 
 function openAiSse(events, { done = true, status = 200, headers } = {}) {
   const frames = events.map((event) => `data: ${JSON.stringify(event)}\n\n`);
@@ -467,6 +480,262 @@ test("probeDedicated never records an arbitrary transport error message", async 
   assert.equal(result.ok, false);
   assert.equal(result.errorCode, null);
   assert.doesNotMatch(JSON.stringify(result), /private-api-key/);
+});
+
+test("buildDedicatedStreamRequest matches the frontend SSE wire contract", () => {
+  const request = buildDedicatedStreamRequest({
+    baseUrl: "https://agent.example",
+    conversationId: "conversation-1",
+    apiKey: "secret-key",
+    prompt: "private prompt",
+    traceId: "latency_trace",
+  });
+
+  assert.equal(
+    request.url,
+    "https://agent.example/api/conversations/conversation-1/messages/stream",
+  );
+  assert.equal(request.method, "POST");
+  assert.equal(
+    headerValue(request.headers, "Authorization"),
+    "Bearer secret-key",
+  );
+  assert.equal(
+    headerValue(request.headers, "Content-Type"),
+    "application/json",
+  );
+  assert.equal(headerValue(request.headers, "Accept"), "text/event-stream");
+  assert.equal(
+    headerValue(request.headers, "X-Eliza-Trace-Id"),
+    "latency_trace",
+  );
+  assert.equal(headerValue(request.headers, "X-Eliza-Telemetry"), "full");
+  assert.equal(
+    headerValue(request.headers, "User-Agent"),
+    "eliza-chat-latency/1.0",
+  );
+
+  const correlation = headerValue(
+    request.headers,
+    "X-ElizaOS-Turn-Correlation",
+  );
+  assert.match(correlation, UUID_RE);
+
+  const body = JSON.parse(request.body);
+  assert.equal(body.text, "private prompt");
+  assert.equal(body.channelType, "DM");
+  assert.match(body.clientMessageId, UUID_RE);
+  assert.equal(body.streamProtocol, "delta-v2");
+
+  // The correlation id is opaque per-turn: two invocations never share one.
+  const second = buildDedicatedStreamRequest({
+    baseUrl: "https://agent.example",
+    conversationId: "conversation-1",
+    apiKey: "secret-key",
+    prompt: "private prompt",
+    traceId: "latency_trace",
+  });
+  assert.notEqual(
+    correlation,
+    headerValue(second.headers, "X-ElizaOS-Turn-Correlation"),
+  );
+  assert.notEqual(
+    body.clientMessageId,
+    JSON.parse(second.body).clientMessageId,
+  );
+});
+
+test("probeDedicated sends the frontend-equivalent delta-v2 stream request", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push({
+      url,
+      method: init.method,
+      headers: init.headers,
+      body: init.body,
+    });
+    if (calls.length === 1) {
+      return Response.json({ conversation: { id: "conversation-wire" } });
+    }
+    if (calls.length === 2) {
+      return new Response(
+        [
+          'data: {"type":"token","delta":"proof-wire"}\n\n',
+          'data: {"type":"done","telemetry":{"runtime":{"totalMs":21}}}\n\n',
+        ].join(""),
+        { status: 200 },
+      );
+    }
+    return new Response(null, { status: 204 });
+  };
+
+  const result = await probeDedicated({
+    agentId: "agent-wire",
+    baseUrl: "https://agent.example",
+    apiKey: "wire-secret-key",
+    proof: "proof-wire",
+    timeoutMs: 5_000,
+    sequence: 1,
+    keepConversation: false,
+    fetchImpl,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(calls.length, 3);
+  const streamCall = calls[1];
+  assert.equal(
+    streamCall.url,
+    "https://agent.example/api/conversations/conversation-wire/messages/stream",
+  );
+  assert.equal(streamCall.method, "POST");
+  // Full preserved header contract on the captured stream call.
+  const correlation = headerValue(
+    streamCall.headers,
+    "X-ElizaOS-Turn-Correlation",
+  );
+  assert.match(correlation, UUID_RE);
+  assert.equal(
+    headerValue(streamCall.headers, "Authorization"),
+    "Bearer wire-secret-key",
+  );
+  assert.equal(
+    headerValue(streamCall.headers, "Content-Type"),
+    "application/json",
+  );
+  assert.equal(headerValue(streamCall.headers, "Accept"), "text/event-stream");
+  assert.match(
+    headerValue(streamCall.headers, "X-Eliza-Trace-Id"),
+    /^latency_/,
+  );
+  assert.equal(headerValue(streamCall.headers, "X-Eliza-Telemetry"), "full");
+  assert.equal(
+    headerValue(streamCall.headers, "User-Agent"),
+    "eliza-chat-latency/1.0",
+  );
+  const body = JSON.parse(streamCall.body);
+  assert.equal(body.text.includes("Include this exact token"), true);
+  assert.equal(body.streamProtocol, "delta-v2");
+  assert.equal(body.channelType, "DM");
+  assert.match(body.clientMessageId, UUID_RE);
+  // Privacy: the generated correlation value, the API key, and the prompt
+  // never reach probe records.
+  const serialized = JSON.stringify(result);
+  assert.ok(correlation);
+  assert.doesNotMatch(serialized, new RegExp(correlation));
+  assert.doesNotMatch(serialized, /wire-secret-key/);
+  assert.doesNotMatch(serialized, /exact token/);
+});
+
+test("consumeAgentEvent accumulates bare deltas and treats fullText-only frames as authoritative snapshots", async () => {
+  const bare = consumeAgentEvent({ type: "token", delta: "wor" });
+  assert.equal(bare.content, "wor");
+  assert.equal(bare.snapshot, undefined);
+  const legacy = consumeAgentEvent({ type: "token", text: "ld" });
+  assert.equal(legacy.content, "ld");
+  assert.equal(legacy.snapshot, undefined);
+
+  // delta-v2 snapshot: no incremental field, fullText = whole reply.
+  const snapshot = consumeAgentEvent({
+    type: "token",
+    fullText: "whole reply",
+  });
+  assert.equal(snapshot.content, "");
+  assert.equal(snapshot.snapshot, "whole reply");
+
+  // delta-v2 PERIODIC self-heal frame: carries BOTH the incremental text
+  // chunk and the authoritative accumulated fullText (server writeChunk on
+  // its geometric snapshot cadence). fullText wins; the chunk must not also
+  // be appended.
+  const periodic = consumeAgentEvent({
+    type: "token",
+    text: "wire",
+    fullText: "proof-missing-wire",
+  });
+  assert.equal(periodic.content, "");
+  assert.equal(periodic.snapshot, "proof-missing-wire");
+
+  // End-to-end accumulation through readSse: bare deltas append, a snapshot
+  // replaces (self-heal after a dropped delta), and a snapshot-only turn
+  // still yields the full reply for proof matching.
+  const stream = new Response(
+    [
+      'data: {"type":"token","delta":"proof-"}\n\n',
+      // Dropped delta implied: accumulated text is wrong until the snapshot.
+      'data: {"type":"token","fullText":"proof-snap"}\n\n',
+      'data: {"type":"token","delta":"!"}\n\n',
+      'data: {"type":"done"}\n\n',
+    ].join(""),
+    { status: 200 },
+  );
+  const result = await readSse(stream.body, 0, consumeAgentEvent);
+  assert.equal(result.outputText, "proof-snap!");
+  assert.equal(result.outputCharacters, "proof-snap!".length);
+  assert.equal(result.terminal.type, "done");
+
+  // R2 reproduction: a periodic self-heal frame ({text, fullText} both)
+  // after a dropped delta must replace, not append, the accumulated text.
+  const periodicStream = await readSse(
+    new Response(
+      [
+        'data: {"type":"token","text":"proof-"}\n\n',
+        'data: {"type":"token","text":"wire","fullText":"proof-missing-wire"}\n\n',
+        'data: {"type":"done"}\n\n',
+      ].join(""),
+      { status: 200 },
+    ).body,
+    0,
+    consumeAgentEvent,
+  );
+  assert.equal(periodicStream.outputText, "proof-missing-wire");
+
+  // A single-frame snapshot-only turn (e.g. wallet guidance) must still
+  // produce the full text — the delta-v2 framing the probe now negotiates.
+  const single = await readSse(
+    new Response(
+      [
+        'data: {"type":"token","fullText":"single-frame reply"}\n\n',
+        'data: {"type":"done"}\n\n',
+      ].join(""),
+      { status: 200 },
+    ).body,
+    0,
+    consumeAgentEvent,
+  );
+  assert.equal(single.outputText, "single-frame reply");
+});
+
+test("probeDedicated lets the done frame's fullText authority repair a dropped delta", async () => {
+  const fetchImpl = async (url) => {
+    if (url.endsWith("/api/conversations")) {
+      return Response.json({ conversation: { id: "conversation-done" } });
+    }
+    if (url.includes("/messages/stream")) {
+      // A delta drops a character; the done frame carries the true reply.
+      return new Response(
+        [
+          'data: {"type":"token","delta":"proof dne"}\n\n',
+          'data: {"type":"done","fullText":"proof done","telemetry":{}}\n\n',
+        ].join(""),
+        { status: 200 },
+      );
+    }
+    return new Response(null, { status: 204 });
+  };
+
+  const result = await probeDedicated({
+    agentId: "agent-done",
+    baseUrl: "https://agent.example",
+    apiKey: "secret-key",
+    proof: "proof done",
+    timeoutMs: 5_000,
+    sequence: 1,
+    keepConversation: true,
+    fetchImpl,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.proofMatched, true);
+  assert.equal(result.outputCharacters, "proof done".length);
 });
 
 test("runPairedProbes reuses prompts, runs targets in parallel, and labels phases", async () => {
