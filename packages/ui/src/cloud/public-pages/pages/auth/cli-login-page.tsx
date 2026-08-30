@@ -9,11 +9,11 @@
 import { isElizaCloudControlPlaneHostname } from "@elizaos/shared/elizacloud";
 import { AlertCircle, CheckCircle2, Key, Loader2 } from "lucide-react";
 import type { ComponentType, ReactNode } from "react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Button } from "../../../../components/primitives";
 import {
-  hasCloudAuthCompleted,
+  hasPersistedCloudAuthComplete,
   isCloudAuthHandoffSurface,
   publishCloudAuthComplete,
   subscribeCloudAuthComplete,
@@ -221,6 +221,25 @@ function tryCloseAuthWindow(): void {
   }
 }
 
+/**
+ * Attempt the scripted close and report whether this browsing context is
+ * still open afterwards. Browsers only honor window.close() for
+ * script-opened tabs (plus a few historic special cases); for a manually
+ * opened or opener-severed tab the call is a silent no-op, which is exactly
+ * the terminal-contract defect from #30014: the page claimed completion but
+ * offered only a dead "Close window" button.
+ */
+function tryCloseAuthWindowWithResult(): boolean {
+  try {
+    window.close();
+  } catch (error) {
+    void error;
+    // error-policy:J4 a browser that throws on close is treated like one that
+    // refuses: the caller keeps the truthful fallback action.
+  }
+  return !window.closed;
+}
+
 function getPageState({
   authenticated,
   completion,
@@ -315,9 +334,15 @@ export default function CliLoginPage() {
   );
   const trustedAppLaunch =
     hasTrustedAppLaunch(sessionId) || matchingLocalAppLaunch;
-  const [completion, setCompletion] = useState<CompletionState>({
-    status: "idle",
-  });
+  const [completion, setCompletion] = useState<CompletionState>(() =>
+    // A reloaded/late-mounted surface for a session that already completed in
+    // another tab starts terminal: the marker is presentation-only, so this
+    // renders the success state WITHOUT minting anything — no POST fires
+    // without the explicit Authorize gesture (#30014).
+    sessionId !== null && hasPersistedCloudAuthComplete(sessionId)
+      ? { status: "success", apiKeyPrefix: "" }
+      : { status: "idle" },
+  );
   // The session id the user explicitly authorized via the interstitial.
   // Keyed by id so a swapped ?session= link must be re-confirmed.
   const [confirmedSessionId, setConfirmedSessionId] = useState<string | null>(
@@ -325,6 +350,22 @@ export default function CliLoginPage() {
   );
   const lastSessionId = useRef(sessionId);
   const completionFiredRef = useRef(false);
+  // True once a scripted window.close() was attempted for this surface and the
+  // tab survived (non-script-opened / opener-severed). The success and
+  // cancelled panels then swap their no-op "Close window" button for a
+  // truthful action back to a safe same-origin destination (#30014).
+  const [tabNotClosable, setTabNotClosable] = useState(false);
+
+  // Terminal success is permanent for the presented session: once this
+  // surface has rendered it (initializer, session swap, or broadcast), the
+  // completion path is treated as fired so no later state change — including
+  // the durable marker's TTL expiring while authentication is still pending —
+  // can re-open the /complete POST (#30014).
+  useEffect(() => {
+    if (completion.status === "success") {
+      completionFiredRef.current = true;
+    }
+  }, [completion.status]);
 
   usePageTitle(
     t("cloud.cliLogin.metaTitle", {
@@ -344,8 +385,24 @@ export default function CliLoginPage() {
     // Consent is for one presentation of one session link. Clear it on every
     // transition so an A -> B -> A URL swap cannot reuse the earlier gesture.
     setConfirmedSessionId(null);
-    setCompletion({ status: "idle" });
+    // Re-evaluate the durable marker per session: a swap to a session that
+    // already completed elsewhere starts terminal; a swap to an uncompleted
+    // one starts idle. Either way no POST fires without a fresh Authorize.
+    setCompletion(
+      sessionId !== null && hasPersistedCloudAuthComplete(sessionId)
+        ? { status: "success", apiKeyPrefix: "" }
+        : { status: "idle" },
+    );
   }, [sessionId]);
+
+  // Terminal close attempt shared by the success and cancelled panels: try the
+  // scripted close; when the tab survives, record it so the rendered action
+  // becomes the truthful fallback instead of a no-op button (#30014).
+  const closeWindowOrRevealFallback = useCallback(() => {
+    if (tryCloseAuthWindowWithResult()) {
+      setTabNotClosable(true);
+    }
+  }, []);
 
   // Another Cloud tab already finished this session — stop showing a live
   // sign-in / completing state on this orphan surface. Ignore events after
@@ -353,20 +410,14 @@ export default function CliLoginPage() {
   // self-echo double-close).
   useEffect(() => {
     if (!sessionId) return;
-    if (hasCloudAuthCompleted(sessionId)) {
-      completionFiredRef.current = true;
-      setCompletion({ status: "success", apiKeyPrefix: "" });
-      if (isCloudAuthHandoffSurface()) tryCloseAuthWindow();
-      return;
-    }
     return subscribeCloudAuthComplete((message) => {
       if (message.sessionId !== sessionId) return;
       if (completionFiredRef.current) return;
       completionFiredRef.current = true;
       setCompletion({ status: "success", apiKeyPrefix: "" });
-      if (isCloudAuthHandoffSurface()) tryCloseAuthWindow();
+      closeWindowOrRevealFallback();
     });
-  }, [sessionId]);
+  }, [sessionId, closeWindowOrRevealFallback]);
 
   // Generic CLI/device completion fires only after Authorize. The matching
   // local-app handoff may finish without another click because its exact
@@ -376,6 +427,19 @@ export default function CliLoginPage() {
     if (!sessionId || !ready || !authenticated) return;
     if (confirmedSessionId !== sessionId && !trustedAppLaunch) return;
     if (completionFiredRef.current) return;
+    // A durable completion marker means this session already finished —
+    // typically in another tab while this trusted tab missed the broadcast.
+    // Treat it as fired and render terminal success; a second /complete POST
+    // would mint again without a fresh explicit Authorize gesture (#30014).
+    if (hasPersistedCloudAuthComplete(sessionId)) {
+      completionFiredRef.current = true;
+      setCompletion((previous) =>
+        previous.status === "success"
+          ? previous
+          : { status: "success", apiKeyPrefix: "" },
+      );
+      return;
+    }
     completionFiredRef.current = true;
     const activeSessionId = sessionId;
 
@@ -398,7 +462,7 @@ export default function CliLoginPage() {
         // that loads a second app shell when opener is severed by COOP or the
         // opener tab closed while auth was in flight (#18001).
         if (isCloudAuthHandoffSurface()) {
-          tryCloseAuthWindow();
+          closeWindowOrRevealFallback();
           setCompletion({ status: "success", apiKeyPrefix: data.keyPrefix });
           return;
         }
@@ -443,6 +507,7 @@ export default function CliLoginPage() {
     };
   }, [
     authenticated,
+    closeWindowOrRevealFallback,
     confirmedSessionId,
     launchReturnTo,
     ready,
@@ -551,17 +616,35 @@ export default function CliLoginPage() {
   }
 
   if (pageState.status === "cancelled") {
+    // Ordinary tabs (no opener, not the named popup) cannot script-close;
+    // they get the truthful destination action directly instead of a no-op
+    // Close button. Script-opened surfaces keep Close, swapping to the
+    // fallback only if a close attempt is refused (#30014).
+    const showTerminalFallback = tabNotClosable || !isCloudAuthHandoffSurface();
     return (
       <CliLoginPanel
         actions={
-          <Button
-            className="w-full h-11 bg-accent hover:bg-accent-hover text-accent-foreground"
-            onClick={() => window.close()}
-          >
-            {t("cloud.cliLogin.closeWindow", {
-              defaultValue: "Close window",
-            })}
-          </Button>
+          showTerminalFallback ? (
+            <Button
+              asChild
+              className="w-full h-11 bg-accent hover:bg-accent-hover text-accent-foreground"
+            >
+              <a href="/join">
+                {t("cloud.cliLogin.continueToEliza", {
+                  defaultValue: "Continue to Eliza",
+                })}
+              </a>
+            </Button>
+          ) : (
+            <Button
+              className="w-full h-11 bg-accent hover:bg-accent-hover text-accent-foreground"
+              onClick={closeWindowOrRevealFallback}
+            >
+              {t("cloud.cliLogin.closeWindow", {
+                defaultValue: "Close window",
+              })}
+            </Button>
+          )
         }
         description={t("cloud.cliLogin.cancelledDescription", {
           defaultValue:
@@ -680,29 +763,33 @@ export default function CliLoginPage() {
   }
 
   if (pageState.status === "success") {
-    const canClose = isCloudAuthHandoffSurface();
+    // Same terminal contract as the cancelled panel: ordinary tabs cannot
+    // script-close, so they see the truthful destination action immediately
+    // (#30014). Script-opened surfaces keep Close and swap in the fallback
+    // only when a close attempt is refused.
+    const showTerminalFallback = tabNotClosable || !isCloudAuthHandoffSurface();
     return (
       <CliLoginPanel
         actions={
-          canClose ? (
-            <Button
-              className="w-full h-11 bg-accent hover:bg-accent-hover text-accent-foreground"
-              onClick={tryCloseAuthWindow}
-            >
-              {t("cloud.cliLogin.closeWindow", {
-                defaultValue: "Close window",
-              })}
-            </Button>
-          ) : (
+          showTerminalFallback ? (
             <Button
               asChild
               className="w-full h-11 bg-accent hover:bg-accent-hover text-accent-foreground"
             >
-              <a href="/">
-                {t("cloud.authSuccess.returnToAppCta", {
-                  defaultValue: "Return to App",
+              <a href="/join">
+                {t("cloud.cliLogin.continueToEliza", {
+                  defaultValue: "Continue to Eliza",
                 })}
               </a>
+            </Button>
+          ) : (
+            <Button
+              className="w-full h-11 bg-accent hover:bg-accent-hover text-accent-foreground"
+              onClick={closeWindowOrRevealFallback}
+            >
+              {t("cloud.cliLogin.closeWindow", {
+                defaultValue: "Close window",
+              })}
             </Button>
           )
         }

@@ -19,6 +19,83 @@ export const CLOUD_AUTH_COMPLETE_CHANNEL = "eliza-cloud-auth-complete";
 const CLOUD_AUTH_COMPLETE_STORAGE_PREFIX = "eliza-cloud-auth-complete:";
 const CLOUD_AUTH_COMPLETE_TTL_MS = 10 * 60 * 1000;
 
+// BroadcastChannel does not replay: an orphaned /login?returnTo=/auth/cli-login
+// document that mounts (or reloads) after the completing tab published the
+// event misses it and falls back to the live sign-in form even though the CLI
+// session already finished (#30014). This durable, session-keyed marker gives
+// late subscribers a replay source. It lives in localStorage — NOT
+// sessionStorage — because the completing popup and the stranded /login tab
+// are distinct top-level browsing contexts; only a same-origin shared storage
+// is visible to both. It is presentation-only — it may suppress sign-in UI,
+// never authorize anything. CLI sessions are server-issued single-use ids
+// with a ~10-minute lifetime; the TTL here mirrors that window, and future
+// timestamps are rejected so a falsified clock cannot pin a stale terminal
+// state.
+const CLOUD_AUTH_COMPLETE_STORAGE_PREFIX = "eliza.cloud.auth.complete.v1";
+const CLOUD_AUTH_COMPLETE_TTL_MS = 10 * 60_000;
+
+function cloudAuthCompleteStorageKey(sessionId: string): string {
+  return `${CLOUD_AUTH_COMPLETE_STORAGE_PREFIX}:${sessionId.trim()}`;
+}
+
+/**
+ * Persist a completion marker for a finished CLI/device session. Called right
+ * before the broadcast publish so live and late consumers observe the same
+ * transition. Best-effort: storage can be unavailable in private browsing,
+ * where the BroadcastChannel live path still works.
+ */
+function persistCloudAuthComplete(sessionId: string): void {
+  const trimmed = sessionId.trim();
+  if (!trimmed || typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(
+      cloudAuthCompleteStorageKey(trimmed),
+      String(Date.now()),
+    );
+  } catch (error) {
+    void error;
+    // error-policy:J4 marker persistence failing degrades to the designed
+    // live-signal path (BroadcastChannel + opener poll); sign-in stays usable.
+  }
+}
+
+/**
+ * True when this origin has a non-expired completion marker for the given
+ * session — i.e. the session already finished and a late-mounted login
+ * surface must render its terminal state instead of sign-in options. Reading
+ * is storage-mechanism-agnostic (any same-origin context sees the marker).
+ */
+export function hasPersistedCloudAuthComplete(sessionId: string): boolean {
+  const trimmed = sessionId.trim();
+  if (!trimmed || typeof window === "undefined") return false;
+  let stored: string | null = null;
+  try {
+    stored = window.localStorage.getItem(cloudAuthCompleteStorageKey(trimmed));
+  } catch (error) {
+    void error;
+    // error-policy:J4 storage unavailable — fail closed to "not completed" so
+    // the live sign-in form renders rather than a fabricated terminal state.
+    return false;
+  }
+  if (stored === null) return false;
+  const completedAt = Number(stored);
+  if (!Number.isFinite(completedAt)) return false;
+  const age = Date.now() - completedAt;
+  // A future timestamp cannot be a legitimate completion record; treat it as
+  // invalid so a falsified clock cannot pin a terminal state indefinitely.
+  if (age < 0 || age > CLOUD_AUTH_COMPLETE_TTL_MS) {
+    try {
+      window.localStorage.removeItem(cloudAuthCompleteStorageKey(trimmed));
+    } catch (error) {
+      void error;
+      // error-policy:J4 an unremovable invalid marker is ignored on this
+      // read; subsequent reads repeat the check and the TTL still bounds it.
+    }
+    return false;
+  }
+  return true;
+}
+
 export type CloudAuthCompleteMessage = {
   type: typeof CLOUD_AUTH_COMPLETE_MESSAGE_TYPE;
   sessionId: string;
@@ -41,6 +118,7 @@ export function isCloudAuthCompleteMessage(
 export function publishCloudAuthComplete(sessionId: string): void {
   const trimmed = sessionId.trim();
   if (!trimmed || typeof window === "undefined") return;
+  persistCloudAuthComplete(trimmed);
   const payload: CloudAuthCompleteMessage = {
     type: CLOUD_AUTH_COMPLETE_MESSAGE_TYPE,
     sessionId: trimmed,

@@ -13,7 +13,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const harness = vi.hoisted(() => ({
@@ -245,5 +245,72 @@ describe("StewardLoginSection provider discovery truth", () => {
     expect(screen.getByRole("button", { name: "X" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Telegram" })).toBeTruthy();
     expect(harness.getProvidersCalls).toBe(3);
+  });
+
+  // #30014: the discovery retry must preserve the exact sanitized CLI
+  // returnTo carried in the address bar — the retry is in-place state work
+  // and must never rewrite or drop the nested /auth/cli-login session.
+  it("preserves the sanitized CLI returnTo across discovery failure and retry", async () => {
+    // Reset the module registry so the section's module-level provider cache
+    // from earlier tests cannot satisfy discovery: this test MUST exercise a
+    // real failure round followed by a retry round.
+    vi.resetModules();
+    // Re-apply the mocks to the fresh module registry.
+    vi.doMock("@stwd/sdk", () => ({
+      StewardAuth: class {
+        getSession() {
+          return null;
+        }
+        getProviders() {
+          harness.getProvidersCalls += 1;
+          return harness.getProvidersCalls === 1
+            ? Promise.reject(new Error("Provider service is down"))
+            : Promise.resolve(LIVE_PROVIDERS);
+        }
+        refreshSession() {
+          return Promise.resolve(null);
+        }
+      },
+    }));
+    const { default: FreshSection } = await import("./steward-login-section");
+    harness.getProvidersCalls = 0;
+    window.sessionStorage.clear();
+    const cliReturnTo = encodeURIComponent("/auth/cli-login?session=sess-1");
+    const initialEntry = `/login?returnTo=${cliReturnTo}`;
+    const observedSearch: string[] = [];
+    function LocationProbe() {
+      const location = useLocation();
+      observedSearch.push(location.search);
+      return null;
+    }
+    render(
+      <MemoryRouter initialEntries={[initialEntry]}>
+        <LocationProbe />
+        <FreshSection />
+      </MemoryRouter>,
+    );
+
+    // Deterministic failure round: the error surface with the retry action.
+    expect(
+      await screen.findByText("Sign-in options couldn't load"),
+    ).toBeTruthy();
+    expect(harness.getProvidersCalls).toBe(1);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Retry sign-in options" }),
+    );
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Google" })).toBeTruthy(),
+    );
+    expect(harness.getProvidersCalls).toBe(2);
+
+    // The route location was never rewritten across renders: every observed
+    // search string carries the exact nested CLI session link.
+    expect(observedSearch.length).toBeGreaterThan(0);
+    for (const search of observedSearch) {
+      expect(search).toContain(`returnTo=${cliReturnTo}`);
+    }
+    vi.doUnmock("@stwd/sdk");
   });
 });

@@ -326,15 +326,29 @@ describe("CliLoginPage", () => {
       ).toBeTruthy(),
     );
 
+    // Swapping back to the already-completed session now lands on the
+    // terminal success state via the durable completion marker (#30014):
+    // a consumed session must not be re-authorized (a second Authorize would
+    // attempt a second mint against a consumed session).
     searchParamsRef.current = new URLSearchParams("session=sess-1");
     rerender(<CliLoginPage />);
     await waitFor(() =>
-      expect(
-        screen.getByRole("heading", { name: "Authentication Complete!" }),
-      ).toBeTruthy(),
+      expect(screen.getByText("Authentication Complete!")).toBeTruthy(),
     );
+    expect(screen.queryByRole("button", { name: "Authorize" })).toBeNull();
     await Promise.resolve();
     expect(apiFetchMock).toHaveBeenCalledTimes(1);
+
+    // The fresh session still requires its own explicit Authorize gesture.
+    searchParamsRef.current = new URLSearchParams("session=sess-2");
+    rerender(<CliLoginPage />);
+    await waitFor(() =>
+      expect(
+        screen.getByRole("heading", { name: "Authorize CLI Sign-In?" }),
+      ).toBeTruthy(),
+    );
+    await user.click(screen.getByRole("button", { name: "Authorize" }));
+    await waitFor(() => expect(apiFetchMock).toHaveBeenCalledTimes(2));
   });
 
   it("Cancel abandons the flow with no POST and a distinct cancelled state", async () => {
@@ -376,10 +390,17 @@ describe("CliLoginPage", () => {
     );
     expect(apiFetchMock).toHaveBeenCalledTimes(1);
     expect(postMessage).not.toHaveBeenCalled();
-    expect(
-      screen.getByRole("link", { name: "Return to App" }).getAttribute("href"),
-    ).toBe("/");
+    // #30014 terminal contract: an ordinary tab (no opener, not the named
+    // popup) cannot script-close, so it must render the truthful destination
+    // action instead of a no-op Close window button.
     expect(screen.queryByRole("button", { name: "Close window" })).toBeNull();
+    const continueLink = screen.getByRole("link", {
+      name: "Continue to Eliza",
+    });
+    expect(continueLink.getAttribute("href")).toBe("/join");
+    expect(
+      screen.queryByRole("link", { name: "Continue to dashboard" }),
+    ).toBeNull();
     expect(screen.queryByText("API Key Details")).toBeNull();
     expect(screen.queryByText("ek_live_abc")).toBeNull();
     expect(navigateMock).not.toHaveBeenCalled();
@@ -582,6 +603,229 @@ describe("CliLoginPage", () => {
     await user.click(screen.getByRole("button", { name: "Authorize" }));
 
     await waitFor(() => expect(clearStaleStewardSession).toHaveBeenCalled());
+  });
+
+  // --- #30014: terminal contract for non-closable tabs ---
+
+  it("swaps the success Close button for the /join fallback when a close attempt is refused", async () => {
+    const user = userEvent.setup();
+    authenticate();
+    apiFetchMock.mockResolvedValue({
+      json: async () => ({ keyPrefix: "ek_live_abc" }),
+    });
+    // Named popup: a script-opened surface, so Close renders first.
+    Object.defineProperty(window, "opener", {
+      value: null,
+      configurable: true,
+    });
+    const originalName = window.name;
+    window.name = "eliza-cloud-auth";
+    // Refused close: window.closed stays false after window.close().
+    const closeSpy = vi.spyOn(window, "close").mockImplementation(() => {});
+    Object.defineProperty(window, "closed", {
+      configurable: true,
+      get: () => false,
+    });
+
+    try {
+      render(<CliLoginPage />);
+      await user.click(screen.getByRole("button", { name: "Authorize" }));
+
+      await waitFor(() =>
+        expect(screen.getByText("Authentication Complete!")).toBeTruthy(),
+      );
+      // Completion auto-attempted the close; it was refused — the panel must
+      // now offer the truthful fallback action, not the dead Close button.
+      expect(closeSpy).toHaveBeenCalled();
+      await waitFor(() =>
+        expect(
+          screen.getByRole("link", { name: "Continue to Eliza" }),
+        ).toBeTruthy(),
+      );
+      expect(screen.queryByRole("button", { name: "Close window" })).toBeNull();
+    } finally {
+      window.name = originalName;
+      delete (window as { closed?: boolean }).closed;
+    }
+  });
+
+  it("gives an ordinary cancelled tab the /join action instead of a no-op Close button", async () => {
+    const user = userEvent.setup();
+    authenticate();
+    // Ordinary tab: no opener, no popup name.
+    delete (window as { opener?: unknown }).opener;
+    const originalName = window.name;
+    window.name = "";
+
+    try {
+      render(<CliLoginPage />);
+      await user.click(screen.getByRole("button", { name: "Cancel" }));
+
+      expect(screen.getByText("Sign-In Cancelled")).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Close window" })).toBeNull();
+      const continueLink = screen.getByRole("link", {
+        name: "Continue to Eliza",
+      });
+      expect(continueLink.getAttribute("href")).toBe("/join");
+      expect(apiFetchMock).not.toHaveBeenCalled();
+    } finally {
+      window.name = originalName;
+    }
+  });
+
+  it("notifies the opener before attempting the popup close (ordering)", async () => {
+    const user = userEvent.setup();
+    searchParamsRef.current = new URLSearchParams({
+      session: "sess-1",
+      returnTo: "http://localhost:2138/chat?firstRun=1",
+    });
+    authenticate();
+    apiFetchMock.mockResolvedValue({
+      json: async () => ({ keyPrefix: "ek_live_abc" }),
+    });
+    const order: string[] = [];
+    const postMessage = vi.fn(() => order.push("postMessage"));
+    Object.defineProperty(window, "opener", {
+      value: {
+        postMessage,
+        closed: false,
+      },
+      configurable: true,
+    });
+    vi.spyOn(window, "close").mockImplementation(() => order.push("close"));
+
+    render(<CliLoginPage />);
+    await user.click(screen.getByRole("button", { name: "Authorize" }));
+
+    await waitFor(() => expect(order).toEqual(["postMessage", "close"]));
+    expect(apiFetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("initializes terminally from the durable marker WITHOUT minting (late reload)", async () => {
+    // Another tab completed this session; this tab then loads (or reloads)
+    // the /auth/cli-login surface directly. It must render the terminal
+    // success state and never POST /complete — the marker is presentational.
+    const { publishCloudAuthComplete } = await import(
+      "../../../auth/cloud-auth-complete-signal"
+    );
+    // Clear marker pollution from other tests, then publish this session.
+    localStorage.clear();
+    publishCloudAuthComplete("sess-1");
+    authenticate();
+
+    render(<CliLoginPage />);
+
+    expect(screen.getByText("Authentication Complete!")).toBeTruthy();
+    // No Authorize interstitial, no completion POST — reading the marker
+    // must never mint a key.
+    expect(screen.queryByText("Authorize CLI Sign-In?")).toBeNull();
+    expect(apiFetchMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps completion idempotent: a broadcast echo for the same session does not re-POST", async () => {
+    authenticate();
+    apiFetchMock.mockResolvedValue({
+      json: async () => ({ keyPrefix: "ek_live_abc" }),
+    });
+    Object.defineProperty(window, "opener", {
+      value: null,
+      configurable: true,
+    });
+    const originalName = window.name;
+    window.name = "eliza-cloud-auth";
+    // jsdom's real window.close() would tear the shared test window down.
+    vi.spyOn(window, "close").mockImplementation(() => {});
+
+    try {
+      const { publishCloudAuthComplete } = await import(
+        "../../../auth/cloud-auth-complete-signal"
+      );
+      render(<CliLoginPage />);
+      await waitFor(() =>
+        expect(screen.getByText("Authorize CLI Sign-In?")).toBeTruthy(),
+      );
+      // Another tab finished this session while this popup sat on the
+      // interstitial.
+      publishCloudAuthComplete("sess-1");
+      await waitFor(() =>
+        expect(screen.getByText("Authentication Complete!")).toBeTruthy(),
+      );
+      // No Authorize gesture happened here, so no POST was ever made.
+      expect(apiFetchMock).not.toHaveBeenCalled();
+      // A duplicate broadcast for the same session changes nothing.
+      publishCloudAuthComplete("sess-1");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(apiFetchMock).not.toHaveBeenCalled();
+      expect(screen.getByText("Authentication Complete!")).toBeTruthy();
+    } finally {
+      window.name = originalName;
+    }
+  });
+
+  it("never re-POSTs a trusted tab whose session already completed elsewhere (durable marker wins)", async () => {
+    // Regression (#30014 rebase review): a tab with a session-scoped
+    // trusted-app-launch marker (remembered across the hosted login round
+    // trip) reloads AFTER another tab already completed the session. The
+    // durable completion marker must render terminal success WITHOUT the
+    // completion effect firing a second /complete POST.
+    const { publishCloudAuthComplete } = await import(
+      "../../../auth/cloud-auth-complete-signal"
+    );
+    localStorage.clear();
+    // This tab remembered the trusted local launch for this session.
+    testSessionStorage.setItem(TRUSTED_APP_LAUNCH_KEY, "1");
+    // ...and another tab completed the session while this one was away.
+    publishCloudAuthComplete("sess-1");
+    authenticate();
+    apiFetchMock.mockResolvedValue({
+      json: async () => ({ keyPrefix: "ek_live_abc" }),
+    });
+    vi.spyOn(window, "close").mockImplementation(() => {});
+
+    render(<CliLoginPage />);
+
+    // Terminal success from the marker, no Authorize interstitial…
+    await waitFor(() =>
+      expect(screen.getByText("Authentication Complete!")).toBeTruthy(),
+    );
+    expect(
+      screen.queryByRole("heading", { name: "Authorize CLI Sign-In?" }),
+    ).toBeNull();
+    // …and crucially no completion POST even though trustedAppLaunch would
+    // otherwise let the effect skip the explicit Authorize gate.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(apiFetchMock).not.toHaveBeenCalled();
+  });
+
+  it("stays terminal (no POST) even when the durable marker expires while authentication is pending", async () => {
+    // Regression (#30014 rebase review r2): the marker initializes
+    // completion as terminal success; if authentication resolves AFTER the
+    // marker's TTL window, the completion effect must still not fire —
+    // terminal success is permanent for the presented session.
+    const markerKey = "eliza.cloud.auth.complete.v1:sess-1";
+    localStorage.setItem(markerKey, String(Date.now()));
+    testSessionStorage.setItem(TRUSTED_APP_LAUNCH_KEY, "1");
+    // Auth is not ready yet when the surface mounts terminal.
+    sessionAuthRef.current = { ready: false, authenticated: false, user: null };
+    apiFetchMock.mockResolvedValue({
+      json: async () => ({ keyPrefix: "ek_live_abc" }),
+    });
+    vi.spyOn(window, "close").mockImplementation(() => {});
+
+    const { rerender } = render(<CliLoginPage />);
+    await waitFor(() =>
+      expect(screen.getByText("Authentication Complete!")).toBeTruthy(),
+    );
+
+    // The marker ages out of its TTL while auth is still pending, then
+    // authentication resolves — the POST path must remain closed.
+    localStorage.setItem(markerKey, String(Date.now() - 11 * 60_000));
+    authenticate();
+    rerender(<CliLoginPage />);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(screen.getByText("Authentication Complete!")).toBeTruthy();
+    expect(apiFetchMock).not.toHaveBeenCalled();
   });
 });
 

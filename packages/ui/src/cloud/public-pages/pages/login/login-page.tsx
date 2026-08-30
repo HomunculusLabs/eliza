@@ -18,7 +18,7 @@ import { lazy, Suspense, useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { Button } from "../../../../components/primitives";
 import {
-  hasCloudAuthCompleted,
+  hasPersistedCloudAuthComplete,
   isCloudAuthHandoffSurface,
   subscribeCloudAuthComplete,
 } from "../../../auth/cloud-auth-complete-signal";
@@ -102,26 +102,57 @@ function PublicLoginPage(): React.JSX.Element {
   const handoffSessionId = sessionIdFromLoginReturnTo(
     searchParams.get("returnTo"),
   );
-  const [handoffComplete, setHandoffComplete] = useState(false);
+  // A CLI session that already completed in another tab (or before a reload)
+  // leaves a durable marker — the login page must initialize terminally from
+  // it instead of falling back to sign-in options (#30014). BroadcastChannel
+  // alone cannot replay a past completion.
+  const [handoffComplete, setHandoffComplete] = useState(
+    () =>
+      handoffSessionId !== null &&
+      hasPersistedCloudAuthComplete(handoffSessionId),
+  );
+  // True when a scripted window.close() was attempted and this tab survived
+  // (ordinary tabs refuse script-close). The terminal handoff panel then
+  // swaps its no-op Close button for a truthful destination action (#30014).
+  const [tabNotClosable, setTabNotClosable] = useState(false);
+
+  // Terminal state is derived per session: a client-side navigation that
+  // changes the embedded CLI session (or drops the CLI returnTo entirely)
+  // must re-evaluate instead of keeping the one-time useState result.
+  useEffect(() => {
+    setHandoffComplete(
+      handoffSessionId !== null &&
+        hasPersistedCloudAuthComplete(handoffSessionId),
+    );
+    setTabNotClosable(false);
+  }, [handoffSessionId]);
+
+  const closeWindowOrRevealFallback = () => {
+    try {
+      window.close();
+    } catch (error) {
+      void error;
+      // error-policy:J4 a throwing close is treated like a refused one.
+    }
+    if (!window.closed) setTabNotClosable(true);
+  };
 
   usePageTitle(t("cloud.login.metaTitle", { defaultValue: "Sign In | Eliza" }));
 
   useEffect(() => {
     if (!handoffSessionId) return;
-    if (hasCloudAuthCompleted(handoffSessionId)) {
-      setHandoffComplete(true);
-      if (isCloudAuthHandoffSurface()) window.close();
-      return;
-    }
     return subscribeCloudAuthComplete((message) => {
       if (message.sessionId !== handoffSessionId) return;
       setHandoffComplete(true);
-      if (isCloudAuthHandoffSurface()) window.close();
+      try {
+        window.close();
+      } catch (error) {
+        void error;
+      }
     });
   }, [handoffSessionId]);
 
   if (handoffComplete) {
-    const canClose = isCloudAuthHandoffSurface();
     return (
       <LoginBackground>
         <div className="space-y-6 text-center">
@@ -139,23 +170,25 @@ function PublicLoginPage(): React.JSX.Element {
               })}
             </p>
           </div>
-          {canClose ? (
-            <Button
-              className="w-full h-11 bg-accent hover:bg-accent-hover text-accent-foreground"
-              onClick={() => window.close()}
-            >
-              {t("cloud.login.closeWindow", { defaultValue: "Close window" })}
-            </Button>
-          ) : (
+          {tabNotClosable || !isCloudAuthHandoffSurface() ? (
             <Button
               asChild
               className="w-full h-11 bg-accent hover:bg-accent-hover text-accent-foreground"
             >
-              <Link to="/">
-                {t("cloud.authSuccess.returnToAppCta", {
-                  defaultValue: "Return to App",
+              <a href="/join">
+                {t("cloud.login.continueToEliza", {
+                  defaultValue: "Continue to Eliza",
                 })}
-              </Link>
+              </a>
+            </Button>
+          ) : (
+            <Button
+              className="w-full h-11 bg-accent hover:bg-accent-hover text-accent-foreground"
+              onClick={closeWindowOrRevealFallback}
+            >
+              {t("cloud.login.closeWindow", {
+                defaultValue: "Close window",
+              })}
             </Button>
           )}
         </div>
