@@ -7,6 +7,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Memory, UUID } from "@elizaos/core";
+import { MEDIA_WRITE_PORT_SERVICE } from "@elizaos/core";
 import {
   summarizeTranscript,
   type Transcript,
@@ -17,7 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeFakeRuntime, segment } from "../test-support.js";
 import {
   MeetingTranscriptWriter,
-  persistMeetingAudioWav,
+  persistMeetingAudio,
   readTranscriptRow,
   TRANSCRIPTS_TABLE,
 } from "./meeting-transcript-writer.js";
@@ -336,23 +337,266 @@ describe("MeetingTranscriptWriter — throttling", () => {
   });
 });
 
-describe("persistMeetingAudioWav", () => {
-  it("writes content-addressed WAV bytes under the served media dir", () => {
+describe("persistMeetingAudio (media-write port)", () => {
+  it("persists WAV bytes through the port content-addressed under the served media dir", async () => {
     const dir = mkdtempSync(join(tmpdir(), "meetings-audio-"));
     const prev = process.env.ELIZA_STATE_DIR;
     process.env.ELIZA_STATE_DIR = dir;
     try {
+      const fake = makeFakeRuntime();
       const wav = Buffer.from("RIFF-fake-wav-bytes");
-      const url = persistMeetingAudioWav(wav);
-      expect(url).toMatch(/^\/api\/media\/[0-9a-f]{64}\.wav$/);
-      const hash = url.slice("/api/media/".length);
-      expect(existsSync(join(dir, "media", hash))).toBe(true);
+      const stored = await persistMeetingAudio(fake.runtime, wav);
+      expect(stored.url).toMatch(/^\/api\/media\/[0-9a-f]{64}\.wav$/);
+      expect(stored.hash).toBe(stored.fileName.split(".")[0]);
+      expect(existsSync(join(dir, "media", stored.fileName))).toBe(true);
       // Idempotent.
-      expect(persistMeetingAudioWav(wav)).toBe(url);
+      expect((await persistMeetingAudio(fake.runtime, wav)).url).toBe(
+        stored.url,
+      );
     } finally {
       if (prev === undefined) delete process.env.ELIZA_STATE_DIR;
       else process.env.ELIZA_STATE_DIR = prev;
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("fails closed with the typed error when the host registered no port", async () => {
+    const fake = makeFakeRuntime();
+    delete fake.services[MEDIA_WRITE_PORT_SERVICE];
+    await expect(
+      persistMeetingAudio(fake.runtime, Buffer.from("RIFF-x")),
+    ).rejects.toMatchObject({ code: "MEDIA_WRITE_PORT_UNAVAILABLE" });
+  });
+
+  it("finalize fails closed (no fallback writer) when the port is absent", async () => {
+    const fake = makeFakeRuntime();
+    delete fake.services[MEDIA_WRITE_PORT_SERVICE];
+    const writer = new MeetingTranscriptWriter(fake.runtime, 0);
+    await writer.start(START_INPUT);
+    await expect(
+      writer.finalize({
+        segments: [segment("s1", "Jill", "hi", 0, 500)],
+        endReason: "normal_completion",
+        participants: [],
+        audioWav: Buffer.from("RIFF-real-wav-payload-bytes"),
+      }),
+    ).rejects.toMatchObject({ code: "MEDIA_WRITE_PORT_UNAVAILABLE" });
+    // No fabricated success: nothing was written under the media dir and no
+    // finalized row claims a ready status with audio.
+    expect(fake.memories.get(writer.transcriptId)).toMatchObject({
+      metadata: expect.objectContaining({ status: "recording" }),
+    });
+  });
+
+  it("a port failure during finalize stays retryable — retry succeeds and finalizes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "meetings-retry-"));
+    const prev = process.env.ELIZA_STATE_DIR;
+    process.env.ELIZA_STATE_DIR = dir;
+    try {
+      const fake = makeFakeRuntime();
+      const port = fake.services[MEDIA_WRITE_PORT_SERVICE] as {
+        persistMedia: (b: Uint8Array, m: string) => Promise<{ url: string }>;
+      };
+      let failNext = true;
+      const original = port.persistMedia.bind(port);
+      port.persistMedia = (b: Uint8Array, m: string) => {
+        if (failNext) {
+          failNext = false;
+          return Promise.reject(new Error("store temporarily down"));
+        }
+        return original(b, m);
+      };
+      const writer = new MeetingTranscriptWriter(fake.runtime, 0);
+      await writer.start(START_INPUT);
+      await expect(
+        writer.finalize({
+          segments: [segment("s1", "Jill", "hi", 0, 500)],
+          endReason: "normal_completion",
+          participants: [],
+          audioWav: Buffer.from("RIFF-wav"),
+        }),
+      ).rejects.toThrow("store temporarily down");
+      // The failed finalize must NOT be remembered as done: a retry re-runs
+      // and completes (the old code returned the stale recording transcript).
+      const final = await writer.finalize({
+        segments: [segment("s1", "Jill", "hi", 0, 500)],
+        endReason: "normal_completion",
+        participants: [],
+        audioWav: Buffer.from("RIFF-wav"),
+      });
+      expect(final.status).toBe("ready");
+      expect(final.audioUrl).toMatch(/^\/api\/media\/[0-9a-f]{64}\.wav$/);
+    } finally {
+      if (prev === undefined) delete process.env.ELIZA_STATE_DIR;
+      else process.env.ELIZA_STATE_DIR = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("concurrent finalize calls share one operation and both see the final state", async () => {
+    const fake = makeFakeRuntime();
+    const writer = new MeetingTranscriptWriter(fake.runtime, 0);
+    await writer.start(START_INPUT);
+    const input = {
+      segments: [segment("s1", "Jill", "hi", 0, 500)],
+      endReason: "normal_completion" as const,
+      participants: [],
+      audioWav: Buffer.from("RIFF-wav"),
+    };
+    const [a, b] = await Promise.all([
+      writer.finalize(input),
+      writer.finalize(input),
+    ]);
+    expect(a.status).toBe("ready");
+    expect(b.status).toBe("ready");
+    expect(a).toBe(b);
+  });
+
+  it("overlapping incremental flushes serialize — finalize's row is strictly last", async () => {
+    const fake = makeFakeRuntime();
+    const writeOrder: string[] = [];
+    let releaseRecording: (() => void) | null = null;
+    const release = (): void => {
+      releaseRecording?.();
+    };
+    const runtime = fake.runtime as unknown as {
+      updateMemory: (patch: { metadata: { status: string } }) => Promise<boolean>;
+    };
+    const originalUpdate = runtime.updateMemory.bind(runtime);
+    runtime.updateMemory = async (patch) => {
+      writeOrder.push(`start:${patch.metadata.status}`);
+      if (patch.metadata.status === "recording") {
+        // Block EVERY incremental recording write on a deferred the test
+        // controls, so finalize() genuinely overlaps an in-flight write.
+        await new Promise<void>((r) => {
+          releaseRecording = r;
+        });
+      }
+      const ok = await originalUpdate(patch);
+      writeOrder.push(`end:${patch.metadata.status}`);
+      return ok;
+    };
+    const writer = new MeetingTranscriptWriter(fake.runtime, 0);
+    await writer.start(START_INPUT);
+    writer.updateSegments([segment("s1", "Jill", "slow update", 0, 500)]);
+    // Wait until the incremental recording write is REALLY in flight.
+    while (releaseRecording === null) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    // Hammer more updates while the write is stalled — the coalescing bound
+    // (one active + one pending) must hold instead of queueing redundant
+    // writes.
+    writer.updateSegments([segment("s1", "Jill", "u2", 0, 600)]);
+    writer.updateSegments([segment("s1", "Jill", "u3", 0, 700)]);
+
+    const finalizing = writer.finalize({
+      segments: [segment("s1", "Jill", "done", 0, 500)],
+      endReason: "normal_completion",
+      participants: [],
+      audioWav: null,
+    });
+    // Let the event loop interleave; the terminal write must remain queued
+    // BEHIND the stalled recording write.
+    await new Promise((r) => setTimeout(r, 10));
+    release();
+    const final = await finalizing;
+    expect(final.status).toBe("ready");
+    // Both writes really happened, in serialized order.
+    const lastRecordingEnd = writeOrder.lastIndexOf("end:recording");
+    const readyEnd = writeOrder.indexOf("end:ready");
+    expect(lastRecordingEnd).toBeGreaterThanOrEqual(0);
+    expect(readyEnd).toBeGreaterThanOrEqual(0);
+    expect(readyEnd).toBeGreaterThan(lastRecordingEnd);
+    const row = fake.memories.get(writer.transcriptId) as Memory;
+    expect(transcriptsViewReader(row)?.status).toBe("ready");
+    // The queued follow-up legitimately short-circuits once finalize owns the
+    // terminal write (its input segments are the final state), so exactly one
+    // recording pass ran here; the no-lost-update drain property is proven by
+    // the dedicated mid-write drain test below without finalize.
+    expect(writeOrder.filter((w) => w === "start:recording").length).toBe(1);
+  });
+
+  it("updates landing mid-write are drained — the latest segments reach the store without finalize", async () => {
+    const fake = makeFakeRuntime();
+    let releaseFirst: (() => void) | null = null;
+    const release = (): void => {
+      releaseFirst?.();
+    };
+    const statuses: string[] = [];
+    const texts: string[] = [];
+    const runtime = fake.runtime as unknown as {
+      updateMemory: (patch: {
+        metadata: { status: string };
+        content: { text: string };
+      }) => Promise<boolean>;
+    };
+    const originalUpdate = runtime.updateMemory.bind(runtime);
+    runtime.updateMemory = async (patch) => {
+      // Capture the full persisted preview per write.
+      statuses.push(patch.metadata.status);
+      texts.push(patch.content.text);
+      if (releaseFirst === null && patch.metadata.status === "recording") {
+        await new Promise<void>((r) => {
+          releaseFirst = r;
+        });
+      }
+      return originalUpdate(patch);
+    };
+    const writer = new MeetingTranscriptWriter(fake.runtime, 0);
+    await writer.start(START_INPUT);
+    writer.updateSegments([segment("s1", "Jill", "first", 0, 500)]);
+    // Wait until the first incremental write is in flight...
+    while (releaseFirst === null) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    // ...then dirty newer segments WHILE that write is stalled. The drain
+    // must eventually persist "latest wins" without any finalize call.
+    writer.updateSegments([segment("s1", "Jill", "latest wins", 0, 900)]);
+    release();
+    // Let the drain settle (no finalize — the writer stays recording).
+    await new Promise((r) => setTimeout(r, 50));
+    const row = fake.memories.get(writer.transcriptId) as Memory;
+    expect(transcriptsViewReader(row)?.status).toBe("recording");
+    expect(texts[texts.length - 1]).toContain("latest wins");
+  });
+
+  it("a failed final row write never publishes a speculative ready state", async () => {
+    const fake = makeFakeRuntime();
+    const runtime = fake.runtime as unknown as {
+      updateMemory: (patch: { metadata: { status: string } }) => Promise<boolean>;
+    };
+    const originalUpdate = runtime.updateMemory.bind(runtime);
+    let failReady = true;
+    runtime.updateMemory = async (patch) => {
+      if (patch.metadata.status === "ready" && failReady) {
+        failReady = false;
+        return false; // "row vanished" failure path
+      }
+      return originalUpdate(patch);
+    };
+    const writer = new MeetingTranscriptWriter(fake.runtime, 0);
+    await writer.start(START_INPUT);
+    await expect(
+      writer.finalize({
+        segments: [segment("s1", "Jill", "hi", 0, 500)],
+        endReason: "normal_completion",
+        participants: [],
+        audioWav: null,
+      }),
+    ).rejects.toThrow("row vanished before finalize");
+    // A subsequent incremental flush must still write RECORDING state —
+    // the failed finalize must not have leaked a speculative "ready".
+    writer.updateSegments([segment("s1", "Jill", "still live", 0, 500)]);
+    await new Promise((r) => setTimeout(r, 5));
+    const row = fake.memories.get(writer.transcriptId) as Memory;
+    expect(transcriptsViewReader(row)?.status).toBe("recording");
+    // And the writer stays retryable: a second finalize completes.
+    const final = await writer.finalize({
+      segments: [segment("s1", "Jill", "hi", 0, 500)],
+      endReason: "normal_completion",
+      participants: [],
+      audioWav: null,
+    });
+    expect(final.status).toBe("ready");
   });
 });

@@ -53,7 +53,7 @@ import {
 import { buildZoomBotMeetingArtifact } from "./platforms/zoom/shared-artifact.js";
 import {
   MeetingTranscriptWriter,
-  persistMeetingMedia,
+  persistMeetingAudio,
 } from "./transcripts/meeting-transcript-writer.js";
 import type {
   MeetingAudioSink,
@@ -561,6 +561,7 @@ export class MeetingService extends Service {
       retainRecordings: request.retainRecordings,
       maxFileBytes: request.maxFileBytes,
       maxTotalBytes: request.maxTotalBytes,
+      mediaRuntime: this.runtime,
     });
     const importId = crypto.randomUUID() as UUID;
     const roomId = createUniqueUuid(
@@ -849,7 +850,10 @@ export class MeetingService extends Service {
       let retainedAudio: { url: string; contentType: string } | undefined;
       let meetingArtifact: MeetingArtifact | undefined;
       if (session.platform === "zoom" && audioWav && audioWav.length > 0) {
-        const stored = persistMeetingMedia(audioWav, "wav");
+        // Persist through the host media-write port (single content-addressed
+        // store); the transcript record and the bot artifact share the store's
+        // canonical URL + hash so they cannot drift (#30019).
+        const stored = await persistMeetingAudio(this.runtime, audioWav);
         const endedAt = new Date().toISOString();
         meetingArtifact = buildZoomBotMeetingArtifact({
           artifactId: `zoom-bot:${session.id}`,
@@ -861,7 +865,12 @@ export class MeetingService extends Service {
           endedAt,
           participants: session.participants,
           segments,
-          audio: { ...stored, mimeType: "audio/wav" },
+          audio: {
+            id: stored.hash,
+            url: stored.url,
+            mimeType: "audio/wav",
+            checksum: stored.hash,
+          },
         });
         retainedAudio = { url: stored.url, contentType: "audio/wav" };
       }

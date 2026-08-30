@@ -83,9 +83,9 @@ plugin-local-inference's `TranscriptStore` (`metadata.type "custom"`,
 `content.text` preview), so the existing `/api/transcripts*` routes and the
 Transcripts view render meeting transcripts with zero extra wiring — a golden
 test (`meeting-transcript-writer.test.ts`) parses persisted rows with the exact
-reader logic those routes use. Retained session audio is written
-content-addressed under `<stateDir>/media/<sha256>.wav` (served at
-`/api/media/…`), and the final text is mirrored into the documents/knowledge
+reader logic those routes use. Retained session audio is persisted through the host
+media-write port (`MEDIA_WRITE_PORT_SERVICE`, the single content-addressed
+store) and served at `/api/media/<sha256>.<ext>`, and the final text is mirrored into the documents/knowledge
 store (tag `"transcript"`, `clientDocumentId` = transcript id, `textBacked`).
 
 ## Live WebSocket events

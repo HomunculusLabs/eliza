@@ -53,6 +53,7 @@ const EXT_BY_MIME: Record<string, string> = {
   "text/plain": "txt",
   "text/csv": "csv",
   "text/markdown": "md",
+  "text/vtt": "vtt",
   "application/json": "json",
 };
 
@@ -81,6 +82,7 @@ const MIME_BY_EXT: Record<string, string> = {
   txt: "text/plain; charset=utf-8",
   csv: "text/csv; charset=utf-8",
   md: "text/markdown; charset=utf-8",
+  vtt: "text/vtt",
   json: "application/json; charset=utf-8",
   bin: "application/octet-stream",
 };

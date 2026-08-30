@@ -6,12 +6,20 @@
  * exported from the package root.
  */
 
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type {
   Action,
   IAgentRuntime,
   Memory,
   Plugin,
   UUID,
+} from "@elizaos/core";
+import {
+  MEDIA_WRITE_PORT_SERVICE,
+  type MediaWritePort,
+  resolveStateDir,
 } from "@elizaos/core";
 import type {
   MeetingBillingState,
@@ -47,6 +55,8 @@ export interface FakeRuntime {
   events: Array<{ event: string | string[]; payload: unknown }>;
   reportedErrors: Array<{ scope: string; error: unknown; context?: unknown }>;
   settings: Record<string, string>;
+  /** Extra runtime services the fake exposes (media-write port by default). */
+  services: Record<string, unknown>;
 }
 
 export function makeFakeRuntime(): FakeRuntime {
@@ -64,6 +74,9 @@ export function makeFakeRuntime(): FakeRuntime {
     context?: unknown;
   }> = [];
   const settings: Record<string, string> = {};
+  const services: Record<string, unknown> = {
+    [MEDIA_WRITE_PORT_SERVICE]: realMediaWritePort(),
+  };
 
   const connectorSetup = {
     broadcastWs: (data: object) => {
@@ -84,6 +97,9 @@ export function makeFakeRuntime(): FakeRuntime {
     getService: (name: string) => {
       if (name === "connector-setup") return connectorSetup;
       if (name === "documents") return documentsService;
+      if (name === MEDIA_WRITE_PORT_SERVICE) {
+        return services[MEDIA_WRITE_PORT_SERVICE];
+      }
       return null;
     },
     ensureWorldExists: async (world: Record<string, unknown>) => {
@@ -128,6 +144,37 @@ export function makeFakeRuntime(): FakeRuntime {
     events,
     reportedErrors,
     settings,
+    services,
+  };
+}
+
+/**
+ * Real-filesystem content-addressed media-write port (test double of the host
+ * `MediaWritePortService` in @elizaos/agent, covered by its own suite). Mirrors
+ * the store's write algorithm — sha256 file name under
+ * `${ELIZA_STATE_DIR}/media`, idempotent, canonical `/api/media/` URL — so
+ * plugin tests assert the same contract the host store enforces. `MIME->ext`
+ * mapping mirrors the store's table for the extensions meetings produce.
+ */
+export function realMediaWritePort(): MediaWritePort {
+  const EXT_BY_MIME: Record<string, string> = {
+    "audio/wav": "wav",
+    "audio/mp4": "m4a",
+    "audio/mpeg": "mp3",
+    "video/mp4": "mp4",
+    "text/vtt": "vtt",
+  };
+  return {
+    async persistMedia(bytes: Uint8Array, mimeType: string) {
+      const hash = createHash("sha256").update(bytes).digest("hex");
+      const ext = EXT_BY_MIME[mimeType.trim().toLowerCase()] ?? "bin";
+      const fileName = `${hash}.${ext}`;
+      const dir = join(resolveStateDir(), "media");
+      mkdirSync(dir, { recursive: true });
+      const file = join(dir, fileName);
+      if (!existsSync(file)) writeFileSync(file, bytes);
+      return { url: `/api/media/${fileName}`, hash, fileName };
+    },
   };
 }
 

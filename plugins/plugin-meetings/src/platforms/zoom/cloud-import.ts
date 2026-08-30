@@ -8,6 +8,7 @@
 import { createHash } from "node:crypto";
 import {
   fetchWithSsrfGuard,
+  requireMediaWritePort,
   toWellFormedUnicode,
   truncateWellFormed,
 } from "@elizaos/core";
@@ -20,7 +21,7 @@ import {
   type MeetingArtifactSourceStream,
   type MeetingArtifactTranscriptSpan,
 } from "@elizaos/shared";
-import { persistMeetingMedia } from "../../transcripts/meeting-transcript-writer.js";
+import type { MeetingTranscriptRuntime } from "../../transcripts/meeting-transcript-writer.js";
 
 const ZOOM_API_BASE = "https://api.zoom.us/v2";
 const DEFAULT_JSON_LIMIT = 8 * 1024 * 1024;
@@ -62,6 +63,13 @@ export interface ZoomCloudImportInput {
   maxFileBytes?: number;
   maxTotalBytes?: number;
   fetchImpl?: FetchLike;
+  /**
+   * Runtime used to resolve the host media-write port that persists retained
+   * recording bytes into the single content-addressed store (#30019).
+   * Required — an absent port fails the import closed with the typed
+   * `MediaWritePortUnavailableError` instead of skipping the write.
+   */
+  mediaRuntime: MeetingTranscriptRuntime;
 }
 
 export interface ZoomCloudImportResult {
@@ -186,21 +194,34 @@ export async function importZoomCloudMeeting(
     pending.push({ source: file, bytes, ...format });
   }
 
-  // Compute canonical refs before writing. Every remote read and artifact
-  // validation must succeed before bytes become visible in the media store.
-  const downloaded: DownloadedFile[] = pending.map((file) => {
+  // Compute canonical refs before writing. Retained bytes are persisted
+  // through the host media-write port (single content-addressed store) as each
+  // file is downloaded; the canonical URL and hash come from the store, so
+  // artifact media refs and stored files can never drift. Note the ordering
+  // trade-off this implies: bytes become visible in the store BEFORE the
+  // final artifact validation — a later validation failure rejects the import
+  // (no fabricated success) and the unreferenced content-addressed objects
+  // remain GC-able, because canonical store URLs are only known after the
+  // port returns.
+  const mediaPort = requireMediaWritePort(input.mediaRuntime);
+  const downloaded: DownloadedFile[] = [];
+  for (const file of pending) {
     const checksum = createHash("sha256").update(file.bytes).digest("hex");
-    return {
+    const stored = await mediaPort.persistMedia(
+      new Uint8Array(file.bytes),
+      file.mimeType,
+    );
+    downloaded.push({
       ...file,
       media: {
         id: checksum,
-        url: `/api/media/${checksum}.${file.extension}`,
+        url: stored.url,
         mimeType: file.mimeType,
         checksum,
         title: zoomFileTitle(file.source),
       },
-    };
-  });
+    });
+  }
   const warnings = importWarnings(recordingFiles, downloaded);
   let artifact: MeetingArtifact;
   try {
@@ -220,9 +241,6 @@ export async function importZoomCloudMeeting(
       undefined,
       error,
     );
-  }
-  for (const file of downloaded) {
-    persistMeetingMedia(file.bytes, file.extension);
   }
   return { artifact, warnings, requestIds: [...new Set(requestIds)] };
 }

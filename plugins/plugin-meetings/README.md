@@ -59,7 +59,8 @@ meeting id and a short-lived OAuth access token (or reads
 recordings resources, parses downloaded VTT cues, and emits the shared
 `MeetingArtifact` schema `eliza.meeting_artifact.v1`. Every retained VTT,
 audio, or video file is byte-bounded, fetched through the SSRF/redirect guard,
-and rehosted under `/api/media/<sha256>.<ext>` before the artifact is validated.
+and rehosted under `/api/media/<sha256>.<ext>` (canonical handles keyed from
+MIME types by the host store) before the artifact is validated.
 The token is never logged, returned, or persisted. Provider authorization,
 permission, missing-resource, expired-resource, malformed-response, network,
 and byte-quota failures remain typed at the private HTTP boundary.
@@ -85,9 +86,9 @@ plugin-local-inference's `TranscriptStore` (`metadata.type "custom"`,
 `content.text` preview), so the existing `/api/transcripts*` routes and the
 Transcripts view render meeting transcripts with zero extra wiring — a golden
 test (`meeting-transcript-writer.test.ts`) parses persisted rows with the exact
-reader logic those routes use. Retained session audio is written
-content-addressed under `<stateDir>/media/<sha256>.wav` (served at
-`/api/media/…`), and the final text is mirrored into the documents/knowledge
+reader logic those routes use. Retained session audio is persisted through the host
+media-write port (`MEDIA_WRITE_PORT_SERVICE`, the single content-addressed
+store) and served at `/api/media/<sha256>.<ext>`, and the final text is mirrored into the documents/knowledge
 store (tag `"transcript"`, `clientDocumentId` = transcript id, `textBacked`).
 
 ## Live WebSocket events

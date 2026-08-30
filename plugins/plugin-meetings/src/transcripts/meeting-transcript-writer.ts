@@ -28,14 +28,12 @@
  * `clientDocumentId` = transcript id, `textBacked: true`).
  */
 
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import {
   logger,
+  type MediaWriteResult,
   type Memory,
   type MemoryMetadata,
-  resolveStateDir,
+  requireMediaWritePort,
   type UUID,
 } from "@elizaos/core";
 import type {
@@ -157,32 +155,18 @@ export function readTranscriptRow(row: Memory): Transcript | null {
 }
 
 /**
- * Persist mono PCM16 WAV bytes into the content-addressed media store dir the
- * agent already serves at `/api/media/<sha256>.wav` (same mechanism as
- * plugin-local-inference's transcript-audio-store). Idempotent.
+ * Persist meeting audio bytes through the host-owned content-addressed media
+ * store (`MEDIA_WRITE_PORT_SERVICE`), returning the served
+ * `/api/media/<sha256>.<ext>` handle. Fails closed with the typed
+ * `MediaWritePortUnavailableError` when the host did not register the port —
+ * the plugin must never fall back to its own writer (#30019).
  */
-export function persistMeetingMedia(
-  bytes: Buffer,
-  extension: string,
-): { id: string; url: string; checksum: string } {
-  const normalizedExtension = extension.toLowerCase().replace(/^\./, "");
-  if (!/^[a-z0-9]{1,10}$/.test(normalizedExtension)) {
-    throw new Error("[MeetingService] media extension is invalid");
-  }
-  const hash = createHash("sha256").update(bytes).digest("hex");
-  const dir = join(resolveStateDir(), "media");
-  mkdirSync(dir, { recursive: true });
-  const file = join(dir, `${hash}.${normalizedExtension}`);
-  if (!existsSync(file)) writeFileSync(file, bytes);
-  return {
-    id: hash,
-    url: `/api/media/${hash}.${normalizedExtension}`,
-    checksum: hash,
-  };
-}
-
-export function persistMeetingAudioWav(wav: Buffer): string {
-  return persistMeetingMedia(wav, "wav").url;
+export async function persistMeetingAudio(
+  runtime: MeetingTranscriptRuntime,
+  wav: Buffer,
+): Promise<MediaWriteResult> {
+  const port = requireMediaWritePort(runtime);
+  return port.persistMedia(new Uint8Array(wav), "audio/wav");
 }
 
 /**
@@ -196,9 +180,24 @@ export class MeetingTranscriptWriter {
   private transcript: Transcript | null = null;
   private input: StartMeetingTranscriptInput | null = null;
   private segments: TranscriptSegment[] = [];
+  /** Monotonic version of `segments` — bumped on every updateSegments call. */
+  private segmentsVersion = 0;
   private lastWriteAt = 0;
   private pendingFlush: ReturnType<typeof setTimeout> | null = null;
   private finalized = false;
+  /**
+   * Serialized incremental-flush drain: at most one ACTIVE flush plus one
+   * QUEUED follow-up pass. Updates arriving while a pass is active schedule
+   * exactly one follow-up (which reads the then-current segments), so writes
+   * never complete out of order, no update is lost, and the queue stays
+   * bounded under sustained updates. `finalize()` awaits the drain before its
+   * terminal write (the async media port widened that race window).
+   */
+  private flushChain: Promise<void> = Promise.resolve();
+  private flushActive = false;
+  private flushQueued = false;
+  /** Shared finalize operation so concurrent callers await the same result. */
+  private finalizePromise: Promise<Transcript> | null = null;
 
   constructor(
     private readonly runtime: MeetingTranscriptRuntime,
@@ -271,8 +270,9 @@ export class MeetingTranscriptWriter {
    * throttled store update — at most one write per `throttleMs`.
    */
   updateSegments(segments: TranscriptSegment[]): void {
-    if (this.finalized || !this.transcript) return;
+    if (this.finalizePromise || !this.transcript) return;
     this.segments = segments;
+    this.segmentsVersion += 1;
     const elapsed = this.now() - this.lastWriteAt;
     if (elapsed >= this.throttleMs) {
       void this.flush();
@@ -295,7 +295,48 @@ export class MeetingTranscriptWriter {
    * the next update simply retries.
    */
   private async flush(): Promise<void> {
-    if (this.finalized || !this.transcript) return;
+    // While a pass is active, ensure exactly ONE follow-up pass is queued;
+    // each pass drains until quiescent (see drainFlushes), so no update is
+    // lost and the backlog stays bounded (active + one queued).
+    if (this.flushActive) {
+      if (!this.flushQueued) {
+        this.flushQueued = true;
+        const run = this.flushChain
+          .then(() => this.drainFlushes())
+          .finally(() => {
+            this.flushQueued = false;
+          });
+        this.flushChain = run;
+      }
+      return this.flushChain;
+    }
+    this.flushActive = true;
+    const run = this.flushChain
+      .then(() => this.drainFlushes())
+      .finally(() => {
+        this.flushActive = false;
+      });
+    this.flushChain = run;
+    return run;
+  }
+
+  /**
+   * Flush repeatedly until no new segments arrived during the last write.
+   * A pass snapshots `this.segments` inside `doFlush`, so updates landing
+   * mid-write bump `segmentsVersion` and force one more pass — the drain
+   * cannot return while dirty data is unpersisted.
+   */
+  private async drainFlushes(): Promise<void> {
+    let seen = -1;
+    while (!this.finalized && !this.finalizePromise && this.transcript) {
+      if (seen === this.segmentsVersion) break;
+      seen = this.segmentsVersion;
+      await this.doFlush();
+    }
+  }
+
+  private async doFlush(): Promise<void> {
+    if (this.finalized || this.finalizePromise || !this.transcript) return;
     this.lastWriteAt = this.now();
     const next: Transcript = {
       ...this.transcript,
@@ -334,17 +375,38 @@ export class MeetingTranscriptWriter {
 
   /** Final write: status "ready", timings, participants, audio + knowledge mirror. */
   async finalize(input: FinalizeMeetingTranscriptInput): Promise<Transcript> {
+    // Concurrent callers share one finalize operation; both observe the same
+    // outcome instead of a half-finalized transcript.
+    if (this.finalizePromise) return this.finalizePromise;
+    this.finalizePromise = this.doFinalize(input);
+    try {
+      return await this.finalizePromise;
+    } finally {
+      // A failed finalize stays retryable: the transcript has not been marked
+      // final, so a retry re-runs the write instead of returning stale
+      // "recording" state as if it had succeeded.
+      if (!this.finalized) this.finalizePromise = null;
+    }
+  }
+
+  private async doFinalize(
+    input: FinalizeMeetingTranscriptInput,
+  ): Promise<Transcript> {
     if (!this.transcript || !this.input) {
       throw new Error(
         "[MeetingService] finalize called before transcript start",
       );
     }
     if (this.finalized) return this.transcript;
-    this.finalized = true;
     if (this.pendingFlush !== null) {
       clearTimeout(this.pendingFlush);
       this.pendingFlush = null;
     }
+    // Serialize against the full chain of incremental flushes so the finalized
+    // row is strictly the LAST write (an async media-write port widened this
+    // window; without the await a stale recording-status row could land after
+    // the final state).
+    await this.flushChain;
 
     const endedAt = this.now();
     if (input.audioWav && input.retainedAudio) {
@@ -355,7 +417,8 @@ export class MeetingTranscriptWriter {
     let audioUrl: string | undefined;
     let audioContentType: string | undefined;
     if (input.audioWav && input.audioWav.length > 0) {
-      audioUrl = persistMeetingAudioWav(input.audioWav);
+      const stored = await persistMeetingAudio(this.runtime, input.audioWav);
+      audioUrl = stored.url;
       audioContentType = "audio/wav";
     } else if (input.retainedAudio) {
       audioUrl = input.retainedAudio.url;
@@ -391,8 +454,12 @@ export class MeetingTranscriptWriter {
 
     const knowledgeDocumentId = await this.mirrorToKnowledge(final);
     if (knowledgeDocumentId) final.knowledgeDocumentId = knowledgeDocumentId;
-    this.transcript = final;
 
+    // Publish the final transcript object into the writer state ONLY after
+    // the durable row write succeeds — a failed updateMemory must leave the
+    // recording-state transcript authoritative, so a later incremental flush
+    // can never persist a speculative terminal state after finalize()
+    // reported failure.
     const { content, metadata } = transcriptContentAndMetadata(final);
     const ok = await this.runtime.updateMemory({
       id: this.transcriptId,
@@ -404,6 +471,7 @@ export class MeetingTranscriptWriter {
         `[MeetingService] transcript ${this.transcriptId} row vanished before finalize`,
       );
     }
+    this.transcript = final;
     logger.info(
       {
         transcriptId: this.transcriptId,
@@ -414,6 +482,10 @@ export class MeetingTranscriptWriter {
       },
       "[MeetingService] meeting transcript finalized (ready)",
     );
+    // Mark final only after the durable write succeeded — a failed finalize
+    // stays retryable and concurrent updateSegments() calls keep working
+    // until the record actually reaches its terminal state.
+    this.finalized = true;
     return final;
   }
 
