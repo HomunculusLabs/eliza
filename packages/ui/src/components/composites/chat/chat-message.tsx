@@ -1177,6 +1177,7 @@ export const ChatMessage = memo(function ChatMessage({
               variant="glass"
               bare={isFlatAssistant}
               tone={isUser ? "user" : "assistant"}
+              source={normalizedSource}
               {...(holdHandlers ?? {})}
               role="button"
               tabIndex={0}
@@ -1203,6 +1204,7 @@ export const ChatMessage = memo(function ChatMessage({
               variant="glass"
               bare={isFlatAssistant}
               tone={isUser ? "user" : "assistant"}
+              source={normalizedSource}
               tabIndex={-1}
               aria-label={`${isUser ? "Your" : agentName} message`}
               {...(holdHandlers ?? {})}
