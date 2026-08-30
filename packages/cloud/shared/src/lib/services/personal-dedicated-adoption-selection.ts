@@ -898,6 +898,16 @@ export async function executePersonalDedicatedSelectionRereview(
       elizaAgentTierUpgradeAdvisoryLockSql(params.organizationId, params.sourceAgentId),
     );
 
+    if (params.selectedByUserId === null) {
+      // A receipt replacement must remain durably attributable; the
+      // synthetic loopback-only development admin has no users row, so it
+      // may preview but never replace a selection.
+      throw selectionError(
+        "PERSONAL_DEDICATED_SELECTION_CONFLICT",
+        "The Dedicated re-review requires a durable administrator identity",
+        params,
+      );
+    }
     const [receipt] = await tx
       .select()
       .from(personalDedicatedAdoptionSelections)

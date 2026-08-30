@@ -101,9 +101,12 @@ export const personalDedicatedAdoptionSelections = pgTable(
         AND ${table.restore_fence_started_at} IS NOT NULL
       )`,
     ),
+    // >= 1 since migration 0366: an explicit re-review may record a sole
+    // remaining candidate. The initial select boundary still requires a
+    // genuinely ambiguous (>= 2) inventory in application code.
     candidate_count_check: check(
       "personal_dedicated_adoption_selections_candidate_count_check",
-      sql`${table.candidate_count} >= 2`,
+      sql`${table.candidate_count} >= 1`,
     ),
   }),
 );

@@ -900,6 +900,9 @@ describe("admin personal Dedicated adoption selection", () => {
       candidate_count: 1,
       inventory_fingerprint: preview.inventoryFingerprint,
     });
+    expect(refreshed.updated_at.getTime()).toBeGreaterThan(
+      original.updated_at.getTime(),
+    );
 
     expect(
       await resolvePersonalDedicatedAdoption({
@@ -921,6 +924,31 @@ describe("admin personal Dedicated adoption selection", () => {
     expect(await selectResponse.json()).toMatchObject({
       code: "personal_dedicated_selection_conflict",
     });
+  });
+
+  test("the synthetic local admin may preview re-review but never replace the receipt", async () => {
+    const original = await seedStaleSelection();
+    await dbWrite.delete(agentSandboxes).where(eq(agentSandboxes.id, STALE));
+
+    adminIdentity = {
+      id: "00000000-0000-4000-8000-000000000001",
+      email: "local-dev-admin@localhost",
+      organization_id: ORG_B,
+      organization: { id: ORG_B, name: "Admin Org", is_active: true },
+    };
+    const preview = await rereviewPreview(RETAINED);
+    expect(preview.candidateCount).toBe(1);
+
+    const response = await post(rereviewRequestBody(RETAINED, false, preview));
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      code: "personal_dedicated_selection_conflict",
+    });
+    const [unchanged] = await dbWrite
+      .select()
+      .from(personalDedicatedAdoptionSelections);
+    expect(unchanged).toEqual(original);
+    expect(await dbWrite.select().from(jobs)).toHaveLength(0);
   });
 
   test("rejects re-review when the named target is deleted or ineligible", async () => {

@@ -277,7 +277,6 @@ export const PROVISIONING_JOB_TEST_TABLES: readonly string[] = [
   "backup_schedule_attempts" integer NOT NULL DEFAULT 0,
   "backup_schedule_last_error_code" text,
   "backup_schedule_last_protected_at" timestamptz,
-  "backup_admission_xid" text,
   "created_at" timestamptz NOT NULL DEFAULT now(),
   "updated_at" timestamptz NOT NULL DEFAULT now(),
   "deleted_at" timestamptz,
