@@ -12,6 +12,7 @@ import { logger } from "@elizaos/core";
 import {
 	isRuntimeManagementOperation,
 	RUNTIME_MANAGEMENT_OPERATIONS,
+	RUNTIME_MANAGEMENT_OWNER_EXEMPT_OPERATIONS,
 	type RuntimeManagementRequest,
 	type RuntimeManagementResult,
 } from "@elizaos/shared";
@@ -41,7 +42,10 @@ const REQUEST_TIMEOUT_MS = 50_000;
 const CONFIRMATION_REQUIRED: ReadonlySet<RuntimeManagementRequest["op"]> =
 	new Set(
 		RUNTIME_MANAGEMENT_OPERATIONS.filter(
-			(op) => op !== "list" && op !== "inspect_ssh",
+			(op) =>
+				!(
+					RUNTIME_MANAGEMENT_OWNER_EXEMPT_OPERATIONS as readonly string[]
+				).includes(op),
 		),
 	);
 

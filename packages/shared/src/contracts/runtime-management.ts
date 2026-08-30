@@ -23,6 +23,23 @@ export const RUNTIME_MANAGEMENT_OPERATIONS = [
 export type RuntimeManagementOperation =
   (typeof RUNTIME_MANAGEMENT_OPERATIONS)[number];
 
+/**
+ * Operations exempt from owner approval because they cannot mutate host state.
+ * Single source of truth for the security partition consumers enforce:
+ * the agent HTTP routes skip the proposal flow for these, and
+ * plugin-app-control treats their complement as requiring explicit user
+ * confirmation. Both views must be derived from this constant — a hand-written
+ * duplicate in a consumer drifts silently when the shared operation list
+ * changes (the plugin view updates by filter; the duplicate does not).
+ */
+export const RUNTIME_MANAGEMENT_OWNER_EXEMPT_OPERATIONS = [
+  "list",
+  "inspect_ssh",
+] as const satisfies readonly RuntimeManagementOperation[];
+
+export type RuntimeManagementOwnerExemptOperation =
+  (typeof RUNTIME_MANAGEMENT_OWNER_EXEMPT_OPERATIONS)[number];
+
 export interface RuntimeManagementRequest {
   op: RuntimeManagementOperation;
   targetId?: string;

@@ -15,6 +15,7 @@ import { describe, expect, it } from "vitest";
 import {
   isRuntimeManagementOperation,
   RUNTIME_MANAGEMENT_OPERATIONS,
+  RUNTIME_MANAGEMENT_OWNER_EXEMPT_OPERATIONS,
 } from "./runtime-management.js";
 
 describe("isRuntimeManagementOperation", () => {
@@ -118,5 +119,98 @@ describe("isRuntimeManagementOperation", () => {
     expect(isRuntimeManagementOperation("constructor")).toBe(false);
     expect(isRuntimeManagementOperation("toString")).toBe(false);
     expect(isRuntimeManagementOperation("includes")).toBe(false);
+  });
+});
+
+describe("owner-approval-exempt partition", () => {
+  // The documented exempt set, pinned independently of the exported constant:
+  // these are the operations that cannot mutate host state, so both the agent
+  // route (proposal flow skipped) and the app-control action (no explicit user
+  // confirmation demanded) must agree on exactly this membership. A dropped
+  // member would demand owner approval for a read; an added member would
+  // silently weaken the confirmation gate — each is a security regression.
+  const DOCUMENTED_EXEMPT_OPERATIONS: readonly string[] = [
+    "list",
+    "inspect_ssh",
+  ];
+  // Independently documented confirmation-required surface: every remaining
+  // contract member must demand explicit user confirmation.
+  const DOCUMENTED_CONFIRMATION_OPERATIONS: readonly string[] = [
+    "pair",
+    "create_pairing",
+    "claim_pairing",
+    "confirm_pairing",
+    "deny_pairing",
+    "revoke",
+    "remove",
+    "retry",
+    "connect_ssh",
+    "add_direct",
+    "enroll_host",
+    "approve_pairing",
+    "start_host",
+    "stop_host",
+    "revoke_host",
+  ];
+
+  it("pins the exempt set as exactly {list, inspect_ssh}", () => {
+    // Exact-set equality: no missing exempt member, no unauthorized exemption.
+    expect([...RUNTIME_MANAGEMENT_OWNER_EXEMPT_OPERATIONS].sort()).toEqual(
+      [...DOCUMENTED_EXEMPT_OPERATIONS].sort(),
+    );
+  });
+
+  it("keeps the exempt set a subset of the operation contract", () => {
+    // An exempt member that is not a contract member would be dead weight at
+    // best and a type lie at worst; the satisfies clause enforces this at
+    // compile time, this pins it at runtime.
+    for (const op of RUNTIME_MANAGEMENT_OWNER_EXEMPT_OPERATIONS) {
+      expect(RUNTIME_MANAGEMENT_OPERATIONS).toContain(op);
+      expect(isRuntimeManagementOperation(op)).toBe(true);
+    }
+  });
+
+  it("pins the confirmation-required set as the exact complement", () => {
+    // Both consumers derive their view from the shared constants (the route
+    // READ_ONLY_OPERATIONS set and the plugin CONFIRMATION_REQUIRED filter).
+    // This pins the partition itself: complement = operations minus exempt,
+    // exactly the derived plugin view, matching the documented surface.
+    const complement = RUNTIME_MANAGEMENT_OPERATIONS.filter(
+      (op) =>
+        !(
+          RUNTIME_MANAGEMENT_OWNER_EXEMPT_OPERATIONS as readonly string[]
+        ).includes(op),
+    );
+    expect([...complement].sort()).toEqual(
+      [...DOCUMENTED_CONFIRMATION_OPERATIONS].sort(),
+    );
+  });
+
+  it("does not exempt any destructive operation", () => {
+    // The security-critical direction: a destructive op appearing in the
+    // exempt set would skip owner approval AND user confirmation at once.
+    for (const destructive of [
+      "remove",
+      "revoke",
+      "deny_pairing",
+      "revoke_host",
+      "connect_ssh",
+      "start_host",
+      "stop_host",
+    ]) {
+      expect(
+        (RUNTIME_MANAGEMENT_OWNER_EXEMPT_OPERATIONS as readonly string[]).includes(
+          destructive,
+        ),
+      ).toBe(false);
+    }
+  });
+
+  it("every non-exempt member is dispatchable by the membership guard", () => {
+    // The complement must stay live at the consumer boundaries: a member the
+    // membership guard rejects could never reach either partition branch.
+    for (const op of DOCUMENTED_CONFIRMATION_OPERATIONS) {
+      expect(isRuntimeManagementOperation(op)).toBe(true);
+    }
   });
 });
