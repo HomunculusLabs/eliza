@@ -5693,6 +5693,16 @@ export async function startEliza(
     bootTimer.lap("svc:connector-setup");
     await registerConnectorCredentialStoreService();
     bootTimer.lap("svc:connector-credential-store");
+    // Media-write port: expose the single content-addressed media store to
+    // plugins (e.g. local-inference transcript audio) so they never duplicate
+    // the store algorithm. Registration failure aborts boot — a plugin
+    // silently falling back to its own writer is exactly the second-writer
+    // drift this prevents.
+    const { MediaWritePortService } = await import(
+      "../services/media-write-port-service.ts"
+    );
+    await runtime.registerService(MediaWritePortService);
+    bootTimer.lap("svc:media-write-port");
     await registerAppSessionService();
     bootTimer.lap("svc:app-session");
     await registerRemoteCodingRunner();

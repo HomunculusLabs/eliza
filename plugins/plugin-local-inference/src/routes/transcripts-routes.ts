@@ -18,7 +18,12 @@ import type {
 	RouteHandlerResult,
 	UUID,
 } from "@elizaos/core";
-import { isAdminRank, PII_ENTITY_RECOGNIZER_SERVICE } from "@elizaos/core";
+import {
+	isAdminRank,
+	MediaWritePortUnavailableError,
+	PII_ENTITY_RECOGNIZER_SERVICE,
+	requireMediaWritePort,
+} from "@elizaos/core";
 import {
 	type MeetingArtifact,
 	TRANSCRIPT_SHARING_STATES,
@@ -40,7 +45,6 @@ import {
 	TranscriptStore,
 	transcriptConsentAllowsSharing,
 } from "../services/voice/transcript-store.js";
-import { persistTranscriptAudioWav } from "./transcript-audio-store.js";
 
 function service(ctx: RouteHandlerContext): TranscriptService {
 	return new TranscriptService(ctx.runtime as TranscriptServiceRuntime);
@@ -493,9 +497,38 @@ const createRoute: Route = {
 		// Persist the recorded session WAV into the served media store so the
 		// player has audio to scrub. The shell sends base64 (it can't write files).
 		if (body.audioBase64 && !body.audioUrl) {
-			body.audioUrl = persistTranscriptAudioWav(
-				Buffer.from(body.audioBase64, "base64"),
-			);
+			// Persist the recorded session WAV through the host's single
+			// content-addressed media store (media-write port). The plugin
+			// must not duplicate the store's hashing/serving wiring; an
+			// absent port fails closed (typed 503) rather than regressing
+			// to a second writer.
+			try {
+				const port = requireMediaWritePort(ctx.runtime);
+				const stored = await port.persistMedia(
+					Buffer.from(body.audioBase64, "base64"),
+					"audio/wav",
+				);
+				body.audioUrl = stored.url;
+			} catch (err) {
+				// error-policy:J1 boundary translation — only the typed
+				// port-unavailable failure becomes the structured 503; every
+				// other failure rethrows to the route boundary.
+				if (err instanceof MediaWritePortUnavailableError) {
+					ctx.runtime.reportError(
+						"transcripts.audio-persist",
+						err,
+						{ worldId: writeScope.value.worldId },
+					);
+					return {
+						status: 503,
+						body: {
+							error: "media store unavailable on this host",
+							code: err.code,
+						},
+					};
+				}
+				throw err;
+			}
 			body.audioContentType = "audio/wav";
 		}
 		const transcript = buildTranscriptFromRequest(
