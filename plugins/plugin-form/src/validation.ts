@@ -722,27 +722,20 @@ export function formatValue(value: JsonValue, control: FormControl): string {
       // Human-friendly boolean display. The stored value may be a boolean,
       // a number, or one of the string forms validateBoolean accepts
       // (startSession stores defaultValue/initialValues verbatim). Normalize
-      // through the same truthy/falsy lists so a stored "false" renders as
-      // "No" instead of a JS-truthy "Yes". Unknown strings and empty string
-      // are not booleans at all — display them verbatim rather than
-      // fabricating a "Yes"/"No" the field never validated as such.
-      let truthy: boolean;
+      // through the same String coercion and truthy/falsy lists
+      // validateBoolean uses, so any value the field validates as a boolean
+      // displays its meaning — a stored "false" renders "No", not a
+      // JS-truthy "Yes". Anything the field would reject renders verbatim
+      // rather than fabricating a "Yes"/"No" answer.
       if (typeof value === "boolean") {
-        truthy = value;
-      } else if (typeof value === "string") {
-        if (value === "") return "";
-        const lower = value.toLowerCase();
-        if (BOOLEAN_FALSY_STRINGS.includes(lower)) {
-          truthy = false;
-        } else if (BOOLEAN_TRUTHY_STRINGS.includes(lower)) {
-          truthy = true;
-        } else {
-          return String(value);
-        }
-      } else {
-        truthy = value !== 0;
+        return value ? "Yes" : "No";
       }
-      return truthy ? "Yes" : "No";
+      const display = String(value);
+      if (display === "") return "";
+      const lower = display.toLowerCase();
+      if (BOOLEAN_FALSY_STRINGS.includes(lower)) return "No";
+      if (BOOLEAN_TRUTHY_STRINGS.includes(lower)) return "Yes";
+      return display;
     }
 
     case "date":

@@ -361,3 +361,30 @@ describe("formatValue boolean non-form values display verbatim", () => {
     expect(formatValue(input as JsonValue, boolControl)).toBe(expected);
   });
 });
+
+describe("formatValue boolean invalid inputs render verbatim", () => {
+  const boolControl: FormControl = {
+    key: "subscribed",
+    label: "Subscribed",
+    type: "boolean",
+  };
+
+  // Numbers outside 0/1 and non-scalar values never validate as booleans;
+  // displaying them as "Yes" (JS truthiness) fabricates an answer.
+  it.each([
+    [2, "2"],
+    [-1, "-1"],
+    [1.5, "1.5"],
+  ])("renders invalid number %s verbatim", (input, expected) => {
+    expect(validateField(input as JsonValue, boolControl).valid).toBe(false);
+    expect(formatValue(input as JsonValue, boolControl)).toBe(expected);
+  });
+
+  // String coercion means ["false"] VALIDATES as the string "false"; display
+  // must agree with validation and render its meaning, not "Yes".
+  it("renders a validating coerced string form by its meaning", () => {
+    const wrapped = ["false"] as unknown as JsonValue;
+    expect(validateField(wrapped, boolControl).valid).toBe(true);
+    expect(formatValue(wrapped, boolControl)).toBe("No");
+  });
+});
