@@ -40,6 +40,37 @@ const formatSettingValue = (setting: Setting, isSetup: boolean): string => {
 };
 
 /**
+ * Returns a copy of the settings with every configured secret's value masked,
+ * mirroring formatSettingValue's outside-setup rule for structured payloads.
+ * Masks both the wrapped registry and any flat Setting siblings —
+ * WorldSettings permits the two shapes simultaneously, and either may carry
+ * a secret.
+ */
+const maskWorldSettingsSecrets = (
+	worldSettings: WorldSettings,
+): WorldSettings => {
+	const maskRecord = (
+		record: Record<string, Setting>,
+	): Record<string, Setting> =>
+		Object.fromEntries(
+			Object.entries(record).map(([key, setting]) => [
+				key,
+				setting.secret && setting.value !== null
+					? { ...setting, value: "****************" }
+					: setting,
+			]),
+		);
+	const maskedFlat = maskRecord(worldSettings as Record<string, Setting>);
+	if (worldSettings.settings !== undefined) {
+		return {
+			...maskedFlat,
+			settings: maskRecord(worldSettings.settings),
+		};
+	}
+	return maskedFlat;
+};
+
+/**
  * Generates a status message based on the current settings state
  */
 function isSetting(
@@ -60,11 +91,18 @@ function generateStatusMessage(
 	isSetup: boolean,
 	state?: State,
 ): string {
-	// Get settings as a Record<string, Setting> for visibleIf callbacks
-	const settingsRecord = worldSettings.settings ?? {};
+	// A world's settings live either flat on the WorldSettings object or under
+	// its `settings` registry (SETTINGS-set persists the wrapped shape).
+	// Normalize once so rendering, visibleIf callbacks, and the setup flow's
+	// valid-keys list all see the same entries for either stored shape.
+	const { settings: registry, ...flatEntries } = worldSettings;
+	const settingsRecord = (
+		registry && typeof registry === "object" ? registry : flatEntries
+	) as Record<string, Setting>;
+	const entries = Object.entries(settingsRecord);
 
 	// Format settings for display
-	const formattedSettings = Object.entries(worldSettings)
+	const formattedSettings = entries
 		.map(([key, setting]) => {
 			if (!isSetting(setting)) {
 				return null;
@@ -106,7 +144,7 @@ function generateStatusMessage(
 			.filter(Boolean)
 			.join("\n\n");
 
-		const validKeys = `Valid setting keys: ${Object.keys(worldSettings).join(", ")}`;
+		const validKeys = `Valid setting keys: ${entries.map(([key]) => key).join(", ")}`;
 
 		const commonInstructions = `Instructions for ${runtime.character.name}:
       - Only update settings if the user is clearly responding to a setting you are currently asking about.
@@ -390,9 +428,17 @@ export const settingsProvider: Provider = {
 				isSetup,
 				state,
 			);
+			// Outside setup, the structured data payload carries the same masked
+			// view as the rendered text: it flows into composed state and action
+			// trajectory state snapshots, so decrypted secret values must not
+			// survive there. Inside the DM setup flow the owner-verifying
+			// plaintext view is the point, so the payload mirrors the text.
+			const payloadSettings = isSetup
+				? worldSettings
+				: maskWorldSettingsSecrets(worldSettings);
 			return {
 				data: {
-					settings: worldSettings,
+					settings: payloadSettings,
 				},
 				values: {
 					settings: output,
