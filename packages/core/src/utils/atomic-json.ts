@@ -59,6 +59,73 @@ function tmpPathFor(filePath: string): string {
 	return `${filePath}.tmp-${process.pid}-${Date.now()}-${tmpSequenceCounter}`;
 }
 
+// On Windows, renaming over an existing destination can transiently fail with
+// EPERM while another handle holds the target open (antivirus, indexer, or a
+// concurrent same-target writer between its write and rename). The replace is
+// idempotent from the caller's perspective, so retrying the rename preserves
+// last-complete-writer semantics instead of surfacing a transient lock as a
+// failed write: every visible destination is still a complete temp-file
+// rename, and a call only completes after its rename succeeds. Bounded so a
+// genuinely persistent lock still fails fast, and win32-only because on POSIX
+// EPERM is a real permission failure that must surface immediately.
+const RENAME_EPERM_RETRY_DELAY_MS = 25;
+const RENAME_EPERM_MAX_ATTEMPTS = 40;
+
+function isTransientRenameError(error: unknown): boolean {
+	return (
+		process.platform === "win32" &&
+		(error as NodeJS.ErrnoException | null)?.code === "EPERM"
+	);
+}
+
+function sleepSync(ms: number): void {
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+async function renameWithWindowsRetry(
+	tmp: string,
+	filePath: string,
+): Promise<void> {
+	for (let attempt = 1; ; attempt += 1) {
+		try {
+			await fsp.rename(tmp, filePath);
+			return;
+		} catch (error) {
+			// error-policy:J4 user-facing degrade — a transient win32
+			// destination lock is an expected error shape ridden out with a
+			// bounded retry; exhaustion rethrows the original failure.
+			if (
+				!isTransientRenameError(error) ||
+				attempt >= RENAME_EPERM_MAX_ATTEMPTS
+			) {
+				throw error;
+			}
+			await new Promise((resolve) =>
+				setTimeout(resolve, RENAME_EPERM_RETRY_DELAY_MS),
+			);
+		}
+	}
+}
+
+function renameSyncWithWindowsRetry(tmp: string, filePath: string): void {
+	for (let attempt = 1; ; attempt += 1) {
+		try {
+			fs.renameSync(tmp, filePath);
+			return;
+		} catch (error) {
+			// error-policy:J4 user-facing degrade — synchronous mirror of the
+			// bounded win32 transient-lock retry above; exhaustion rethrows.
+			if (
+				!isTransientRenameError(error) ||
+				attempt >= RENAME_EPERM_MAX_ATTEMPTS
+			) {
+				throw error;
+			}
+			sleepSync(RENAME_EPERM_RETRY_DELAY_MS);
+		}
+	}
+}
+
 function serialize(value: unknown, opts: NormalizedWriteOptions): string {
 	const body = JSON.stringify(value, null, opts.indent);
 	return opts.trailingNewline ? `${body}\n` : body;
@@ -90,7 +157,7 @@ export async function writeJsonAtomic(
 			mode: o.mode,
 			flag: "wx",
 		});
-		await fsp.rename(tmp, filePath);
+		await renameWithWindowsRetry(tmp, filePath);
 	} finally {
 		try {
 			await fsp.rm(tmp, { force: true });
@@ -128,7 +195,7 @@ export function writeJsonAtomicSync(
 			mode: o.mode,
 			flag: "wx",
 		});
-		fs.renameSync(tmp, filePath);
+		renameSyncWithWindowsRetry(tmp, filePath);
 	} finally {
 		try {
 			fs.rmSync(tmp, { force: true });

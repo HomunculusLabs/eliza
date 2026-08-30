@@ -109,8 +109,12 @@ describe("currentTimeProvider", () => {
 				userTimeZone: null,
 				timeZoneOrigin: "agent-setting",
 			});
-			if (String(invalid).length > 0) {
-				expect(result.text).not.toContain(String(invalid));
+			// Substring-absence only proves rejection semantically for textual
+			// inputs; a numeric zone like 42 would spuriously "match" digits
+			// inside the rendered clock (e.g. the ISO timestamp's
+			// milliseconds), which says nothing about rejection.
+			if (typeof invalid === "string" && invalid.trim().length > 0) {
+				expect(result.text).not.toContain(invalid);
 			}
 		},
 	);

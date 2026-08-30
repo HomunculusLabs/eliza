@@ -47,7 +47,10 @@ async function productionRegistrationSites(): Promise<
 			)?.length;
 			if (registrations) {
 				found.push({
-					site: path.relative(pluginsRoot, file),
+					// The committed audit constants use forward slashes; emit
+					// platform-independent site ids so the comparison holds on
+					// win32 paths too.
+					site: path.relative(pluginsRoot, file).replaceAll("\\", "/"),
 					registrations,
 				});
 			}
@@ -75,6 +78,13 @@ describe("first-party interaction capability matrix", () => {
 			path.join(import.meta.dirname, "CAPABILITY_MATRIX.md"),
 			"utf8",
 		);
-		expect(`${renderFirstPartyInteractionCapabilityMatrix()}\n`).toBe(golden);
+		// A win32 checkout with core.autocrlf rewrites the committed LF
+		// artifact to CRLF; the rendered matrix is always LF. Compare on the
+		// rendered line endings so the golden check is about content, not the
+		// local checkout's eol configuration.
+		const normalizedGolden = golden.replaceAll("\r\n", "\n");
+		expect(`${renderFirstPartyInteractionCapabilityMatrix()}\n`).toBe(
+			normalizedGolden,
+		);
 	});
 });

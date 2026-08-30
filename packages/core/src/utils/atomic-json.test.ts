@@ -117,6 +117,108 @@ describe("atomic-json", () => {
 			expect((await fsp.readdir(tempDir)).sort()).toEqual(["concurrent.json"]);
 		});
 
+		it("retries a transient EPERM on rename until it succeeds", async () => {
+			// win32 replace semantics can transiently fail with EPERM while
+			// another handle holds the destination open; the writer must ride
+			// it out and still land the complete document, not surface it.
+			// Platform is mocked because the retry is deliberately win32-only
+			// (on POSIX EPERM is a real permission failure).
+			vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+			const target = path.join(tempDir, "eperm.json");
+			const realRename = fsp.rename;
+			let failures = 0;
+			vi.spyOn(fsp, "rename").mockImplementation(
+				async (from: string, to: string) => {
+					if (from.includes(".tmp-")) {
+						if (failures < 2) {
+							failures += 1;
+							throw Object.assign(
+								new Error(
+									`EPERM: operation not permitted, rename '${from}' -> '${to}'`,
+								),
+								{ code: "EPERM" },
+							);
+						}
+					}
+					return realRename(from, to);
+				},
+			);
+
+			await writeJsonAtomic(target, { retries: true });
+
+			expect(failures).toBe(2);
+			const readBack = await readJsonFile<{ retries: boolean }>(target);
+			expect(readBack).toEqual({ retries: true });
+			expect((await fsp.readdir(tempDir)).sort()).toEqual(["eperm.json"]);
+		});
+
+		it("surfaces a persistent EPERM after bounded retries instead of looping forever", async () => {
+			vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+			const target = path.join(tempDir, "eperm-stuck.json");
+			const eperm = () =>
+				Object.assign(new Error("EPERM: operation not permitted, rename"), {
+					code: "EPERM",
+				});
+			let attempts = 0;
+			vi.spyOn(fsp, "rename").mockImplementation(async () => {
+				attempts += 1;
+				throw eperm();
+			});
+
+			await expect(writeJsonAtomic(target, { stuck: true })).rejects.toThrow(
+				/EPERM/,
+			);
+			// Bounded exactly: the loop gives up after 40 attempts (39 x 25ms
+			// sleeps ≈ 1s worst-case added latency on a persistent lock).
+			expect(attempts).toBe(40);
+		});
+
+		it("does not retry EPERM outside win32 — POSIX surfaces it immediately", async () => {
+			vi.spyOn(process, "platform", "get").mockReturnValue("linux");
+			const target = path.join(tempDir, "eperm-posix.json");
+			let attempts = 0;
+			vi.spyOn(fsp, "rename").mockImplementation(async () => {
+				attempts += 1;
+				throw Object.assign(
+					new Error("EPERM: operation not permitted, rename"),
+					{ code: "EPERM" },
+				);
+			});
+
+			await expect(writeJsonAtomic(target, { posix: true })).rejects.toThrow(
+				/EPERM/,
+			);
+			expect(attempts).toBe(1);
+		});
+
+		it("retries a transient EPERM on the sync rename path", () => {
+			vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+			const target = path.join(tempDir, "eperm-sync.json");
+			const realRenameSync = fs.renameSync;
+			let failures = 0;
+			vi.spyOn(fs, "renameSync").mockImplementation(
+				(from: string, to: string) => {
+					if (from.includes(".tmp-") && failures < 1) {
+						failures += 1;
+						throw Object.assign(
+							new Error(
+								`EPERM: operation not permitted, rename '${from}' -> '${to}'`,
+							),
+							{ code: "EPERM" },
+						);
+					}
+					return realRenameSync(from, to);
+				},
+			);
+
+			writeJsonAtomicSync(target, { syncRetries: true });
+
+			expect(failures).toBe(1);
+			expect(readJsonFileSync<{ syncRetries: boolean }>(target)).toEqual({
+				syncRetries: true,
+			});
+		});
+
 		it("rejects non-string or empty file paths", async () => {
 			await expect(
 				writeJsonAtomic("" as unknown as string, {}),
