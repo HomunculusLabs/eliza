@@ -9,6 +9,7 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { resolveNodeRuntimePath } from "../run-node-runtime.mjs";
 
 export function resolveViteCommand({
   appDir,
@@ -44,4 +45,26 @@ export function resolveViteCommand({
   if (port !== undefined) args.push("--port", String(port));
   args.push(...viteArgs);
   return { command: runtimePath, args };
+}
+
+/**
+ * Resolves the Vite command for the SUPERVISED combined dev launcher
+ * (`bun run dev` / dev-ui.mjs): unlike the generic resolveViteCommand default,
+ * which keeps a Bun orchestrator on Bun, the supervised child is always pinned
+ * to a probed Node 24+ executable because Vite's HTTP/WS proxy depends on Node
+ * socket semantics (`destroySoon`, HTTP upgrade) that Bun does not implement.
+ */
+export function resolveSupervisedViteCommand({
+  appDir,
+  force = false,
+  port,
+  env = process.env,
+}) {
+  return resolveViteCommand({
+    appDir,
+    force,
+    runtime: "node",
+    runtimePath: resolveNodeRuntimePath(env),
+    port,
+  });
 }

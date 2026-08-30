@@ -5,6 +5,7 @@
  * scripts.
  */
 import { spawnSync } from "node:child_process";
+import path from "node:path";
 
 const KNOWN_UNSTABLE_BUN_LINUX = /^1\.3\.9(?:$|[-+].*)/;
 const MIN_NODE_MAJOR = 24;
@@ -253,6 +254,40 @@ export function probeNodeExecutable(candidate) {
       error: error instanceof Error ? error.message : String(error),
     };
   }
+}
+
+/**
+ * Resolves the Node executable for supervised dev children (the combined
+ * `bun run dev` supervisor's Vite child and the Node API runtime). Candidate
+ * discovery covers explicit overrides, npm's runtime hint, PATH, and the
+ * common Homebrew/system locations; every candidate is probed, so a Bun
+ * executable (e.g. an npm_node_execpath pointing at Bun) can never be
+ * returned. Throws an actionable error naming ELIZA_NODE_PATH when no Node
+ * 24+ exists.
+ */
+export function resolveNodeRuntimePath(
+  env,
+  platform = process.platform,
+  probeNode = probeNodeExecutable,
+) {
+  const pathCandidates = (env.PATH ?? "")
+    .split(path.delimiter)
+    .filter(Boolean)
+    .map((dir) => path.join(dir, platform === "win32" ? "node.exe" : "node"));
+  const candidates = [
+    env.ELIZA_NODE_PATH,
+    env.npm_node_execpath,
+    ...pathCandidates,
+    "/opt/homebrew/bin/node",
+    "/usr/local/bin/node",
+    "/usr/bin/node",
+  ].filter(Boolean);
+  return resolveNodeExecPathFromCandidates({
+    candidates,
+    explicitNodePath: env.ELIZA_NODE_PATH,
+    platform,
+    probeNode,
+  });
 }
 
 export function resolveNodeExecPathFromCandidates({

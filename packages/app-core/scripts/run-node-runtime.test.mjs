@@ -6,6 +6,7 @@ import {
   parseNodeMajor,
   resolveNodeExecPath,
   resolveNodeExecPathFromCandidates,
+  resolveNodeRuntimePath,
   validateNodeExecutable,
   validateNodeProbeOutput,
 } from "./run-node-runtime.mjs";
@@ -230,5 +231,61 @@ describe("run-node-runtime node validation", () => {
         }),
       }),
     ).toBe("node");
+  });
+});
+
+describe("resolveNodeRuntimePath supervised-child resolution", () => {
+  test("skips a Bun npm_node_execpath and resolves a Node from PATH", () => {
+    const env = {
+      PATH: "/usr/local/bin:/usr/bin",
+      npm_node_execpath: "/Users/dev/.bun/bin/bun",
+    };
+    expect(
+      resolveNodeRuntimePath(env, "linux", (candidate) =>
+        probe({
+          "/Users/dev/.bun/bin/bun": { status: 0, stdout: "bun", stderr: "" },
+          "/usr/local/bin/node": {
+            status: 0,
+            stdout: "node:22.0.0",
+            stderr: "",
+          },
+          "/usr/bin/node": { status: 0, stdout: "node:24.15.0", stderr: "" },
+        })(candidate),
+      ),
+    ).toBe("/usr/bin/node");
+  });
+
+  test("honors an explicit ELIZA_NODE_PATH over every other candidate", () => {
+    const env = {
+      ELIZA_NODE_PATH: "/opt/node24/bin/node",
+      PATH: "/usr/bin",
+    };
+    expect(
+      resolveNodeRuntimePath(env, "darwin", (candidate) =>
+        probe({
+          "/opt/node24/bin/node": {
+            status: 0,
+            stdout: "node:24.4.1",
+            stderr: "",
+          },
+          "/usr/bin/node": { status: 0, stdout: "node:24.4.1", stderr: "" },
+        })(candidate),
+      ),
+    ).toBe("/opt/node24/bin/node");
+  });
+
+  test("throws an actionable error when no candidate is a Node 24+", () => {
+    const env = {
+      PATH: "/usr/bin",
+      npm_node_execpath: "/Users/dev/.bun/bin/bun",
+    };
+    expect(() =>
+      resolveNodeRuntimePath(env, "linux", (candidate) =>
+        probe({
+          "/Users/dev/.bun/bin/bun": { status: 0, stdout: "bun", stderr: "" },
+          "/usr/bin/node": { status: 0, stdout: "node:22.0.0", stderr: "" },
+        })(candidate),
+      ),
+    ).toThrow(/No usable Node\.js 24\+ executable found.*ELIZA_NODE_PATH/s);
   });
 });
