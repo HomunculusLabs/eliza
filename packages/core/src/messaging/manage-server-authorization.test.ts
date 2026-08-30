@@ -21,6 +21,7 @@ const LINKED_ALPHA = stringToUuid("msa-linked-alpha") as UUID;
 const LINKED_BETA = stringToUuid("msa-linked-beta") as UUID;
 const WORLD_ID = stringToUuid("msa-world") as UUID;
 const ROOM_ID = stringToUuid("msa-room") as UUID;
+const SECOND_ROOM_ID = stringToUuid("msa-room-2") as UUID;
 const FOREIGN_ROOM_ID = stringToUuid("msa-foreign-room") as UUID;
 
 const SERVER_ID = "223456789012345678";
@@ -55,6 +56,8 @@ interface HarnessOptions {
 	roomMembership?: Record<string, UUID[]>;
 	/** Rooms the agent participates in (defaults to ROOM_ID). */
 	agentRooms?: UUID[];
+	/** When set, getWorld resolves the destination world to null. */
+	missingWorld?: boolean;
 }
 
 function harness(options: HarnessOptions = {}) {
@@ -88,7 +91,7 @@ function harness(options: HarnessOptions = {}) {
 		getService: (serviceType: string) =>
 			serviceType === "relationships" ? resolver : null,
 		getWorld: async (worldId: UUID) =>
-			worldId === WORLD_ID
+			!options.missingWorld && worldId === WORLD_ID
 				? {
 						id: WORLD_ID,
 						agentId: worldAgentId,
@@ -219,6 +222,17 @@ describe("authorizeManageServerDestination binding exactness", () => {
 		);
 		expect(error.code).toBe("MANAGE_SERVER_DESTINATION_UNBOUND");
 	});
+
+	it("denies with UNBOUND when the destination world is missing entirely", async () => {
+		const { runtime } = harness({
+			missingWorld: true,
+			roles: { [REQUESTER_ID]: "ADMIN" },
+		});
+		const error = await denyCode(
+			authorizeManageServerDestination(runtime, REQUESTER_ID, destination()),
+		);
+		expect(error.code).toBe("MANAGE_SERVER_DESTINATION_UNBOUND");
+	});
 });
 
 describe("authorizeManageServerDestination identity freshness", () => {
@@ -306,5 +320,56 @@ describe("authorizeManageServerDestination identity freshness", () => {
 			authorizeManageServerDestination(runtime, REQUESTER_ID, destination()),
 		);
 		expect(error.code).toBe("MANAGE_SERVER_DESTINATION_NOT_AUTHORIZED");
+	});
+
+	it("keeps only rooms the agent itself shares, dropping requester-only binding rooms", async () => {
+		// The requester and the destination share two exact binding rooms, but
+		// the agent participates in only the first — the agent-side
+		// intersection must exclude the second.
+		const { runtime } = harness({
+			clusterAnswers: [[REQUESTER_ID]],
+			roles: { [REQUESTER_ID]: "ADMIN" },
+			rooms: [
+				{
+					id: ROOM_ID,
+					worldId: WORLD_ID,
+					source: "discord",
+					serverId: SERVER_ID,
+					messageServerId: MESSAGE_SERVER_ID,
+				},
+				{
+					id: SECOND_ROOM_ID,
+					worldId: WORLD_ID,
+					source: "discord",
+					serverId: SERVER_ID,
+					messageServerId: MESSAGE_SERVER_ID,
+				},
+			],
+			roomMembership: { [REQUESTER_ID]: [ROOM_ID, SECOND_ROOM_ID] },
+			agentRooms: [ROOM_ID],
+		});
+		const authorization = await inTurn(() =>
+			authorizeManageServerDestination(runtime, REQUESTER_ID, destination()),
+		);
+		expect(authorization.bindingRoomIds).toEqual([ROOM_ID]);
+	});
+
+	it("keeps scanning the cluster past a member with shared rooms but insufficient role", async () => {
+		// The first cluster member shares a binding room but is only USER;
+		// the loop must continue to the second member, an ADMIN who also
+		// shares a room, and authorize through them.
+		const { runtime } = harness({
+			clusterAnswers: [[REQUESTER_ID, LINKED_ALPHA]],
+			roles: { [REQUESTER_ID]: "USER", [LINKED_ALPHA]: "ADMIN" },
+			roomMembership: {
+				[REQUESTER_ID]: [ROOM_ID],
+				[LINKED_ALPHA]: [ROOM_ID],
+			},
+		});
+		const authorization = await inTurn(() =>
+			authorizeManageServerDestination(runtime, REQUESTER_ID, destination()),
+		);
+		expect(authorization.authorizedEntityId).toBe(LINKED_ALPHA);
+		expect(authorization.role).toBe("ADMIN");
 	});
 });
