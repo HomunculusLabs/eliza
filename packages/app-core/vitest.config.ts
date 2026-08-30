@@ -165,8 +165,11 @@ export default defineConfig({
       // The runner-based suites above are excluded from vitest because they use
       // node:test/bun:test. They are executed by `bun run test:script-suites`
       // (chained from `test`) so the exclusion no longer means "runs nowhere".
-      // Uses Node.js built-in test runner (node:test), not vitest.
+      // Uses Node.js built-in test runner (node:test), not vitest; runs in
+      // `bun run test:script-suites` (node --test list).
       "scripts/mobile-auth-simulator-smoke-endstate.test.mjs",
+      // Uses node:test; runs in `bun run test:script-suites`.
+      "scripts/ensure-fused-inference-install.test.mjs",
       "scripts/android-sms-gateway-template.test.mjs",
       "scripts/stage-android-agent.test.mjs",
       "scripts/stage-desktop-fused-lib-staleness.test.mjs",

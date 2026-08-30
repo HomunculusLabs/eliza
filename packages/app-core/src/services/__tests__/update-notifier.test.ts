@@ -1,3 +1,4 @@
+/** Tests update-notification scheduling with a mocked updater and Vitest harness. */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -32,6 +33,10 @@ describe("scheduleUpdateNotification", () => {
     mocks.resolveChannel.mockReturnValue("stable");
     originalIsTTY = (process.stderr as { isTTY?: boolean }).isTTY;
     originalCI = process.env.CI;
+    // The notifier hard-skips under CI; the "writes an update notice" case
+    // must run with CI unset regardless of the host environment (GitHub
+    // Actions exports CI=true to every step).
+    delete process.env.CI;
     mod = await import("../update-notifier.ts");
   });
 
