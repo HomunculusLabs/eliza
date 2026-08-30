@@ -387,3 +387,40 @@ describe("field validation edge cases", () => {
     }
   });
 });
+
+describe("boolean field display round-trip", () => {
+  it("renders a string boolean defaultValue as its meaning, not truthiness", async () => {
+    const service = (await FormService.start(makeRuntime())) as FormService;
+    service.registerForm(
+      validForm({
+        controls: [
+          {
+            key: "subscribed",
+            label: "Subscribed",
+            type: "boolean",
+            required: true,
+            defaultValue: "false",
+          },
+          {
+            key: "marketing",
+            label: "Marketing emails",
+            type: "boolean",
+            required: false,
+            defaultValue: "off",
+          },
+        ],
+      }),
+    );
+
+    const session = await service.startSession("signup", entityId, roomId);
+    // The stored value is the verbatim string (validated, never parsed).
+    expect(session.fields.subscribed?.value).toBe("false");
+
+    // The provider context must display its meaning: "No", not "Yes".
+    const context = service.getSessionContext(session);
+    const subscribed = context.filledFields.find((f) => f.key === "subscribed");
+    const marketing = context.filledFields.find((f) => f.key === "marketing");
+    expect(subscribed?.displayValue).toBe("No");
+    expect(marketing?.displayValue).toBe("No");
+  });
+});

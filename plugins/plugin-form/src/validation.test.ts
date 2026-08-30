@@ -14,10 +14,12 @@
  */
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import type { JsonValue } from "@elizaos/core";
 import { describe, expect, it } from "vitest";
 import { getBuiltinType } from "./builtins";
 import type { FormControl, ValidationResult } from "./types";
 import {
+  formatValue,
   MAX_CONTROL_PATTERN_INPUT_LENGTH,
   MAX_CONTROL_PATTERN_LENGTH,
   testControlPattern,
@@ -299,5 +301,63 @@ describe("control-pattern execution deadline (out of process)", () => {
       );
       expect(entry.builtinMs, entry.name).toBeLessThan(PER_CASE_BUDGET_MS);
     }
+  });
+});
+
+describe("formatValue boolean string forms", () => {
+  const boolControl: FormControl = {
+    key: "subscribed",
+    label: "Subscribed",
+    type: "boolean",
+  };
+
+  // validateBoolean accepts these string forms, so a session can legally
+  // hold them (startSession stores defaultValue/initialValues verbatim).
+  // formatValue must display them by their meaning, not JS truthiness.
+  it.each([
+    ["false", "No"],
+    ["no", "No"],
+    ["0", "No"],
+    ["off", "No"],
+    ["FALSE", "No"],
+    ["Off", "No"],
+    ["true", "Yes"],
+    ["yes", "Yes"],
+    ["1", "Yes"],
+    ["on", "Yes"],
+    ["TRUE", "Yes"],
+    ["On", "Yes"],
+  ])("renders string boolean %s as %s", (input, expected) => {
+    // The form must actually accept the value before we render it.
+    expect(validateField(input as JsonValue, boolControl).valid).toBe(true);
+    expect(formatValue(input as JsonValue, boolControl)).toBe(expected);
+  });
+
+  it("renders canonical booleans and numbers unchanged in meaning", () => {
+    expect(formatValue(false, boolControl)).toBe("No");
+    expect(formatValue(true, boolControl)).toBe("Yes");
+    expect(formatValue(0, boolControl)).toBe("No");
+    expect(formatValue(1, boolControl)).toBe("Yes");
+  });
+});
+
+describe("formatValue boolean non-form values display verbatim", () => {
+  const boolControl: FormControl = {
+    key: "subscribed",
+    label: "Subscribed",
+    type: "boolean",
+  };
+
+  // Unknown strings never validated as booleans must not be converted into a
+  // fabricated answer; empty string means "not answered" (same as null).
+  it.each([
+    ["", ""],
+    ["maybe", "maybe"],
+    ["2", "2"],
+  ])("renders %s verbatim", (input, expected) => {
+    if (input !== "") {
+      expect(validateField(input as JsonValue, boolControl).valid).toBe(false);
+    }
+    expect(formatValue(input as JsonValue, boolControl)).toBe(expected);
   });
 });

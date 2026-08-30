@@ -398,6 +398,20 @@ function validateNumber(
 }
 
 /**
+ * String forms a boolean field accepts, shared by validation, parsing, and
+ * display formatting so the three surfaces cannot drift.
+ *
+ * WHY shared lists: `validateBoolean` deliberately accepts these string
+ * forms, and `startSession` stores defaultValue/initialValues verbatim
+ * (validated, never parsed), so a session can legally hold `"false"`. If
+ * formatting re-derives truthiness from JS coercion instead of these lists,
+ * every non-empty string renders as "Yes" — displaying the opposite of the
+ * stored meaning.
+ */
+const BOOLEAN_TRUTHY_STRINGS = ["true", "yes", "1", "on"];
+const BOOLEAN_FALSY_STRINGS = ["false", "no", "0", "off"];
+
+/**
  * Validate boolean field.
  *
  * WHY accept many formats:
@@ -415,10 +429,11 @@ function validateBoolean(
 
   // Accept common boolean-like strings
   const strValue = String(value).toLowerCase();
-  const truthy = ["true", "yes", "1", "on"];
-  const falsy = ["false", "no", "0", "off"];
 
-  if (truthy.includes(strValue) || falsy.includes(strValue)) {
+  if (
+    BOOLEAN_TRUTHY_STRINGS.includes(strValue) ||
+    BOOLEAN_FALSY_STRINGS.includes(strValue)
+  ) {
     return { valid: true };
   }
 
@@ -647,7 +662,7 @@ export function parseValue(value: string, control: FormControl): JsonValue {
 
     case "boolean": {
       const lower = value.toLowerCase();
-      return ["true", "yes", "1", "on"].includes(lower);
+      return BOOLEAN_TRUTHY_STRINGS.includes(lower);
     }
 
     case "date": {
@@ -703,9 +718,32 @@ export function formatValue(value: JsonValue, control: FormControl): string {
       // Use locale formatting for numbers
       return typeof value === "number" ? value.toLocaleString() : String(value);
 
-    case "boolean":
-      // Human-friendly boolean display
-      return value ? "Yes" : "No";
+    case "boolean": {
+      // Human-friendly boolean display. The stored value may be a boolean,
+      // a number, or one of the string forms validateBoolean accepts
+      // (startSession stores defaultValue/initialValues verbatim). Normalize
+      // through the same truthy/falsy lists so a stored "false" renders as
+      // "No" instead of a JS-truthy "Yes". Unknown strings and empty string
+      // are not booleans at all — display them verbatim rather than
+      // fabricating a "Yes"/"No" the field never validated as such.
+      let truthy: boolean;
+      if (typeof value === "boolean") {
+        truthy = value;
+      } else if (typeof value === "string") {
+        if (value === "") return "";
+        const lower = value.toLowerCase();
+        if (BOOLEAN_FALSY_STRINGS.includes(lower)) {
+          truthy = false;
+        } else if (BOOLEAN_TRUTHY_STRINGS.includes(lower)) {
+          truthy = true;
+        } else {
+          return String(value);
+        }
+      } else {
+        truthy = value !== 0;
+      }
+      return truthy ? "Yes" : "No";
+    }
 
     case "date":
       // Locale-appropriate date format
