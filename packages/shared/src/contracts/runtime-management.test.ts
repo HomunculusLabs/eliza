@@ -199,9 +199,9 @@ describe("owner-approval-exempt partition", () => {
       "stop_host",
     ]) {
       expect(
-        (RUNTIME_MANAGEMENT_OWNER_EXEMPT_OPERATIONS as readonly string[]).includes(
-          destructive,
-        ),
+        (
+          RUNTIME_MANAGEMENT_OWNER_EXEMPT_OPERATIONS as readonly string[]
+        ).includes(destructive),
       ).toBe(false);
     }
   });
