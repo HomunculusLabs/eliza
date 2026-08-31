@@ -251,11 +251,29 @@ describe("ChatSurface", () => {
       input.compareDocumentPosition(voiceToggle) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
-    // A bare click (no hold) toggles; it must not touch the dictate channel.
-    const onDictateStart = vi.fn();
     fireEvent.click(voiceToggle);
     expect(onToggleRecording).toHaveBeenCalledTimes(1);
-    expect(onDictateStart).not.toHaveBeenCalled();
+  });
+
+  it("a quick mic tap toggles recording instead of dictating", () => {
+    vi.useFakeTimers();
+    try {
+      const onToggleRecording = vi.fn();
+      const onDictateStart = vi.fn();
+      render(surface({ onToggleRecording, onDictateStart }));
+      const mic = screen.getByRole("button", { name: "Start voice input" });
+
+      fireEvent.pointerDown(mic, { button: 0, pointerId: 7 });
+      vi.advanceTimersByTime(PUSH_TO_TALK_HOLD_MS / 4);
+      fireEvent.pointerUp(mic, { pointerId: 7 });
+      fireEvent.click(mic);
+
+      expect(onDictateStart).not.toHaveBeenCalled();
+      expect(onToggleRecording).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+    }
   });
 
   it("submits on Enter (without Shift)", () => {
