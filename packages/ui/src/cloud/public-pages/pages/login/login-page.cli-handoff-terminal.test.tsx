@@ -25,6 +25,7 @@ vi.mock("../../../shell/CloudI18nProvider", () => ({
 vi.mock("../../lib/use-page-title", () => ({ usePageTitle: () => {} }));
 
 import {
+  clearStaleCloudAuthCompleteMarkers,
   hasPersistedCloudAuthComplete,
   publishCloudAuthComplete,
 } from "../../../auth/cloud-auth-complete-signal";
@@ -53,19 +54,22 @@ describe("durable CLI completion marker", () => {
     const key = "eliza.cloud.auth.complete.v1:sess-1";
     localStorage.setItem(key, String(Date.now() - 11 * 60_000));
     expect(hasPersistedCloudAuthComplete("sess-1")).toBe(false);
-    // Expired markers are cleaned up on read.
+    // Reads are pure (they run inside React render): the stale marker is
+    // ignored, not removed. Explicit cleanup removes it.
+    expect(localStorage.getItem(key)).not.toBeNull();
+    clearStaleCloudAuthCompleteMarkers();
     expect(localStorage.getItem(key)).toBeNull();
   });
 
   it("rejects future timestamps instead of pinning a terminal state", () => {
-    localStorage.setItem(
-      "eliza.cloud.auth.complete.v1:sess-1",
-      String(Date.now() + 60 * 60_000),
-    );
+    const key = "eliza.cloud.auth.complete.v1:sess-1";
+    localStorage.setItem(key, String(Date.now() + 60 * 60_000));
     expect(hasPersistedCloudAuthComplete("sess-1")).toBe(false);
-    expect(
-      localStorage.getItem("eliza.cloud.auth.complete.v1:sess-1"),
-    ).toBeNull();
+    // Reads stay pure: the falsified marker survives read-time rejection and
+    // is only removed by the explicit cleanup pass.
+    expect(localStorage.getItem(key)).not.toBeNull();
+    clearStaleCloudAuthCompleteMarkers();
+    expect(localStorage.getItem(key)).toBeNull();
   });
 
   it("fails closed on a malformed marker", () => {
