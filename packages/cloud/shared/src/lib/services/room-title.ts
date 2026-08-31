@@ -4,6 +4,7 @@ import { generateText } from "ai";
 import { memoriesRepository, roomsRepository } from "../../db/repositories";
 import { getLanguageModel } from "../providers/language-model";
 import { logger } from "../utils/logger";
+import { generateFallbackTitle } from "./room-title-fallback";
 
 /**
  * Generate an AI-powered title for a room based on the first user message.
@@ -96,54 +97,3 @@ Title:`;
   return title;
 }
 
-/**
- * Generate a descriptive title from the user message when AI fails.
- */
-function generateFallbackTitle(message: string): string {
-  const cleaned = message.trim().toLowerCase();
-
-  // Common greeting patterns -> generic titles
-  // Word-boundary anchored so a prefix like "hi" in "history" cannot
-  // collapse a real message to a generic title (#30122).
-  if (/^(hi|hello|hey|howdy|greetings|yo|sup)\b/i.test(cleaned)) {
-    return "New Conversation";
-  }
-
-  // Question patterns
-  if (/^(what|how|why|when|where|who|can|could|would|should|is|are|do|does)\b/i.test(cleaned)) {
-    const words = message.trim().split(/\s+/).slice(0, 6);
-    if (words.length >= 3) {
-      return capitalizeFirst(words.slice(0, 5).join(" "));
-    }
-    return "Question & Answer";
-  }
-
-  // Help/assist patterns
-  if (/^(help|assist|support|i need|please)\b/i.test(cleaned)) {
-    return "Help Request";
-  }
-
-  // Code/technical patterns
-  if (/^(code|write|create|build|make|implement|debug|fix)\b/i.test(cleaned)) {
-    return "Coding Assistance";
-  }
-
-  // Explain patterns
-  if (/^(explain|tell me|describe|what is|define)\b/i.test(cleaned)) {
-    return "Explanation Request";
-  }
-
-  // For other messages, extract first few meaningful words
-  const words = message.trim().split(/\s+/);
-  if (words.length <= 5) {
-    return capitalizeFirst(words.join(" ").replace(/[.!?]+$/, ""));
-  }
-
-  // Take first 5 words and capitalize
-  const title = words.slice(0, 5).join(" ");
-  return capitalizeFirst(title) + "...";
-}
-
-function capitalizeFirst(str: string): string {
-  return str.charAt(0).toUpperCase() + str.slice(1);
-}

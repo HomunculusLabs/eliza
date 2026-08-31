@@ -50,6 +50,9 @@ export default defineConfig({
       "src/lib/services/email.port.test.ts",
       "src/lib/services/docker-node-manager.surrogate-safe.test.ts",
       "src/lib/services/affiliate-billing-attribution.test.ts",
+      // Pure-function intent-boundary regression lane for room titles
+      // (#30168); listed for the same changed-file-coverage reason as above.
+      "src/lib/services/__tests__/room-title.test.ts",
     ],
     environment: "node",
     // PGlite's WASM worker outlives Vitest's fork shutdown grace even after
