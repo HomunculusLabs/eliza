@@ -83,17 +83,46 @@ export function hasPersistedCloudAuthComplete(sessionId: string): boolean {
   const age = Date.now() - completedAt;
   // A future timestamp cannot be a legitimate completion record; treat it as
   // invalid so a falsified clock cannot pin a terminal state indefinitely.
+  // The read is pure: it never removes anything. hasPersistedCloudAuthComplete
+  // runs inside React state initializers during render, so a mutating read
+  // would violate render purity. Stale markers are simply ignored on read and
+  // bounded by the same TTL check on every subsequent read; explicit cleanup
+  // lives in clearStaleCloudAuthCompleteMarkers.
   if (age < 0 || age > CLOUD_AUTH_COMPLETE_TTL_MS) {
-    try {
-      window.localStorage.removeItem(cloudAuthCompleteStorageKey(trimmed));
-    } catch (error) {
-      void error;
-      // error-policy:J4 an unremovable invalid marker is ignored on this
-      // read; subsequent reads repeat the check and the TTL still bounds it.
-    }
     return false;
   }
   return true;
+}
+
+/**
+ * Remove completion markers whose recorded timestamp has fallen outside the
+ * TTL window (expired or future/falsified). This is the only mutating path
+ * besides publishing: render-path reads stay pure, so stale-marker hygiene
+ * runs where a write is already legitimate.
+ */
+export function clearStaleCloudAuthCompleteMarkers(): void {
+  if (typeof window === "undefined") return;
+  const now = Date.now();
+  try {
+    for (let i = window.localStorage.length - 1; i >= 0; i--) {
+      const key = window.localStorage.key(i);
+      if (!key?.startsWith(CLOUD_AUTH_COMPLETE_STORAGE_PREFIX)) continue;
+      const stored = window.localStorage.getItem(key);
+      const completedAt = Number(stored);
+      if (!Number.isFinite(completedAt)) {
+        window.localStorage.removeItem(key);
+        continue;
+      }
+      const age = now - completedAt;
+      if (age < 0 || age > CLOUD_AUTH_COMPLETE_TTL_MS) {
+        window.localStorage.removeItem(key);
+      }
+    }
+  } catch (error) {
+    void error;
+    // error-policy:J4 cleanup is hygiene, never correctness — stale markers
+    // are already ignored by reads; failing to remove them changes nothing.
+  }
 }
 
 export type CloudAuthCompleteMessage = {
