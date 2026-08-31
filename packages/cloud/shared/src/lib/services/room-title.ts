@@ -64,13 +64,23 @@ export async function generateRoomTitle(roomId: string): Promise<string | null> 
 function generateFallbackTitle(message: string): string {
   const cleaned = message.trim().toLowerCase();
 
-  // Common greeting patterns -> generic titles
-  if (/^(hi|hello|hey|howdy|greetings|yo|sup)/i.test(cleaned)) {
+  // Common greeting patterns -> generic titles. The lookahead boundary is
+  // load-bearing and Unicode-aware: a plain \b is ASCII-only (\w), so
+  // "supérieur …" and "hiện tại" still matched the "sup"/"hi" prefixes, and
+  // without any boundary "history of rome", "you were right", and "supply
+  // chain issue" were all permanently retitled "New Conversation" (the room is
+  // never retitled a second time). Reject a following letter/number/mark/_ so
+  // only whole-word intents match.
+  if (/^(hi|hello|hey|howdy|greetings|yo|sup)(?![\p{L}\p{N}\p{M}_])/iu.test(cleaned)) {
     return "New Conversation";
   }
 
   // Question patterns
-  if (/^(what|how|why|when|where|who|can|could|would|should|is|are|do|does)/i.test(cleaned)) {
+  if (
+    /^(what|how|why|when|where|who|can|could|would|should|is|are|do|does)(?![\p{L}\p{N}\p{M}_])/iu.test(
+      cleaned,
+    )
+  ) {
     const words = message.trim().split(/\s+/).slice(0, 6);
     if (words.length >= 3) {
       return capitalizeFirst(words.slice(0, 5).join(" "));
@@ -79,17 +89,17 @@ function generateFallbackTitle(message: string): string {
   }
 
   // Help/assist patterns
-  if (/^(help|assist|support|i need|please)/i.test(cleaned)) {
+  if (/^(help|assist|support|i need|please)(?![\p{L}\p{N}\p{M}_])/iu.test(cleaned)) {
     return "Help Request";
   }
 
   // Code/technical patterns
-  if (/^(code|write|create|build|make|implement|debug|fix)/i.test(cleaned)) {
+  if (/^(code|write|create|build|make|implement|debug|fix)(?![\p{L}\p{N}\p{M}_])/iu.test(cleaned)) {
     return "Coding Assistance";
   }
 
   // Explain patterns
-  if (/^(explain|tell me|describe|what is|define)/i.test(cleaned)) {
+  if (/^(explain|tell me|describe|what is|define)(?![\p{L}\p{N}\p{M}_])/iu.test(cleaned)) {
     return "Explanation Request";
   }
 
