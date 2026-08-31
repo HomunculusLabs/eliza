@@ -79,6 +79,26 @@ describe("durable CLI completion marker", () => {
     );
     expect(hasPersistedCloudAuthComplete("sess-1")).toBe(false);
   });
+
+  it("sweeps stale markers when a new completion is published", () => {
+    const staleKey = "eliza.cloud.auth.complete.v1:sess-old";
+    const futureKey = "eliza.cloud.auth.complete.v1:sess-future";
+    const foreignKey = "eliza.cloud.auth.complete.v2:sess-x";
+    localStorage.setItem(staleKey, String(Date.now() - 11 * 60_000));
+    localStorage.setItem(futureKey, String(Date.now() + 60 * 60_000));
+    localStorage.setItem(foreignKey, String(Date.now() - 11 * 60_000));
+
+    publishCloudAuthComplete("sess-1");
+
+    expect(localStorage.getItem(staleKey)).toBeNull();
+    expect(localStorage.getItem(futureKey)).toBeNull();
+    // A future marker family sharing the basename is never swept.
+    expect(localStorage.getItem(foreignKey)).not.toBeNull();
+    // The freshly published marker survives its own sweep.
+    expect(
+      localStorage.getItem("eliza.cloud.auth.complete.v1:sess-1"),
+    ).not.toBeNull();
+  });
 });
 
 describe("login page terminal handoff (#30014)", () => {

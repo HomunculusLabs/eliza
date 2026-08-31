@@ -103,10 +103,13 @@ export function hasPersistedCloudAuthComplete(sessionId: string): boolean {
 export function clearStaleCloudAuthCompleteMarkers(): void {
   if (typeof window === "undefined") return;
   const now = Date.now();
+  // Match the full prefix-with-separator so a future marker family sharing a
+  // basename (e.g. ...v2) is never swept by this pass.
+  const scopedPrefix = `${CLOUD_AUTH_COMPLETE_STORAGE_PREFIX}:`;
   try {
     for (let i = window.localStorage.length - 1; i >= 0; i--) {
       const key = window.localStorage.key(i);
-      if (!key?.startsWith(CLOUD_AUTH_COMPLETE_STORAGE_PREFIX)) continue;
+      if (!key?.startsWith(scopedPrefix)) continue;
       const stored = window.localStorage.getItem(key);
       const completedAt = Number(stored);
       if (!Number.isFinite(completedAt)) {
@@ -148,6 +151,10 @@ export function publishCloudAuthComplete(sessionId: string): void {
   const trimmed = sessionId.trim();
   if (!trimmed || typeof window === "undefined") return;
   persistCloudAuthComplete(trimmed);
+  // Publishing is the natural non-render maintenance point: every completion
+  // pass removes markers that have aged out of the TTL window so the prefix
+  // cannot accumulate unbounded stale keys (#30014).
+  clearStaleCloudAuthCompleteMarkers();
   const payload: CloudAuthCompleteMessage = {
     type: CLOUD_AUTH_COMPLETE_MESSAGE_TYPE,
     sessionId: trimmed,
