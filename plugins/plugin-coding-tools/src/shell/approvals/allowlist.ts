@@ -13,7 +13,6 @@ import { logger, resolveStateDir } from "@elizaos/core";
 import type {
   CommandResolution,
   ExecAllowlistEntry,
-  ExecApprovalsAgent,
   ExecApprovalsDefaults,
   ExecApprovalsFile,
   ExecApprovalsResolved,
@@ -69,14 +68,6 @@ function ensureDir(filePath: string): void {
 }
 
 /**
- * Normalize allowlist pattern for comparison
- */
-function normalizePattern(value: string | undefined): string | null {
-  const trimmed = value?.trim() ?? "";
-  return trimmed ? trimmed.toLowerCase() : null;
-}
-
-/**
  * Ensure all allowlist entries have IDs
  */
 function ensureAllowlistIds(
@@ -97,35 +88,6 @@ function ensureAllowlistIds(
 }
 
 /**
- * Merge legacy agent configuration with current
- */
-function mergeLegacyAgent(
-  current: ExecApprovalsAgent,
-  legacy: ExecApprovalsAgent,
-): ExecApprovalsAgent {
-  const allowlist: ExecAllowlistEntry[] = [];
-  const seen = new Set<string>();
-
-  const pushEntry = (entry: ExecAllowlistEntry) => {
-    const key = normalizePattern(entry.pattern);
-    if (!key || seen.has(key)) return;
-    seen.add(key);
-    allowlist.push(entry);
-  };
-
-  for (const entry of current.allowlist ?? []) pushEntry(entry);
-  for (const entry of legacy.allowlist ?? []) pushEntry(entry);
-
-  return {
-    security: current.security ?? legacy.security,
-    ask: current.ask ?? legacy.ask,
-    askFallback: current.askFallback ?? legacy.askFallback,
-    autoAllowSkills: current.autoAllowSkills ?? legacy.autoAllowSkills,
-    allowlist: allowlist.length > 0 ? allowlist : undefined,
-  };
-}
-
-/**
  * Normalize approval configuration file
  */
 export function normalizeApprovals(file: ExecApprovalsFile): ExecApprovalsFile {
@@ -133,15 +95,12 @@ export function normalizeApprovals(file: ExecApprovalsFile): ExecApprovalsFile {
   const token = file.socket?.token?.trim();
   const agents = { ...file.agents };
 
-  // Handle legacy "default" agent
-  const legacyDefault = agents.default;
-  if (legacyDefault) {
-    const main = agents[DEFAULT_AGENT_ID];
-    agents[DEFAULT_AGENT_ID] = main
-      ? mergeLegacyAgent(main, legacyDefault)
-      : legacyDefault;
-    delete agents.default;
-  }
+  // `agents.default` IS the canonical DEFAULT_AGENT_ID slot — there is no
+  // separate legacy key to migrate away, so the entry must pass through
+  // unchanged (apart from the ID backfill below). A merge here would be a
+  // lossy self-merge: it collapses trim/case-equivalent duplicate patterns
+  // within the same agent's allowlist, and `ensureApprovals` persists the
+  // normalized form back to exec-approvals.json, making that loss on-disk.
 
   // Ensure all allowlist entries have IDs
   for (const [key, agent] of Object.entries(agents)) {
