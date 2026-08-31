@@ -29,6 +29,17 @@ const releaseWorkflow = readFileSync(
   resolve(repoRoot, ".github/workflows/cloud-cf-release.yml"),
   "utf8",
 ).replaceAll("\r\n", "\n");
+const deployWorkflow = readFileSync(
+  resolve(repoRoot, ".github/workflows/cloud-cf-deploy.yml"),
+  "utf8",
+).replaceAll("\r\n", "\n");
+const railwayAuditWorkflow = readFileSync(
+  resolve(
+    repoRoot,
+    ".github/workflows/production-railway-database-authority-audit.yml",
+  ),
+  "utf8",
+).replaceAll("\r\n", "\n");
 const sourceSha = "a".repeat(40);
 const treeSha = "b".repeat(40);
 const workflowSha256 = "c".repeat(64);
@@ -424,6 +435,19 @@ describe("Cloud CF workflow staging certification gate", () => {
     expect(migrate).toContain("shred -f -u --");
     expect(migrate).toContain("production_migration_ledger_not_current");
     expect(migrate).toContain('DATABASE_IDENTITY_GATE_MODE" = "enforce');
+  });
+
+  test("destroys read-only private evidence in every production workflow", () => {
+    const authorize = jobBlock(deployWorkflow, "authorize-production");
+    expect(authorize).toContain("Destroy private bounded-recovery evidence");
+    expect(authorize).toContain("shred -f -u --");
+    expect(authorize).not.toMatch(/shred -u --/);
+    expect(authorize).toContain('chmod 0500 "$trusted_admission"');
+
+    const audit = jobBlock(railwayAuditWorkflow, "audit");
+    expect(audit).toContain("Destroy private audit evidence");
+    expect(audit).toContain("shred -f -u --");
+    expect(audit).not.toMatch(/shred -u --/);
   });
 
   test("re-audits database authority and exact production Worker before approval", () => {
