@@ -263,9 +263,11 @@ describe("StewardLoginSection provider discovery truth", () => {
     // from earlier tests cannot satisfy discovery: this test MUST exercise a
     // real failure round followed by a retry round.
     vi.resetModules();
-    // Re-apply the mocks to the fresh module registry.
-    vi.doMock("@stwd/sdk", () => ({
-      StewardAuth: class {
+    // Re-apply the discovery mocks to the fresh module registry. The section
+    // now resolves its auth client from `@elizaos/login` (the successor of the
+    // old `@stwd/sdk` surface), so the doMock must target that specifier.
+    vi.doMock("@elizaos/login", () => ({
+      LoginAuth: class {
         getSession() {
           return null;
         }
@@ -319,6 +321,6 @@ describe("StewardLoginSection provider discovery truth", () => {
     for (const search of observedSearch) {
       expect(search).toContain(`returnTo=${cliReturnTo}`);
     }
-    vi.doUnmock("@stwd/sdk");
+    vi.doUnmock("@elizaos/login");
   });
 });

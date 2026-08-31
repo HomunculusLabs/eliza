@@ -722,7 +722,7 @@ describe("CliLoginPage", () => {
   it("notifies the opener before attempting the popup close (ordering)", async () => {
     const user = userEvent.setup();
     searchParamsRef.current = new URLSearchParams({
-      session: "sess-1",
+      session: SESSION_ID,
       returnTo: "http://localhost:2138/chat?firstRun=1",
     });
     authenticate();
@@ -756,7 +756,7 @@ describe("CliLoginPage", () => {
     );
     // Clear marker pollution from other tests, then publish this session.
     localStorage.clear();
-    publishCloudAuthComplete("sess-1");
+    publishCloudAuthComplete(SESSION_ID);
     authenticate();
 
     render(<CliLoginPage />);
@@ -792,14 +792,14 @@ describe("CliLoginPage", () => {
       );
       // Another tab finished this session while this popup sat on the
       // interstitial.
-      publishCloudAuthComplete("sess-1");
+      publishCloudAuthComplete(SESSION_ID);
       await waitFor(() =>
         expect(screen.getByText("Authentication Complete!")).toBeTruthy(),
       );
       // No Authorize gesture happened here, so no POST was ever made.
       expect(apiFetchMock).not.toHaveBeenCalled();
       // A duplicate broadcast for the same session changes nothing.
-      publishCloudAuthComplete("sess-1");
+      publishCloudAuthComplete(SESSION_ID);
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(apiFetchMock).not.toHaveBeenCalled();
       expect(screen.getByText("Authentication Complete!")).toBeTruthy();
@@ -821,7 +821,7 @@ describe("CliLoginPage", () => {
     // This tab remembered the trusted local launch for this session.
     testSessionStorage.setItem(TRUSTED_APP_LAUNCH_KEY, "1");
     // ...and another tab completed the session while this one was away.
-    publishCloudAuthComplete("sess-1");
+    publishCloudAuthComplete(SESSION_ID);
     authenticate();
     apiFetchMock.mockResolvedValue({
       json: async () => ({ keyPrefix: "ek_live_abc" }),
@@ -848,7 +848,7 @@ describe("CliLoginPage", () => {
     // completion as terminal success; if authentication resolves AFTER the
     // marker's TTL window, the completion effect must still not fire —
     // terminal success is permanent for the presented session.
-    const markerKey = "eliza.cloud.auth.complete.v1:sess-1";
+    const markerKey = `eliza.cloud.auth.complete.v1:${SESSION_ID}`;
     localStorage.setItem(markerKey, String(Date.now()));
     testSessionStorage.setItem(TRUSTED_APP_LAUNCH_KEY, "1");
     // Auth is not ready yet when the surface mounts terminal.
