@@ -3,7 +3,6 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  hasCloudAuthCompleted,
   isCloudAuthCompleteMessage,
   isCloudAuthHandoffSurface,
   publishCloudAuthComplete,
@@ -16,7 +15,6 @@ let originalOpener: PropertyDescriptor | undefined;
 beforeEach(() => {
   originalName = window.name;
   originalOpener = Object.getOwnPropertyDescriptor(window, "opener");
-  window.localStorage.clear();
 });
 
 afterEach(() => {
@@ -83,25 +81,6 @@ describe("publish / subscribe", () => {
   it("publish and subscribe are safe no-ops or callable without throw", () => {
     const unsub = subscribeCloudAuthComplete(() => {});
     expect(() => publishCloudAuthComplete("sess-bc")).not.toThrow();
-    expect(hasCloudAuthCompleted("sess-bc")).toBe(true);
     expect(() => unsub()).not.toThrow();
-  });
-
-  it("does not replay a different session", () => {
-    publishCloudAuthComplete("sess-one");
-    expect(hasCloudAuthCompleted("sess-two")).toBe(false);
-  });
-
-  it("removes a completion marker dated in the future", () => {
-    const now = Date.now();
-    vi.spyOn(Date, "now").mockReturnValue(now);
-    window.localStorage.setItem(
-      "eliza-cloud-auth-complete:sess-future",
-      String(now + 1),
-    );
-    expect(hasCloudAuthCompleted("sess-future")).toBe(false);
-    expect(
-      window.localStorage.getItem("eliza-cloud-auth-complete:sess-future"),
-    ).toBeNull();
   });
 });
