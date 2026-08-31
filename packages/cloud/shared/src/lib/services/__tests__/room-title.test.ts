@@ -35,6 +35,9 @@ describe("generateFallbackTitle intent boundaries (#30122 + #30168)", () => {
     test("explain", () => {
       expect(generateFallbackTitle("define the term entropy")).toBe("Explanation Request");
     });
+    test("help (positive control for the help matcher)", () => {
+      expect(generateFallbackTitle("help me debug this")).toBe("Help Request");
+    });
   });
 
   describe("non-ASCII letter extensions get real titles (#30168)", () => {
@@ -69,6 +72,11 @@ describe("generateFallbackTitle intent boundaries (#30122 + #30168)", () => {
     test("Cyrillic first message routes to word extraction", () => {
       expect(generateFallbackTitle("Привет всем как дела")).not.toBe("New Conversation");
       expect(generateFallbackTitle("Привет всем как дела")).toBe("Привет всем как дела");
+    });
+    test("Cyrillic: hi + Cyrillic letter routes to word extraction", () => {
+      // Exercises the actual bug: ASCII keyword "hi" followed by a Cyrillic
+      // letter — ASCII \b would match here (Cyrillic is not [A-Za-z0-9_]).
+      expect(generateFallbackTitle("HiПривет всем")).not.toBe("New Conversation");
     });
     test("CJK-adjacent: hi + CJK char routes to word extraction", () => {
       // "hi" followed by a CJK character (not \w in JS): must NOT match the
