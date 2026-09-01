@@ -32,7 +32,16 @@ function headerNumber(
   if (!headers) {
     return null;
   }
-  const raw = headers[name] ?? headers[name.toLowerCase()];
+  // Case-insensitive: HTTP/1.1 transports may deliver canonical casing
+  // (`X-RateLimit-Remaining`) while HTTP/2 and Octokit normalize to
+  // lowercase. A casing miss would silently drop the reset timestamp.
+  const entry = Object.entries(headers).find(
+    ([key]) => key.toLowerCase() === name,
+  );
+  if (!entry) {
+    return null;
+  }
+  const raw = entry[1];
   if (raw === undefined) {
     return null;
   }
@@ -40,12 +49,17 @@ function headerNumber(
   return Number.isFinite(num) ? num : null;
 }
 
+/** GitHub documents primary rate-limit exhaustion as 403 OR 429. */
+function isRateLimitStatus(status: number | undefined): boolean {
+  return status === 403 || status === 429;
+}
+
 export function inspectRateLimit(err: unknown): RateLimitDetails {
   const e = toErrorLike(err);
   const headers = e.response?.headers;
   const remaining = headerNumber(headers, "x-ratelimit-remaining");
   const resetSeconds = headerNumber(headers, "x-ratelimit-reset");
-  const isRateLimited = e.status === 403 && remaining === 0;
+  const isRateLimited = isRateLimitStatus(e.status) && remaining === 0;
   return {
     isRateLimited,
     remaining,
