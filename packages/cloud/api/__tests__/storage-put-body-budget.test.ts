@@ -47,11 +47,48 @@ mock.module("@/db/repositories", () => ({
 }));
 
 mock.module("@/lib/api/cloud-worker-errors", () => ({
+  // Standing-admission denials throw the real ApiError; re-export it so the
+  // partial failureResponse stub below keeps the module shape complete.
+  ApiError: class ApiError extends Error {
+    status: number;
+    code: string;
+    details: unknown;
+    constructor(
+      status: number,
+      code: string,
+      message: string,
+      details?: unknown,
+    ) {
+      super(message);
+      this.status = status;
+      this.code = code;
+      this.details = details;
+    }
+    toJSON() {
+      return {
+        error: this.message,
+        code: this.code,
+        details: this.details ?? undefined,
+      };
+    }
+  },
   failureResponse,
 }));
 
 mock.module("@/lib/auth/workers-hono-auth", () => ({
   requireUserOrApiKeyWithOrg,
+}));
+// The routes now resolve callers through the shared standing boundary. These
+// suites exercise storage/billing logic, not standing admission (covered by
+// durable-paid-workflows-standing-gate.test.ts), so delegate the boundary to
+// the same compatibility auth mock the routes previously called inline.
+mock.module("@/api-app/lib/generative-route-auth", () => ({
+  requireGenerativeRouteCaller: async () => ({
+    user: await requireUserOrApiKeyWithOrg(),
+    apiKeyId: null,
+    authSource: "compatibility" as const,
+    appScopeId: null,
+  }),
 }));
 
 mock.module("@/lib/services/credits", () => ({

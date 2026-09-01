@@ -2,7 +2,7 @@
  * Attachment object storage proxy.
  *
  * Routes:
- *   PUT    /api/v1/apis/storage/objects/_   integrity-declared byte stream → metadata
+ *   PUT    /api/v1/apis/storage/objects/_  integrity-declared byte stream → metadata
  *   GET    /api/v1/apis/storage/objects/_                raw bytes
  *   HEAD   /api/v1/apis/storage/objects/_                metadata headers, 404 if missing
  *   DELETE /api/v1/apis/storage/objects/_                204 No Content
@@ -12,7 +12,9 @@
  * Legacy `org/${organization_id}/${userKey}` objects are adopted on first
  * access; new bytes live under tenant-scoped immutable generation keys.
  *
- * Auth: requireUserOrApiKeyWithOrg.
+ * Auth: requireGenerativeRouteCaller standing admission — one combined cache
+ * read (cold continuation consumed inline); no provider access, receipt, or
+ * quota work runs for a denied account.
  * Quota: declared bytes are reserved atomically before R2 consumes the stream;
  * object size itself is governed by R2 and the ingress plan, not Worker heap.
  * Length headers (`X-Content-Length`, `Content-Length`) must be plain safe
@@ -23,12 +25,12 @@
  */
 
 import { type Context, Hono } from "hono";
+import { requireGenerativeRouteCaller } from "@/api-app/lib/generative-route-auth";
 import {
   StoragePutConflictError,
   StorageQuotaExceededError,
 } from "@/db/repositories";
 import { failureResponse } from "@/lib/api/cloud-worker-errors";
-import { requireUserOrApiKeyWithOrg } from "@/lib/auth/workers-hono-auth";
 import { InsufficientCreditsError } from "@/lib/services/credits";
 import { getServiceMethodCost } from "@/lib/services/proxy/pricing";
 import {
@@ -122,10 +124,18 @@ function rejectPutAndCancelBody(
 }
 
 app.put("/*", async (c) => {
+  let user: Awaited<ReturnType<typeof requireGenerativeRouteCaller>>["user"];
   try {
-    const user = await requireUserOrApiKeyWithOrg(c);
-    const { organization_id } = user;
+    user = (await requireGenerativeRouteCaller(c)).user;
+  } catch (error) {
+    // error-policy:J1 transport boundary maps standing denials to the bounded
+    // API contract before any pricing, provider, or receipt work.
+    return failureResponse(c, error);
+  }
 
+  const { organization_id } = user;
+
+  try {
     if (!c.env.BLOB) {
       logger.error(
         "[storage proxy] native BLOB binding is missing; PUT rejected",
@@ -233,10 +243,18 @@ async function handleStorageGet(c: Context<AppEnv>) {
     return handleStorageHead(c);
   }
 
+  let user: Awaited<ReturnType<typeof requireGenerativeRouteCaller>>["user"];
   try {
-    const user = await requireUserOrApiKeyWithOrg(c);
-    const { organization_id } = user;
+    user = (await requireGenerativeRouteCaller(c)).user;
+  } catch (error) {
+    // error-policy:J1 transport boundary maps standing denials to the bounded
+    // API contract before any pricing, provider, or receipt work.
+    return failureResponse(c, error);
+  }
 
+  const { organization_id } = user;
+
+  try {
     const validated = validatePrivateObjectKey(c);
     if ("error" in validated) {
       return c.json({ error: validated.error }, 400);
@@ -283,10 +301,18 @@ app.get("/", handleStorageGet);
 app.get("/*", handleStorageGet);
 
 async function handleStorageHead(c: Context<AppEnv>) {
+  let user: Awaited<ReturnType<typeof requireGenerativeRouteCaller>>["user"];
   try {
-    const user = await requireUserOrApiKeyWithOrg(c);
-    const { organization_id } = user;
+    user = (await requireGenerativeRouteCaller(c)).user;
+  } catch (error) {
+    // error-policy:J1 transport boundary maps standing denials to the bounded
+    // API contract before any pricing, provider, or receipt work.
+    return failureResponse(c, error);
+  }
 
+  const { organization_id } = user;
+
+  try {
     const validated = validatePrivateObjectKey(c);
     if ("error" in validated) {
       return c.json({ error: validated.error }, 400);
@@ -354,10 +380,18 @@ function storageReadFailure(
 }
 
 app.delete("/*", async (c) => {
+  let user: Awaited<ReturnType<typeof requireGenerativeRouteCaller>>["user"];
   try {
-    const user = await requireUserOrApiKeyWithOrg(c);
-    const { organization_id } = user;
+    user = (await requireGenerativeRouteCaller(c)).user;
+  } catch (error) {
+    // error-policy:J1 transport boundary maps standing denials to the bounded
+    // API contract before any pricing, provider, or receipt work.
+    return failureResponse(c, error);
+  }
 
+  const { organization_id } = user;
+
+  try {
     const validated = validatePrivateObjectKey(c);
     if ("error" in validated) {
       return c.json({ error: validated.error }, 400);

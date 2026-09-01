@@ -6,7 +6,9 @@
  *       X-Storage-Recursive headers
  *       → { items: [{ key, size, contentType, modifiedAt }] }
  *
- * Auth: requireUserOrApiKeyWithOrg.
+ * Auth: requireGenerativeRouteCaller standing admission — one combined cache
+ * read (cold continuation consumed inline), provider and receipt work never
+ * dispatched for a denied account.
  * Pricing: one durable server-priced receipt per idempotent list request.
  *
  * Native R2 enumeration discovers and adopts legacy tenant-prefixed objects;
@@ -15,8 +17,8 @@
 
 import { Hono } from "hono";
 import { z } from "zod";
+import { requireGenerativeRouteCaller } from "@/api-app/lib/generative-route-auth";
 import { failureResponse } from "@/lib/api/cloud-worker-errors";
-import { requireUserOrApiKeyWithOrg } from "@/lib/auth/workers-hono-auth";
 import { getServiceMethodCost } from "@/lib/services/proxy/pricing";
 import {
   executeNativeStorageList,
@@ -38,10 +40,17 @@ const listQuerySchema = z.object({
 const app = new Hono<AppEnv>();
 
 app.get("/", async (c) => {
+  let user: Awaited<ReturnType<typeof requireGenerativeRouteCaller>>["user"];
   try {
-    const user = await requireUserOrApiKeyWithOrg(c);
-    const { organization_id } = user;
+    user = (await requireGenerativeRouteCaller(c)).user;
+  } catch (error) {
+    // error-policy:J1 transport boundary maps standing denials to the bounded
+    // API contract before any pricing, provider, or receipt work.
+    return failureResponse(c, error);
+  }
+  const { organization_id } = user;
 
+  try {
     const bucket = c.env.BLOB;
     if (!bucket?.list) {
       return c.json(

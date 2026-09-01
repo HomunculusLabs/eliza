@@ -6,16 +6,20 @@
  * Cloudflare status instead of repeating the purchase or guessing that it
  * failed. Terminal responses are replayed byte-for-byte; a different app in the
  * same organization may reassign the already-owned domain without another debit.
+ *
+ * Standing admission runs before any idempotency, ledger, registrar, or DNS
+ * work: one combined cache read (cold continuation consumed inline), and a
+ * denied account never reaches the registrar provider.
  */
 
 import { Hono } from "hono";
+import { requireGenerativeRouteCaller } from "@/api-app/lib/generative-route-auth";
 import { creditTransactionsRepository } from "@/db/repositories/credit-transactions";
 import { domainPurchaseAttemptsRepository } from "@/db/repositories/domain-purchase-attempts";
 import type { CreditTransaction } from "@/db/schemas/credit-transactions";
 import type { DomainPurchaseIdempotency } from "@/db/schemas/domain-purchase-idempotency";
 import { failureResponse } from "@/lib/api/cloud-worker-errors";
 import { isAppKeyOutOfScope } from "@/lib/auth/app-key-scope";
-import { requireUserOrApiKeyWithOrg } from "@/lib/auth/workers-hono-auth";
 import {
   moneyRateLimit,
   RateLimitPresets,
@@ -57,8 +61,16 @@ const app = new Hono<AppEnv>();
 const domainBuyRateLimit = moneyRateLimit(RateLimitPresets.CRITICAL);
 
 app.post("/", domainBuyRateLimit, async (c) => {
+  let user: Awaited<ReturnType<typeof requireGenerativeRouteCaller>>["user"];
   try {
-    const user = await requireUserOrApiKeyWithOrg(c);
+    user = (await requireGenerativeRouteCaller(c)).user;
+  } catch (error) {
+    // error-policy:J1 transport boundary maps standing denials to the bounded
+    // API contract before any idempotency, ledger, registrar, or DNS work.
+    return failureResponse(c, error);
+  }
+
+  try {
     const appId = c.req.param("id");
     if (!appId) return c.json({ success: false, error: "Missing app id" }, 400);
 

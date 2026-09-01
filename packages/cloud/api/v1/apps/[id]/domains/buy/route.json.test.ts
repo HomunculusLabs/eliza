@@ -10,6 +10,10 @@ mock.module("@elizaos/plugin-todos/edge", () => ({
 }));
 
 const getById = mock(async () => null);
+const requireUserOrApiKeyWithOrg = mock(async () => ({
+  id: "user-1",
+  organization_id: "org-1",
+}));
 const failureResponse = mock(
   (c: { json: (body: unknown, status: 500) => Response }, _error: unknown) =>
     c.json({ success: false, error: "unhandled" }, 500),
@@ -37,11 +41,23 @@ mock.module("@/db/schemas/domain-purchase-idempotency", () => ({
 }));
 
 mock.module("@/lib/auth/workers-hono-auth", () => ({
-  requireUserOrApiKeyWithOrg: async () => ({
-    id: "user-1",
-    organization_id: "org-1",
-  }),
+  requireUserOrApiKeyWithOrg,
   readSessionCredential: () => undefined,
+}));
+// The route resolves callers through the shared standing boundary; this suite
+// exercises JSON response shape, not standing admission (covered by
+// durable-paid-workflows-standing-gate.test.ts), so delegate the boundary to
+// the same compatibility auth mock.
+mock.module("@/api-app/lib/generative-route-auth", () => ({
+  requireGenerativeRouteCaller: async () => {
+    const user = await requireUserOrApiKeyWithOrg();
+    return {
+      user,
+      apiKeyId: null,
+      authSource: "compatibility" as const,
+      appScopeId: null,
+    };
+  },
 }));
 
 mock.module("@/lib/middleware/rate-limit-hono-cloudflare", () => ({

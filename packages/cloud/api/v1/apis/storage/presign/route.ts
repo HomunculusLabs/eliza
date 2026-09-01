@@ -4,13 +4,13 @@
  */
 import { Hono } from "hono";
 import { z } from "zod";
+import { requireGenerativeRouteCaller } from "@/api-app/lib/generative-route-auth";
 import {
   mintStorageReadCapabilityUrl,
   StorageReadCapabilityConfigurationError,
   validateStorageReadCapabilityConfiguration,
 } from "@/api-app/storage-read-capability";
 import { failureResponse } from "@/lib/api/cloud-worker-errors";
-import { requireUserOrApiKeyWithOrg } from "@/lib/auth/workers-hono-auth";
 import { getServiceMethodCost } from "@/lib/services/proxy/pricing";
 import {
   executeNativeStoragePresign,
@@ -42,8 +42,15 @@ function validLogicalKey(value: string): string | undefined {
 }
 
 app.post("/", async (c) => {
+  let user: Awaited<ReturnType<typeof requireGenerativeRouteCaller>>["user"];
   try {
-    const user = await requireUserOrApiKeyWithOrg(c);
+    user = (await requireGenerativeRouteCaller(c)).user;
+  } catch (error) {
+    // error-policy:J1 transport boundary maps standing denials to the bounded
+    // API contract before any pricing, provider, or receipt work.
+    return failureResponse(c, error);
+  }
+  try {
     const raw = await c.req.json().catch(() => {
       // error-policy:J3 malformed request JSON remains an explicit invalid result.
       return null;

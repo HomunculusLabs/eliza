@@ -5,12 +5,16 @@
  * backend used by @elizaos/plugin-tailscale. Client-supplied tags are treated
  * as advisory only; the server always applies the locked-down customer-tunnel
  * service tag from services/headscale/acl.hujson.
+ *
+ * Standing admission runs before the keyed debit and the Headscale provider
+ * call: one combined cache read (cold continuation consumed inline), no
+ * provider dispatch or credit charge for a denied account.
  */
 
 import { Hono } from "hono";
 import { z } from "zod";
+import { requireGenerativeRouteCaller } from "@/api-app/lib/generative-route-auth";
 import { failureResponse } from "@/lib/api/cloud-worker-errors";
-import { requireUserOrApiKeyWithOrg } from "@/lib/auth/workers-hono-auth";
 import { creditsService } from "@/lib/services/credits";
 import { HeadscaleClient } from "@/lib/services/headscale-client";
 import { logger } from "@/lib/utils/logger";
@@ -39,8 +43,16 @@ const authKeyRequestSchema = z
 const app = new Hono<AppEnv>();
 
 app.post("/", async (c) => {
+  let user: Awaited<ReturnType<typeof requireGenerativeRouteCaller>>["user"];
   try {
-    const user = await requireUserOrApiKeyWithOrg(c);
+    user = (await requireGenerativeRouteCaller(c)).user;
+  } catch (error) {
+    // error-policy:J1 transport boundary maps standing denials to the bounded
+    // API contract before any pricing, provider, or receipt work.
+    return failureResponse(c, error);
+  }
+
+  try {
     const rawBody = await c.req.json().catch(() => ({}));
     const parsed = authKeyRequestSchema.safeParse(rawBody);
     if (!parsed.success) {

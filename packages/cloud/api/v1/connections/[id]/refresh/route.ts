@@ -4,12 +4,17 @@
  * POST /api/v1/connections/:id/refresh revalidates or refreshes the credential
  * behind an opaque connection ID and returns token metadata only (expiry,
  * scopes, whether a refresh happened). Raw token material is never exposed.
+ *
+ * Standing admission runs before the brokered provider call: one combined
+ * cache read (cold continuation consumed inline), provider suppressed for a
+ * denied account.
  */
 
 import { Hono } from "hono";
 
+import { requireGenerativeRouteCaller } from "@/api-app/lib/generative-route-auth";
+import { failureResponse } from "@/lib/api/cloud-worker-errors";
 import { ApiError } from "@/lib/api/errors";
-import { requireAuthOrApiKeyWithOrg } from "@/lib/auth";
 import {
   credentialBroker,
   internalErrorResponse,
@@ -18,15 +23,18 @@ import {
 import { logger } from "@/lib/utils/logger";
 import type { AppEnv } from "@/types/cloud-worker-env";
 
+type StandingCaller = Awaited<ReturnType<typeof requireGenerativeRouteCaller>>;
+
 async function __hono_POST(
-  request: Request,
+  _request: Request,
   { params }: { params: Promise<{ id: string }> },
+  caller: StandingCaller,
 ) {
   const { id: connectionId } = await params;
   let organizationId: string | undefined;
 
   try {
-    const { user } = await requireAuthOrApiKeyWithOrg(request);
+    const { user } = caller;
     organizationId = user.organization_id;
 
     const result = await credentialBroker.refreshToken({
@@ -58,9 +66,21 @@ async function __hono_POST(
 }
 
 const __hono_app = new Hono<AppEnv>();
-__hono_app.post("/", async (c) =>
-  __hono_POST(c.req.raw, {
-    params: Promise.resolve({ id: c.req.param("id")! }),
-  }),
-);
+__hono_app.post("/", async (c) => {
+  let caller: StandingCaller;
+  try {
+    caller = await requireGenerativeRouteCaller(c, { compatibility: "raw" });
+  } catch (error) {
+    // error-policy:J1 transport boundary maps standing denials to the bounded
+    // API contract before the credential-broker provider call. Standing
+    // denials throw the cloud-worker ApiError — a different class from the
+    // broker's own @/lib/api/errors ApiError handled in __hono_POST.
+    return failureResponse(c, error);
+  }
+  return __hono_POST(
+    c.req.raw,
+    { params: Promise.resolve({ id: c.req.param("id")! }) },
+    caller,
+  );
+});
 export default __hono_app;
