@@ -48,11 +48,51 @@ export function parseAgentStatusEvent(
   // composer back to "waking up".
   const canRespond =
     typeof data.canRespond === "boolean" ? data.canRespond : undefined;
+  // #30228: carry the chat-brain model validation through so the composer can
+  // say "configured model unavailable" instead of a generic not-ready state.
+  // Untrusted wire data — validate the shape before keeping any of it.
+  const rawValidation = data.modelValidation;
+  let modelValidation: AgentStatus["modelValidation"] | undefined;
+  if (isRecord(rawValidation)) {
+    const status = rawValidation.status;
+    if (
+      status === "unknown" ||
+      status === "unavailable" ||
+      status === "invalid_model" ||
+      status === "valid_model"
+    ) {
+      // A recognized status with a missing/malformed `invalid` array is a
+      // malformed payload, not an empty one — drop the whole field rather
+      // than fabricate required DTO values ([] / 0) from absent data.
+      // Same for ANY malformed array member: silently deleting it could
+      // turn a wire-corrupt `invalid_model` into a healthy-looking DTO.
+      if (
+        Array.isArray(rawValidation.invalid) &&
+        rawValidation.invalid.every(
+          (entry) =>
+            isRecord(entry) &&
+            typeof entry.key === "string" &&
+            typeof entry.model === "string",
+        ) &&
+        typeof rawValidation.checkedAt === "number"
+      ) {
+        modelValidation = {
+          status,
+          invalid: rawValidation.invalid as Array<{
+            key: string;
+            model: string;
+          }>,
+          checkedAt: rawValidation.checkedAt,
+        };
+      }
+    }
+  }
   return {
     state: state as AgentStatus["state"],
     agentName,
     model,
     ...(canRespond !== undefined ? { canRespond } : {}),
+    ...(modelValidation ? { modelValidation } : {}),
     startedAt,
     uptime,
     startup,

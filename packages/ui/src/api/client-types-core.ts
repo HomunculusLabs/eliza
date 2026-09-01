@@ -143,6 +143,18 @@ export interface AgentStatus {
    * with older agents/transports that don't report it.
    */
   canRespond?: boolean;
+  /**
+   * Chat-brain model-id validation (#30228): present when the server loaded
+   * the cloud model registry. `invalid_model` means the configured
+   * TEXT_SMALL/TEXT_LARGE id is gone from the provider catalog — a config
+   * problem the user can fix, distinct from a general provider outage
+   * (`unavailable` = transient warming) or no validation (`undefined`).
+   */
+  modelValidation?: {
+    status: "unknown" | "unavailable" | "invalid_model" | "valid_model";
+    invalid: Array<{ key: string; model: string }>;
+    checkedAt: number;
+  };
   uptime: number | undefined;
   startedAt: number | undefined;
   port?: number;

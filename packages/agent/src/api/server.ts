@@ -433,7 +433,10 @@ import { detectRuntimeModel, resolveProviderFromModel } from "./agent-model.ts";
 import { persistConfigEnv } from "./config-env.ts";
 import { restoreConversationsFromDb as restoreConversationsFromDbImpl } from "./conversation-restore.ts";
 import { wireCoordinatorBridgesWhenReady } from "./coordinator-wiring.ts";
-import { computeCanRespond } from "./health-routes.ts";
+import {
+  computeCanRespond,
+  readChatBrainModelValidation,
+} from "./health-routes.ts";
 import {
   type LocalInferenceRouteApi,
   type LocalInferenceVoiceRouteApi,
@@ -4964,6 +4967,12 @@ export async function startApiServer(opts?: {
       startup: state.startup,
       pendingRestart: state.pendingRestartReasons.length > 0,
       pendingRestartReasons: state.pendingRestartReasons,
+      // Chat-brain model-id validation (#30228) rides the same broadcast so
+      // the UI banner can say "configured model unavailable" instead of a
+      // generic waking/outage state. Optional — absent without the registry.
+      ...(readChatBrainModelValidation(state.runtime)
+        ? { modelValidation: readChatBrainModelValidation(state.runtime) }
+        : {}),
     });
   };
 

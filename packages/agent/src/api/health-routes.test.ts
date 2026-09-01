@@ -109,6 +109,55 @@ describe("computeCanRespond", () => {
 
     expect(computeCanRespond(runtime, "running")).toBe(false);
   });
+
+  it("gates canRespond when the cloud chat-brain model validation is invalid_model (#30228)", () => {
+    // A registered TEXT handler whose effective configured model id is gone
+    // from the Cloud catalog cannot answer — canRespond must be false even
+    // though handler registration succeeded.
+    const runtimeWith = (status: string) =>
+      ({
+        getModel: (modelType: string) =>
+          modelType === ModelType.TEXT_LARGE ? () => undefined : undefined,
+        getService: (type: string) =>
+          type === "CLOUD_MODEL_REGISTRY"
+            ? {
+                getChatBrainValidation: () => ({
+                  status,
+                  invalid: [],
+                  checkedAt: 1,
+                }),
+              }
+            : null,
+      }) as unknown as AgentRuntime;
+
+    expect(computeCanRespond(runtimeWith("invalid_model"), "running")).toBe(
+      false,
+    );
+    // Warming (catalog fetch failed) and an unloaded/absent catalog stay
+    // permissive — transient provider trouble must not gate the composer.
+    expect(computeCanRespond(runtimeWith("unavailable"), "running")).toBe(true);
+    expect(computeCanRespond(runtimeWith("unknown"), "running")).toBe(true);
+    expect(computeCanRespond(runtimeWith("valid_model"), "running")).toBe(true);
+  });
+
+  it("never gates when the registry lacks the validation accessor or throws (#30228)", () => {
+    const runtime = {
+      getModel: (modelType: string) =>
+        modelType === ModelType.TEXT_LARGE ? () => undefined : undefined,
+      getService: (type: string) => {
+        if (type !== "CLOUD_MODEL_REGISTRY") return null;
+        throw new Error("service bus unavailable");
+      },
+    } as unknown as AgentRuntime;
+    expect(computeCanRespond(runtime, "running")).toBe(true);
+
+    const noAccessor = {
+      getModel: (modelType: string) =>
+        modelType === ModelType.TEXT_LARGE ? () => undefined : undefined,
+      getService: () => ({}),
+    } as unknown as AgentRuntime;
+    expect(computeCanRespond(noAccessor, "running")).toBe(true);
+  });
 });
 
 describe("handleHealthRoutes dispatch", () => {

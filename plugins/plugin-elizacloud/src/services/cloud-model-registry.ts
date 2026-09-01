@@ -1,7 +1,12 @@
 /** Fetches and caches available models from ElizaCloud. */
 
-import { type IAgentRuntime, logger, Service } from "@elizaos/core";
+import { ElizaError, type IAgentRuntime, logger, Service } from "@elizaos/core";
 import type { CloudAuthService } from "./cloud-auth";
+import {
+  getLargeModel,
+  getSmallModel,
+  getSetting,
+} from "../utils/config";
 
 interface ModelListEntry {
   id: string;
@@ -24,6 +29,26 @@ export interface AvailableModel {
 
 export interface ModelsByProvider {
   [provider: string]: AvailableModel[];
+}
+
+/**
+ * Outcome of validating the EFFECTIVE chat-brain model ids (the ids the
+ * TEXT_SMALL/TEXT_LARGE handlers will actually send) against the provider
+ * catalog. Surfaced on `/api/status` as `modelValidation` so clients can
+ * distinguish "configured model is gone" from a general provider outage
+ * (#30228).
+ *
+ * - `unknown` — no authenticated catalog yet (never gates anything);
+ * - `unavailable` — catalog fetch failed; transient warming stays retryable
+ *   and must NOT be treated as model removal (never gates canRespond);
+ * - `invalid_model` — the catalog loaded and a chat-brain id is absent: the
+ *   run cannot answer; `invalid` names each config key + model id;
+ * - `valid_model` — every effective chat-brain id is in the catalog.
+ */
+export interface CloudModelValidation {
+  status: "unknown" | "unavailable" | "invalid_model" | "valid_model";
+  invalid: Array<{ key: string; model: string }>;
+  checkedAt: number;
 }
 
 const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
@@ -68,6 +93,11 @@ export class CloudModelRegistryService extends Service {
   private byProvider: ModelsByProvider = {};
   private lastFetchedAt = 0;
   private fetchPromise: Promise<void> | null = null;
+  private chatBrainValidation: CloudModelValidation = {
+    status: "unknown",
+    invalid: [],
+    checkedAt: 0,
+  };
 
   static async start(runtime: IAgentRuntime): Promise<Service> {
     const service = new CloudModelRegistryService(runtime);
@@ -79,6 +109,12 @@ export class CloudModelRegistryService extends Service {
     this.models = [];
     this.byProvider = {};
     this.lastFetchedAt = 0;
+    this.catalogLoaded = false;
+    this.chatBrainValidation = {
+      status: "unknown",
+      invalid: [],
+      checkedAt: 0,
+    };
   }
 
   private async initialize(): Promise<void> {
@@ -89,20 +125,61 @@ export class CloudModelRegistryService extends Service {
       return;
     }
 
-    await this.fetchModels();
-    this.validateConfiguredModels();
+    await this.refreshCatalogAndValidate();
   }
 
-  private async fetchModels(): Promise<void> {
+  /**
+   * Single catalog refresh + revalidation entry point. Every successful or
+   * failed fetch transitions `chatBrainValidation` freshly, so a transient
+   * `unavailable` never sticks after connectivity returns (#30228).
+   */
+  private async refreshCatalogAndValidate(): Promise<void> {
+    // error-policy:J4 a catalog FETCH failure is transient warming — record
+    // it as retryable `unavailable`, never as model removal, and never let
+    // it fail service start. Only the fetch itself is inside this boundary;
+    // validation runs after it on the successfully loaded catalog.
+    try {
+      await this.fetchModels();
+    } catch (error) {
+      this.chatBrainValidation = {
+        status: "unavailable",
+        invalid: [],
+        checkedAt: Date.now(),
+      };
+      logger.warn(
+        `[CloudModelRegistry] Catalog unavailable (${error instanceof Error ? error.message : String(error)}); chat-brain model validation will retry on next fetch`,
+      );
+      return;
+    }
+    // An unauthenticated no-op fetch loaded nothing — keep `unknown`; an
+    // empty-but-loaded catalog IS authoritative and validates below.
+    if (!this.catalogLoaded) return;
+    this.validateConfiguredModels();
+    this.validateChatBrainModels();
+  }
+
+  private async fetchModels(): Promise<boolean> {
     if (this.fetchPromise) {
       await this.fetchPromise;
-      return;
+      return this.catalogLoaded;
     }
 
     this.fetchPromise = this.doFetchModels();
-    await this.fetchPromise;
-    this.fetchPromise = null;
+    try {
+      await this.fetchPromise;
+    } finally {
+      // Clear on BOTH outcomes: a retained rejected promise would make every
+      // later fetch re-await the same failure, so a transient outage could
+      // never recover (#30228).
+      this.fetchPromise = null;
+    }
+    // A no-op pass (auth absent) loaded nothing — callers must not treat it
+    // as an authoritative empty catalog.
+    return this.catalogLoaded;
   }
+
+  /** True once an authenticated /models response has actually been processed. */
+  private catalogLoaded = false;
 
   private async doFetchModels(): Promise<void> {
     const auth = this.runtime.getService("CLOUD_AUTH") as CloudAuthService | undefined;
@@ -129,6 +206,7 @@ export class CloudModelRegistryService extends Service {
     }
 
     this.lastFetchedAt = Date.now();
+    this.catalogLoaded = true;
     logger.info(
       `[CloudModelRegistry] Loaded ${this.models.length} models from ${Object.keys(this.byProvider).length} providers`
     );
@@ -181,16 +259,115 @@ export class CloudModelRegistryService extends Service {
     }
   }
 
+  /**
+   * Validates the EFFECTIVE chat-brain model ids (what getSmallModel/
+   * getLargeModel resolve to — the ids the TEXT_SMALL/TEXT_LARGE handlers
+   * actually send) against the fetched catalog, recording a typed
+   * {@link CloudModelValidation} and surfacing a missing model through
+   * `runtime.reportError` with an actionable code naming the config key and
+   * model (#30228). A stale `ELIZAOS_CLOUD_LARGE_MODEL` override previously
+   * only logged a warning while `/api/status` kept reporting healthy
+   * `canRespond`.
+   *
+   * Resolution note: when a tier override is set, the config key named in
+   * `invalid` is that override key; when the id came from a bare `*_MODEL`
+   * alias or the code default, the key names the setting the resolver reads
+   * next. `unknown` (no authenticated catalog) and fetch failures never reach
+   * this method — they stay non-gating by construction.
+   */
+  private validateChatBrainModels(): void {
+    // The validation only describes the Cloud chat-brain handlers. When the
+    // host wrote ELIZAOS_CLOUD_USE_INFERENCE=false, another provider owns the
+    // text brain and a stale Cloud catalog entry must NEVER gate it — reset
+    // to non-gating `unknown` (same state as an unloaded catalog).
+    const useInference = getSetting(
+      this.runtime,
+      "ELIZAOS_CLOUD_USE_INFERENCE",
+    );
+    if (useInference?.trim().toLowerCase() === "false") {
+      this.chatBrainValidation = {
+        status: "unknown",
+        invalid: [],
+        checkedAt: Date.now(),
+      };
+      return;
+    }
+    // An EMPTY but successfully loaded catalog is authoritative: the effective
+    // chat-brain ids cannot be in it, so the run cannot answer — record
+    // invalid_model rather than staying permissive `unknown` (#30228).
+    const modelIds = new Set(this.models.map((m) => m.id));
+    const nameSet = new Set(this.models.map((m) => m.name));
+
+    const slots: Array<{ label: string; keys: string[]; resolved: string }> = [
+      {
+        label: "small",
+        keys: ["ELIZAOS_CLOUD_SMALL_MODEL", "SMALL_MODEL"],
+        resolved: getSmallModel(this.runtime),
+      },
+      {
+        label: "large",
+        keys: ["ELIZAOS_CLOUD_LARGE_MODEL", "LARGE_MODEL"],
+        resolved: getLargeModel(this.runtime),
+      },
+    ];
+
+    const invalid: CloudModelValidation["invalid"] = [];
+    for (const slot of slots) {
+      if (modelIds.has(slot.resolved) || nameSet.has(slot.resolved)) continue;
+      // Name the most specific configured key that produced the id: the
+      // ELIZAOS_CLOUD_* override when set, else the bare alias tier setting.
+      const key =
+        slot.keys.find((k) => {
+          const value = this.runtime.getSetting(k);
+          return typeof value === "string" && value.trim().length > 0;
+        }) ?? slot.keys[0];
+      invalid.push({ key, model: slot.resolved });
+    }
+
+    this.chatBrainValidation = {
+      status: invalid.length > 0 ? "invalid_model" : "valid_model",
+      invalid,
+      checkedAt: Date.now(),
+    };
+
+    if (invalid.length === 0) return;
+
+    const detail = invalid
+      .map((entry) => `${entry.key}="${entry.model}"`)
+      .join(", ");
+    // error-policy:J7 diagnostics must not kill the loop — the typed error is
+    // reported through reportError (RECENT_ERRORS surfaces it) and the
+    // validation state gates canRespond; the service keeps running.
+    this.runtime.reportError?.(
+      "CloudModelRegistry.validateChatBrainModels",
+      new ElizaError(
+        `Configured chat-brain model(s) not found in the Eliza Cloud catalog: ${detail}. Remove or update the stale override — the agent cannot answer until the configured model exists.`,
+        {
+          code: "ELIZA_CLOUD_MODEL_NOT_FOUND",
+          context: { invalid, catalogSize: this.models.length },
+        },
+      ),
+      { invalid },
+    );
+  }
+
+  /** Current chat-brain validation snapshot for /api/status and canRespond gating. */
+  getChatBrainValidation(): CloudModelValidation {
+    return this.chatBrainValidation;
+  }
+
   async getAvailableModels(): Promise<AvailableModel[]> {
     if (Date.now() - this.lastFetchedAt > CACHE_TTL_MS) {
-      await this.fetchModels();
+      // Refresh through the revalidating path so a recovered catalog also
+      // transitions chatBrainValidation (#30228).
+      await this.refreshCatalogAndValidate();
     }
     return this.models;
   }
 
   async getModelsByProvider(): Promise<ModelsByProvider> {
     if (Date.now() - this.lastFetchedAt > CACHE_TTL_MS) {
-      await this.fetchModels();
+      await this.refreshCatalogAndValidate();
     }
     return this.byProvider;
   }

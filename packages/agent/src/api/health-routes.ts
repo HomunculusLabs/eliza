@@ -483,6 +483,54 @@ export function serializeForRuntimeDebug(
  * signal the UI uses to fade in first-turn capability: the shell paints early
  * (agentState "starting"), and the composer goes live when this flips.
  */
+/**
+ * Shape contract for the optional CLOUD_MODEL_REGISTRY service lookup — the
+ * plugin's `CloudModelValidation` duck-typed from the agent package so no new
+ * cross-package import is needed at this boundary.
+ */
+interface ChatBrainModelValidationLike {
+  status: "unknown" | "unavailable" | "invalid_model" | "valid_model";
+  invalid: Array<{ key: string; model: string }>;
+  checkedAt: number;
+}
+
+/**
+ * Chat-brain model validation gate for #30228: a registered TEXT handler whose
+ * EFFECTIVE configured model id is absent from the Cloud catalog cannot answer
+ * (chat 404s on `/chat/completions`), so `canRespond` must be false. Only
+ * `invalid_model` (catalog loaded + id missing) gates — `unknown` (no
+ * authenticated catalog yet) and `unavailable` (catalog fetch failed, e.g.
+ * transient provider warming) stay permissive so warming remains retryable.
+ * Services without the registry (non-cloud agents) never gate.
+ */
+function cloudChatBrainModelsInvalid(runtime: AgentRuntime | null): boolean {
+  return readChatBrainModelValidation(runtime)?.status === "invalid_model";
+}
+
+/**
+ * Reads the optional CLOUD_MODEL_REGISTRY chat-brain validation snapshot for
+ * status surfaces (`/api/status` + the WS status broadcast). Returns undefined
+ * when the service is absent, lacks the accessor, or throws — an optional
+ * plugin diagnostic must never fail a status response (#30228).
+ */
+export function readChatBrainModelValidation(
+  runtime: AgentRuntime | null,
+): ChatBrainModelValidationLike | undefined {
+  if (!runtime) return undefined;
+  try {
+    const registry = runtime.getService("CLOUD_MODEL_REGISTRY") as {
+      getChatBrainValidation?: () => ChatBrainModelValidationLike;
+    } | null;
+    if (!registry || typeof registry.getChatBrainValidation !== "function") {
+      return undefined;
+    }
+    return registry.getChatBrainValidation() ?? undefined;
+  } catch {
+    // error-policy:J4 optional registry lookup must never fail the status read
+    return undefined;
+  }
+}
+
 export function computeCanRespond(
   runtime: AgentRuntime | null,
   agentState: string,
@@ -491,7 +539,9 @@ export function computeCanRespond(
     return false;
   }
   try {
-    return hasTextGenerationHandler(runtime);
+    return (
+      hasTextGenerationHandler(runtime) && !cloudChatBrainModelsInvalid(runtime)
+    );
   } catch {
     return false;
   }
@@ -561,6 +611,11 @@ export async function handleHealthRoutes(
       cloudProvisioned,
       hasApiKey: hasCloudApiKey,
     };
+    // Chat-brain model-id validation (#30228): lets clients distinguish a
+    // stale configured model (actionable: fix the override) from a general
+    // provider outage. Absent when the registry service isn't loaded —
+    // never fail /api/status for this optional diagnostic.
+    const modelValidation = readChatBrainModelValidation(state.runtime ?? null);
 
     json(res, {
       state: state.agentState,
@@ -571,6 +626,7 @@ export async function handleHealthRoutes(
       uptime,
       startup: state.startup,
       cloud: cloudStatus,
+      ...(modelValidation ? { modelValidation } : {}),
       pendingRestart: state.pendingRestartReasons.length > 0,
       pendingRestartReasons: state.pendingRestartReasons,
     });

@@ -381,16 +381,27 @@ export function ChatView({
     agentStatus?.state === "running" &&
     !deriveAgentReady(agentStatus) &&
     !isMobileLocalRuntime;
+  // #30228: distinguish "the configured model is gone from the provider
+  // catalog" from the generic missing-provider lock — the user can fix a stale
+  // override in Settings, and the composer must say so instead of implying no
+  // provider is configured at all.
+  const isInvalidModelConfig =
+    agentStatus?.modelValidation?.status === "invalid_model";
   // First-turn capability fades in: the composer stays usable while the agent
   // warms up (a turn submitted during warmup is held server-side until the
   // runtime is ready, then streams its reply) — only a genuinely missing
   // inference provider hard-locks the composer.
   const isComposerLocked = isMissingInferenceProvider;
-  const composerPlaceholderOverride = isMissingInferenceProvider
-    ? t("chat.setupProviderToChat", {
-        defaultValue: "Set up an LLM provider in Settings to start chatting",
+  const composerPlaceholderOverride = isInvalidModelConfig
+    ? t("chat.configuredModelUnavailable", {
+        defaultValue:
+          "Configured model is unavailable — update the model setting to start chatting",
       })
-    : undefined;
+    : isMissingInferenceProvider
+      ? t("chat.setupProviderToChat", {
+          defaultValue: "Set up an LLM provider in Settings to start chatting",
+        })
+      : undefined;
   // Resolve the realtime-voice mint inputs (agent UUID + consent nonce) from the
   // same auth/runtime source the app uses for every other /api/v1 call. A
   // self-hosted runtime arms only when its gateway proves the active
