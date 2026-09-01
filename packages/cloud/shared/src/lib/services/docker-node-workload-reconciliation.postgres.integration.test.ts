@@ -15,9 +15,46 @@ import {
   reconcileAllocatedWorkloadsOnNodeWithDatabase,
 } from "./docker-node-workload-queries";
 import {
+  parallelTeardownStep,
+  runCaseWithOrderedTeardown,
+  type TeardownStep,
+} from "./postgres-case-teardown";
+import {
   acquireEphemeralPostgres,
   type EphemeralPostgres,
 } from "./tenant-db/__tests__/ephemeral-postgres";
+
+/**
+ * Ordered teardown steps for a case's dedicated clients: the writer's
+ * transaction is rolled back before either client closes, both clients close
+ * even when the rollback (or a prior close) failed, and every step failure is
+ * retained as an ordered diagnostic through {@link runCaseWithOrderedTeardown}
+ * instead of a silent `.catch(() => {})`.
+ */
+function caseTeardownSteps(writer: Client, observer: Client): TeardownStep[] {
+  return [
+    {
+      name: "rollback-writer",
+      run: async () => {
+        await writer.query("ROLLBACK");
+      },
+    },
+    parallelTeardownStep("close-clients", [
+      {
+        label: "close-writer",
+        run: async () => {
+          await writer.end();
+        },
+      },
+      {
+        label: "close-observer",
+        run: async () => {
+          await observer.end();
+        },
+      },
+    ]),
+  ];
+}
 
 const SKIP_REASON =
   "[docker capacity recount] SKIPPED - no real PostgreSQL available. " +
@@ -172,35 +209,37 @@ realPostgres("Docker capacity recount PostgreSQL serialization", () => {
     const writer = new Client({ connectionString: isolatedDsn });
     const observer = new Client({ connectionString: isolatedDsn });
     await Promise.all([writer.connect(), observer.connect()]);
-    try {
-      await writer.query("BEGIN");
-      await writer.query("SELECT id FROM docker_nodes WHERE node_id = $1 FOR UPDATE", [NODE_ID]);
-      await writer.query("LOCK TABLE agent_sandbox_replacement_attempts IN ACCESS EXCLUSIVE MODE");
-      const pid = (await writer.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows[0]!
-        .pid;
-      const count = countAllocatedWorkloadsOnNodeWithDatabase(database, NODE_ID);
-      await waitUntilBlockedBy(observer, pid);
-      // The old serial implementation had already observed no canonical
-      // sandbox when it blocked on its final replacement-attempt SELECT. This
-      // atomic handoff then made that last SELECT observe no reservation too,
-      // returning zero. The aggregate implementation can observe only the
-      // complete pre-commit or post-commit state of its one statement.
-      await writer.query(
-        "UPDATE agent_sandbox_replacement_attempts SET state = 'lifecycle_committed' WHERE id = $1",
-        [ATTEMPT_ID],
-      );
-      await writer.query(
-        "INSERT INTO agent_sandboxes (id, node_id, status) VALUES ($1, $2, 'running')",
-        [SANDBOX_ID, NODE_ID],
-      );
-      await writer.query("COMMIT");
+    await runCaseWithOrderedTeardown(
+      async () => {
+        await writer.query("BEGIN");
+        await writer.query("SELECT id FROM docker_nodes WHERE node_id = $1 FOR UPDATE", [NODE_ID]);
+        await writer.query(
+          "LOCK TABLE agent_sandbox_replacement_attempts IN ACCESS EXCLUSIVE MODE",
+        );
+        const pid = (await writer.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows[0]!
+          .pid;
+        const count = countAllocatedWorkloadsOnNodeWithDatabase(database, NODE_ID);
+        await waitUntilBlockedBy(observer, pid);
+        // The old serial implementation had already observed no canonical
+        // sandbox when it blocked on its final replacement-attempt SELECT. This
+        // atomic handoff then made that last SELECT observe no reservation too,
+        // returning zero. The aggregate implementation can observe only the
+        // complete pre-commit or post-commit state of its one statement.
+        await writer.query(
+          "UPDATE agent_sandbox_replacement_attempts SET state = 'lifecycle_committed' WHERE id = $1",
+          [ATTEMPT_ID],
+        );
+        await writer.query(
+          "INSERT INTO agent_sandboxes (id, node_id, status) VALUES ($1, $2, 'running')",
+          [SANDBOX_ID, NODE_ID],
+        );
+        await writer.query("COMMIT");
 
-      expect(await count).toBe(1);
-      expect(await countAllocatedWorkloadsOnNodeWithDatabase(database, NODE_ID)).toBe(1);
-    } finally {
-      await writer.query("ROLLBACK").catch(() => {});
-      await Promise.all([writer.end(), observer.end()]);
-    }
+        expect(await count).toBe(1);
+        expect(await countAllocatedWorkloadsOnNodeWithDatabase(database, NODE_ID)).toBe(1);
+      },
+      caseTeardownSteps(writer, observer),
+    );
   }, 10_000);
 
   test("reserve followed by recount preserves the newly owned slot", async () => {
@@ -208,31 +247,31 @@ realPostgres("Docker capacity recount PostgreSQL serialization", () => {
     const writer = new Client({ connectionString: isolatedDsn });
     const observer = new Client({ connectionString: isolatedDsn });
     await Promise.all([writer.connect(), observer.connect()]);
-    try {
-      await writer.query("BEGIN");
-      await writer.query(
-        "UPDATE docker_nodes SET allocated_count = allocated_count + 1 WHERE node_id = $1",
-        [NODE_ID],
-      );
-      const pid = (await writer.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows[0]!
-        .pid;
-      const recount = reconcileAllocatedWorkloadsOnNodeWithDatabase(database, NODE_ID);
-      await waitUntilBlockedBy(observer, pid);
-      await writer.query(
-        `INSERT INTO agent_sandbox_replacement_attempts
+    await runCaseWithOrderedTeardown(
+      async () => {
+        await writer.query("BEGIN");
+        await writer.query(
+          "UPDATE docker_nodes SET allocated_count = allocated_count + 1 WHERE node_id = $1",
+          [NODE_ID],
+        );
+        const pid = (await writer.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows[0]!
+          .pid;
+        const recount = reconcileAllocatedWorkloadsOnNodeWithDatabase(database, NODE_ID);
+        await waitUntilBlockedBy(observer, pid);
+        await writer.query(
+          `INSERT INTO agent_sandbox_replacement_attempts
            (id, locator_node_id, locator_allocation_counted, restore_attempt_id, state)
          VALUES ($1, $2, true, $3, 'in_flight_unresolved')`,
-        [ATTEMPT_ID, NODE_ID, RESTORE_ID],
-      );
-      await writer.query("COMMIT");
+          [ATTEMPT_ID, NODE_ID, RESTORE_ID],
+        );
+        await writer.query("COMMIT");
 
-      expect(await recount).toEqual({ before: 1, after: 1 });
-      expect(await readAllocatedCount(pool)).toBe(1);
-      expect(await countAllocatedWorkloadsOnNodeWithDatabase(database, NODE_ID)).toBe(1);
-    } finally {
-      await writer.query("ROLLBACK").catch(() => {});
-      await Promise.all([writer.end(), observer.end()]);
-    }
+        expect(await recount).toEqual({ before: 1, after: 1 });
+        expect(await readAllocatedCount(pool)).toBe(1);
+        expect(await countAllocatedWorkloadsOnNodeWithDatabase(database, NODE_ID)).toBe(1);
+      },
+      caseTeardownSteps(writer, observer),
+    );
   }, 10_000);
 
   test("cleanup followed by recount cannot resurrect or double-release the slot", async () => {
@@ -247,29 +286,29 @@ realPostgres("Docker capacity recount PostgreSQL serialization", () => {
     const writer = new Client({ connectionString: isolatedDsn });
     const observer = new Client({ connectionString: isolatedDsn });
     await Promise.all([writer.connect(), observer.connect()]);
-    try {
-      await writer.query("BEGIN");
-      await writer.query(
-        "UPDATE docker_nodes SET allocated_count = allocated_count - 1 WHERE node_id = $1",
-        [NODE_ID],
-      );
-      const pid = (await writer.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows[0]!
-        .pid;
-      const recount = reconcileAllocatedWorkloadsOnNodeWithDatabase(database, NODE_ID);
-      await waitUntilBlockedBy(observer, pid);
-      await writer.query(
-        "UPDATE agent_sandbox_replacement_attempts SET state = 'cleanup_proven' WHERE id = $1",
-        [ATTEMPT_ID],
-      );
-      await writer.query("COMMIT");
+    await runCaseWithOrderedTeardown(
+      async () => {
+        await writer.query("BEGIN");
+        await writer.query(
+          "UPDATE docker_nodes SET allocated_count = allocated_count - 1 WHERE node_id = $1",
+          [NODE_ID],
+        );
+        const pid = (await writer.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows[0]!
+          .pid;
+        const recount = reconcileAllocatedWorkloadsOnNodeWithDatabase(database, NODE_ID);
+        await waitUntilBlockedBy(observer, pid);
+        await writer.query(
+          "UPDATE agent_sandbox_replacement_attempts SET state = 'cleanup_proven' WHERE id = $1",
+          [ATTEMPT_ID],
+        );
+        await writer.query("COMMIT");
 
-      expect(await recount).toEqual({ before: 0, after: 0 });
-      expect(await readAllocatedCount(pool)).toBe(0);
-      expect(await countAllocatedWorkloadsOnNodeWithDatabase(database, NODE_ID)).toBe(0);
-    } finally {
-      await writer.query("ROLLBACK").catch(() => {});
-      await Promise.all([writer.end(), observer.end()]);
-    }
+        expect(await recount).toEqual({ before: 0, after: 0 });
+        expect(await readAllocatedCount(pool)).toBe(0);
+        expect(await countAllocatedWorkloadsOnNodeWithDatabase(database, NODE_ID)).toBe(0);
+      },
+      caseTeardownSteps(writer, observer),
+    );
   }, 10_000);
 
   test("lifecycle transfer followed by recount counts exactly the canonical sandbox slot", async () => {
@@ -284,30 +323,30 @@ realPostgres("Docker capacity recount PostgreSQL serialization", () => {
     const writer = new Client({ connectionString: isolatedDsn });
     const observer = new Client({ connectionString: isolatedDsn });
     await Promise.all([writer.connect(), observer.connect()]);
-    try {
-      await writer.query("BEGIN");
-      await writer.query("SELECT id FROM docker_nodes WHERE node_id = $1 FOR UPDATE", [NODE_ID]);
-      const pid = (await writer.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows[0]!
-        .pid;
-      const recount = reconcileAllocatedWorkloadsOnNodeWithDatabase(database, NODE_ID);
-      await waitUntilBlockedBy(observer, pid);
-      await writer.query(
-        "UPDATE agent_sandbox_replacement_attempts SET state = 'lifecycle_committed' WHERE id = $1",
-        [ATTEMPT_ID],
-      );
-      await writer.query(
-        "INSERT INTO agent_sandboxes (id, node_id, status) VALUES ($1, $2, 'running')",
-        [SANDBOX_ID, NODE_ID],
-      );
-      await writer.query("COMMIT");
+    await runCaseWithOrderedTeardown(
+      async () => {
+        await writer.query("BEGIN");
+        await writer.query("SELECT id FROM docker_nodes WHERE node_id = $1 FOR UPDATE", [NODE_ID]);
+        const pid = (await writer.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows[0]!
+          .pid;
+        const recount = reconcileAllocatedWorkloadsOnNodeWithDatabase(database, NODE_ID);
+        await waitUntilBlockedBy(observer, pid);
+        await writer.query(
+          "UPDATE agent_sandbox_replacement_attempts SET state = 'lifecycle_committed' WHERE id = $1",
+          [ATTEMPT_ID],
+        );
+        await writer.query(
+          "INSERT INTO agent_sandboxes (id, node_id, status) VALUES ($1, $2, 'running')",
+          [SANDBOX_ID, NODE_ID],
+        );
+        await writer.query("COMMIT");
 
-      expect(await recount).toEqual({ before: 1, after: 1 });
-      expect(await readAllocatedCount(pool)).toBe(1);
-      expect(await countAllocatedWorkloadsOnNodeWithDatabase(database, NODE_ID)).toBe(1);
-    } finally {
-      await writer.query("ROLLBACK").catch(() => {});
-      await Promise.all([writer.end(), observer.end()]);
-    }
+        expect(await recount).toEqual({ before: 1, after: 1 });
+        expect(await readAllocatedCount(pool)).toBe(1);
+        expect(await countAllocatedWorkloadsOnNodeWithDatabase(database, NODE_ID)).toBe(1);
+      },
+      caseTeardownSteps(writer, observer),
+    );
   }, 10_000);
 
   test("an absent replacement table does not abort repair of a divergent counter", async () => {
