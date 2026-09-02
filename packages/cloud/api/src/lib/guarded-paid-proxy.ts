@@ -92,20 +92,22 @@ export async function withGuardedPaidProxyAdmission(
       return dispatch({ mode: "compatibility", auth, requestId });
     }
     if (!caller.admissionSnapshot) {
-      logger.error("[PaidProxyAdmission] Combined admission snapshot missing", {
-        requestId,
-        route: new URL(c.req.url).pathname,
-        organizationId: caller.user.organization_id,
-        authSource: caller.authSource,
-      });
-      return paidProxyApiErrorResponse(
-        new ApiError(
-          503,
-          "service_unavailable",
-          "Provider admission is unavailable; retry shortly",
-          { retryable: true, retryAfterSeconds: 1 },
-        ),
+      // An authorized origin decision legitimately carries no combined
+      // projection while the positive auth cache is disabled — the engine's
+      // compatibility path then bills through the authoritative reservation
+      // instead of the Durable Object lease. Any standing denial already threw
+      // inside requireGenerativeRouteCaller, so a missing snapshot here is a
+      // supported deployment state, not an authorization gap.
+      logger.info(
+        "[PaidProxyAdmission] authorized without combined snapshot; dispatching compatibility",
+        {
+          requestId,
+          route: new URL(c.req.url).pathname,
+          organizationId: caller.user.organization_id,
+          authSource: caller.authSource,
+        },
       );
+      return dispatch({ mode: "compatibility", auth, requestId });
     }
 
     return dispatch({

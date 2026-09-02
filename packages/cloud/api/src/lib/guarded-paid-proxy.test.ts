@@ -175,6 +175,44 @@ test("preflight sees the caller after one standing read and can reject without p
   expect(executeWithBody).not.toHaveBeenCalled();
 });
 
+test("authorized caller without a snapshot dispatches compatibility instead of failing", async () => {
+  combinedStandingRead.mockReset();
+  executionContextRead.mockReset();
+  executeWithBody.mockReset();
+  // An authorized origin decision with the positive auth cache disabled:
+  // combined_cache authSource but no admission projection on the context.
+  combinedStandingRead.mockResolvedValue({
+    user: { id: "user-1", organization_id: "org-1" },
+    apiKeyId: "key-1",
+    authSource: "combined_cache",
+    admissionSnapshot: undefined,
+    appScopeId: null,
+  });
+  executionContextRead.mockReturnValue({ waitUntil: () => undefined });
+  executeWithBody.mockResolvedValue(Response.json({ ok: true }));
+
+  const response = await executeGuardedPaidProxyWithBody(
+    makeContext(),
+    {
+      id: "market-data",
+      name: "Market data",
+      auth: "apiKeyWithOrg",
+      getCost: async () => 0.01,
+    },
+    mock(),
+    { method: "getPrice" },
+  );
+
+  expect(response.status).toBe(200);
+  expect(executeWithBody).toHaveBeenCalledTimes(1);
+  const admission = executeWithBody.mock.calls[0][4] as {
+    mode: string;
+    auth: { apiKey: { id: string } | undefined };
+  };
+  expect(admission.mode).toBe("compatibility");
+  expect(admission.auth.apiKey?.id).toBe("key-1");
+});
+
 test("production without a Worker lifetime fails closed before reserve or dispatch", async () => {
   combinedStandingRead.mockReset();
   executionContextRead.mockReset();

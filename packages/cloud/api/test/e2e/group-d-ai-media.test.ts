@@ -385,7 +385,6 @@ describeE2E("Group D — /api/v1/responses", () => {
   // adopted across the untrusted ingress since #30274 — the gateway mints a
   // fresh id instead of echoing them — so these tests send the closed-schema
   // form the gateway preserves.
->>>>>>> efebfe6e5a (fix(ci): align cloud E2E and perf-gate expectations with post-#30265/#30274 contracts (#30280))
   const traceId = "16098110000040008000000000000110";
 
   test("auth gate: missing credentials → 401", async () => {
