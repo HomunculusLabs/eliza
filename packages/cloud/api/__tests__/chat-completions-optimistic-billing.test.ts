@@ -117,7 +117,7 @@ const resolveInferenceAuthContext = mock(
     authResolveOptions.push(options);
     options.onTelemetry?.({
       v: 1,
-      traceId: "11111111-1111-4111-8111-111111111111",
+      traceId: "11111111111141118111111111111111",
       authSource: "x_api_key",
       controlledProbe: "off",
       cacheAvailability: "available",
@@ -348,7 +348,7 @@ function makeRequest(
     headers: {
       "content-type": "application/json",
       "x-request-id": CLIENT_REQUEST_ID,
-      "x-eliza-trace-id": "11111111-1111-4111-8111-111111111111",
+      "x-eliza-trace-id": "11111111111141118111111111111111",
       ...(affiliateCode ? { "X-Affiliate-Code": affiliateCode } : {}),
     },
     body: JSON.stringify({
@@ -438,7 +438,7 @@ describe("chat/completions cache-only organization admission", () => {
 
     expect(response.status).toBeGreaterThanOrEqual(400);
     expect(response.headers.get("X-Eliza-Trace-Id")).toBe(
-      "11111111-1111-4111-8111-111111111111",
+      "11111111111141118111111111111111",
     );
     const preforward = response.headers.get("X-Eliza-Preforward-Ms");
     expect(preforward).toMatch(
@@ -794,7 +794,7 @@ describe("responses compatibility transformations", () => {
       headers: {
         Authorization: "Bearer eliza_test_key",
         "Content-Length": "999",
-        "X-Eliza-Trace-Id": "33333333-3333-4333-8333-333333333333",
+        "X-Eliza-Trace-Id": "33333333333343338333333333333333",
       },
       body: "{}",
     });
@@ -812,7 +812,7 @@ describe("responses compatibility transformations", () => {
     expect(request.headers.get("Authorization")).toBe("Bearer eliza_test_key");
     expect(request.headers.get("Content-Length")).toBeNull();
     expect(request.headers.get("X-Eliza-Trace-Id")).toBe(
-      "33333333-3333-4333-8333-333333333333",
+      "33333333333343338333333333333333",
     );
     const chatBody = (await request.json()) as Record<string, unknown>;
     expect(chatBody).toEqual({

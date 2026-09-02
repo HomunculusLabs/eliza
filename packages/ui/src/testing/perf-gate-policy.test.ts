@@ -5,7 +5,10 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { summarizeFrameSamples } from "../hooks/frame-budget";
+import {
+  shouldReportFrameBudget,
+  summarizeFrameSamples,
+} from "../hooks/frame-budget";
 import {
   evaluateFrameBudgetWindows,
   RELAYOUT_FRAME_GATE,
@@ -22,12 +25,20 @@ function summaryWithDroppedRatio(ratio: number) {
 }
 
 describe("maximize/restore performance-gate policy", () => {
-  it("retains the hosted-runner 35% dropped-frame boundary", () => {
-    expect(RELAYOUT_FRAME_GATE.droppedFrameRatio).toBe(0.35);
+  it("retains the hosted-runner 40% dropped-frame boundary, above the measured healthy median band", () => {
+    expect(RELAYOUT_FRAME_GATE.droppedFrameRatio).toBe(0.4);
     expect(RELAYOUT_FRAME_GATE_WINDOW_COUNT).toBe(5);
   });
 
-  it.each([0.4, 0.44])(
+  it("still flags the observed healthy-band ceiling as non-degraded", () => {
+    // Develop full runs 33532464306/33595881721 recorded 36% median dropped
+    // with p95 pinned at one dropped frame (33.4ms) — inside the operating
+    // band, so a single such window must not flag.
+    const healthy = summaryWithDroppedRatio(0.36);
+    expect(shouldReportFrameBudget(healthy, RELAYOUT_FRAME_GATE)).toBe(false);
+  });
+
+  it.each([0.45, 0.5])(
     "fails sustained %d frame loss in three of five windows",
     (droppedRatio) => {
       const degraded = summaryWithDroppedRatio(droppedRatio);
