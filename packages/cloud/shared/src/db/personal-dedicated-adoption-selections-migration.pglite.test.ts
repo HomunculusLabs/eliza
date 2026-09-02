@@ -21,7 +21,7 @@ const adoptionMigration = readFileSync(
   "utf8",
 );
 const rereviewMigration = readFileSync(
-  new URL("./migrations/0375_personal_dedicated_rereview_residuals.sql", import.meta.url),
+  new URL("./migrations/0377_personal_dedicated_rereview_residuals.sql", import.meta.url),
   "utf8",
 );
 
