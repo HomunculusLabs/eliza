@@ -274,9 +274,11 @@ describe("recordUsage, NUMERIC money reads fail closed (#13415)", () => {
     // 1 legacy MCP point charged, no affiliate => deduct $0.01.
     expect(deductCalls).toHaveLength(1);
     expect(deductCalls[0].amount).toBeCloseTo(0.01, 6);
-    // creator gets 80% of 1 credit => 0.8 credit => addCredits + addEarnings.
-    expect(addCreditsCalls).toHaveLength(1);
-    expect(addCreditsCalls[0].amount).toBeCloseTo(0.008, 6);
+    // Creator gets one funded entitlement: 80% of the charge as redeemable earnings.
+    expect(addCreditsCalls).toHaveLength(0);
+    expect(addEarningsCalls).toHaveLength(1);
+    expect(addEarningsCalls[0].source).toBe("mcp");
+    expect(addEarningsCalls[0].amount).toBeCloseTo(0.008, 6);
     // usage row records real numeric strings, never "NaN".
     expect(usageCreateCalls).toHaveLength(1);
     expect(usageCreateCalls[0].credits_charged).toBe("1");
@@ -549,8 +551,10 @@ describe("recordUsageWithoutDeduction, share reads fail closed (#13415)", () => 
 
     expect(result.success).toBe(true);
     expect(result).toMatchObject({ basePriceUsd: 0.01, creditUnit: "USD" });
-    expect(addCreditsCalls).toHaveLength(1);
-    expect(addCreditsCalls[0].amount).toBeCloseTo(0.008, 6);
+    expect(addCreditsCalls).toHaveLength(0);
+    expect(addEarningsCalls).toHaveLength(1);
+    expect(addEarningsCalls[0].source).toBe("mcp");
+    expect(addEarningsCalls[0].amount).toBeCloseTo(0.008, 6);
     expect(usageCreateCalls).toHaveLength(1);
     expect(usageCreateCalls[0].creator_earnings).not.toContain("NaN");
     expect(usageCreateCalls[0]).toMatchObject({

@@ -4,8 +4,8 @@
  * One MCP proxy call debits the buyer once and must credit every payout leg
  * exactly once. Before this table nothing linked the buyer debit to the
  * affiliate/creator legs: the creator earning was keyed on the constant MCP id
- * with no dedupe, the creator org-credit and usage rows had no idempotency at
- * all, and a settlement retry (Worker lost response, redelivery) replayed
+ * with no dedupe, the legacy creator org-credit duplicated the funded creator
+ * entitlement, usage rows had no idempotency, and a settlement retry replayed
  * every leg. This row is the single authoritative receipt: `payment_event_id`
  * is the canonical identity of the economic event (the precharge credit
  * transaction for credits purchases, the provider payment id for x402), unique
@@ -80,7 +80,6 @@ export const mcpSettlements = pgTable(
 
     /** Completed-leg linkage: set as each leg commits, read by recovery replays. */
     affiliate_ledger_entry_id: uuid("affiliate_ledger_entry_id"),
-    creator_credit_transaction_id: uuid("creator_credit_transaction_id"),
     creator_ledger_entry_id: uuid("creator_ledger_entry_id"),
     mcp_usage_id: uuid("mcp_usage_id"),
 
@@ -119,7 +118,7 @@ export const mcpSettlements = pgTable(
     }).onDelete("restrict"),
     receipt_check: check(
       "mcp_settlements_receipt_check",
-      sql`${table.base_amount_usd} >= 0 AND ${table.affiliate_fee_usd} >= 0 AND ${table.platform_fee_usd} >= 0 AND ${table.total_amount_usd} = ${table.base_amount_usd} + ${table.affiliate_fee_usd} + ${table.platform_fee_usd} AND ${table.total_amount_usd}::text <> 'NaN' AND ${table.creator_earnings_usd} >= 0 AND ${table.platform_earnings_usd} >= 0 AND ${table.creator_earnings_usd}::text <> 'NaN' AND ${table.platform_earnings_usd}::text <> 'NaN'`,
+      sql`${table.base_amount_usd} >= 0 AND ${table.affiliate_fee_usd} >= 0 AND ${table.platform_fee_usd} >= 0 AND ${table.total_amount_usd} = ${table.base_amount_usd} + ${table.affiliate_fee_usd} + ${table.platform_fee_usd} AND ${table.total_amount_usd} = ${table.creator_earnings_usd} + ${table.affiliate_fee_usd} + ${table.platform_earnings_usd} AND ${table.total_amount_usd}::text <> 'NaN' AND ${table.creator_earnings_usd} >= 0 AND ${table.platform_earnings_usd} >= 0 AND ${table.creator_earnings_usd}::text <> 'NaN' AND ${table.platform_earnings_usd}::text <> 'NaN'`,
     ),
     status_check: check(
       "mcp_settlements_status_check",

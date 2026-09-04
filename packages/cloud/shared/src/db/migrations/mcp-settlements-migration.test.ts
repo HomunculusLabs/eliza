@@ -52,7 +52,7 @@ function receipt(overrides: Record<string, string> = {}): string {
     platform_fee_usd: "0.00",
     total_amount_usd: "0.14",
     creator_earnings_usd: "0.07",
-    platform_earnings_usd: "0.07",
+    platform_earnings_usd: "0.05",
     x402_amount_usd: "0",
     status: "'settling'",
   };
@@ -124,6 +124,9 @@ describe("0343 mcp settlements migration", () => {
     await expect(
       db.exec(receipt({ creator_earnings_usd: "-0.01", payment_event_id: "'evt-d'" })),
     ).rejects.toThrow(/mcp_settlements_receipt_check/);
+    await expect(
+      db.exec(receipt({ creator_earnings_usd: "0.08", payment_event_id: "'evt-payout'" })),
+    ).rejects.toThrow(/mcp_settlements_receipt_check/);
   });
 
   test("receipt check rejects NaN economic legs (driver 'NaN'::numeric pins)", async () => {
@@ -176,7 +179,7 @@ describe("0343 mcp settlements migration", () => {
     await db.exec(migration);
     await db.exec(receipt());
     await expect(
-      db.exec(receipt({ creator_earnings_usd: "0.09", platform_earnings_usd: "0.05" })),
+      db.exec(receipt({ creator_earnings_usd: "0.09", platform_earnings_usd: "0.03" })),
     ).rejects.toThrow(/mcp_settlements_payment_event_uidx/);
   });
 

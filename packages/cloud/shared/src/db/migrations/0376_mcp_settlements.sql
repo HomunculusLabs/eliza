@@ -1,11 +1,11 @@
 -- First-committed-wins settlement authority for one MCP purchase (#22961).
 --
 -- The MCP proxy debits the buyer up front (reserveAndDeductCredits) and then
--- distributes the payout legs (affiliate earning, creator organization credit,
--- creator redeemable earning, usage row, usage stats) fire-and-forget. Before
+-- distributes the payout legs (affiliate earning, creator redeemable earning,
+-- usage row, usage stats) fire-and-forget. Before
 -- this table nothing tied those legs to the debit: the creator earning was
--- keyed on the constant MCP id with no dedupe, the creator org-credit and the
--- usage row had no idempotency at all, and the affiliate leg deduped only when
+-- keyed on the constant MCP id with no dedupe, the usage row had no
+-- idempotency at all, and the affiliate leg deduped only when
 -- the caller passed a precharge transaction id. A settlement retry — a Worker
 -- that lost its response and redelivered, or any future reconciliation sweep —
 -- replayed every leg and minted duplicate value.
@@ -47,7 +47,6 @@ CREATE TABLE IF NOT EXISTS mcp_settlements (
   x402_amount_usd numeric(18, 6) NOT NULL DEFAULT 0,
   status text NOT NULL DEFAULT 'settling',
   affiliate_ledger_entry_id uuid,
-  creator_credit_transaction_id uuid,
   creator_ledger_entry_id uuid,
   mcp_usage_id uuid,
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -66,6 +65,7 @@ CREATE TABLE IF NOT EXISTS mcp_settlements (
     AND affiliate_fee_usd >= 0
     AND platform_fee_usd >= 0
     AND total_amount_usd = base_amount_usd + affiliate_fee_usd + platform_fee_usd
+    AND total_amount_usd = creator_earnings_usd + affiliate_fee_usd + platform_earnings_usd
     AND total_amount_usd::text <> 'NaN'
     AND creator_earnings_usd >= 0
     AND platform_earnings_usd >= 0

@@ -1025,11 +1025,19 @@ class UserMcpsService {
     const { mcp } = params;
     const creatorSharePct =
       parseMcpSharePercentage(mcp.creator_share_percentage, "creator_share_percentage", 0) / 100;
-    const platformSharePct =
-      parseMcpSharePercentage(mcp.platform_share_percentage, "platform_share_percentage", 0) / 100;
+    parseMcpSharePercentage(mcp.platform_share_percentage, "platform_share_percentage", 0);
 
     const creatorEarnings = params.creditsCharged * creatorSharePct;
-    const platformEarnings = params.creditsCharged * platformSharePct + params.platformFeeCredits;
+    const creatorEarningsUsd = legacyMcpPointsToOrganizationCredits(creatorEarnings).toFixed(6);
+    // Platform receives the exact funded remainder after creator and affiliate
+    // earnings. Deriving this leg from the canonical receipt grid makes the
+    // conservation constraint immune to independent percentage rounding.
+    const platformEarningsUsd = (
+      Number(formatOrganizationCreditUsd(params.chargeReceipt.totalAmountUsd)) -
+      Number(formatOrganizationCreditUsd(params.chargeReceipt.affiliateFeeUsd)) -
+      Number(creatorEarningsUsd)
+    ).toFixed(6);
+    const platformEarnings = organizationCreditsToLegacyMcpPoints(Number(platformEarningsUsd));
 
     // Live-side ownership claim (#22961 round-4 P0): on the credits rail the
     // payment event IS the precharge debit, and the durable sweep refunds
@@ -1094,8 +1102,8 @@ class UserMcpsService {
       affiliate_fee_usd: formatOrganizationCreditUsd(params.chargeReceipt.affiliateFeeUsd),
       platform_fee_usd: formatOrganizationCreditUsd(params.chargeReceipt.platformFeeUsd),
       total_amount_usd: formatOrganizationCreditUsd(params.chargeReceipt.totalAmountUsd),
-      creator_earnings_usd: legacyMcpPointsToOrganizationCredits(creatorEarnings).toFixed(6),
-      platform_earnings_usd: legacyMcpPointsToOrganizationCredits(platformEarnings).toFixed(6),
+      creator_earnings_usd: creatorEarningsUsd,
+      platform_earnings_usd: platformEarningsUsd,
       x402_amount_usd: (params.paymentType === "x402" ? params.x402AmountUsd : 0).toFixed(6),
     });
     if (!created && settlement.status === "settled") {
@@ -1196,33 +1204,11 @@ class UserMcpsService {
       });
     }
 
-    // Creator organization-credit leg: the ledger's idempotency slot
-    // (`stripe_payment_intent_id`, the established synthesized-key pattern
-    // used by reserve/reconcile) makes the credit exactly-once; a replay with
-    // different amount/org is rejected inside applyCreditIncrease.
-    const creatorCreditKey = `mcp_settlement:${settlement.id}:creator_credit`;
-    if (creatorEarnings > 0 && !settlement.creator_credit_transaction_id) {
-      const creditResult = await creditsService.addCredits({
-        organizationId: settlement.creator_organization_id,
-        amount: creatorEarnings,
-        description: `MCP Revenue: ${mcp.name} - ${settlement.tool_name}`,
-        stripePaymentIntentId: creatorCreditKey,
-        metadata: {
-          mcp_id: mcp.id,
-          mcp_settlement_id: settlement.id,
-          consumer_org_id: settlement.buyer_organization_id,
-          tool_name: settlement.tool_name,
-          payment_type: settlement.payment_type,
-          affiliate_fee_usd: settlement.affiliate_fee_usd,
-          platform_fee_usd: settlement.platform_fee_usd,
-        },
-      });
-      await mcpSettlementsRepository.recordLeg(settlement.id, {
-        creator_credit_transaction_id: creditResult.transaction.id,
-      });
-    }
-
-    // Creator redeemable-earnings leg (token redemption). A failed leg must
+    // Creator earnings are credited only to the creator's redeemable balance.
+    // Organization credits are a separate asset that creators can explicitly
+    // fund from earnings; granting both here would create an unfunded second
+    // creator entitlement from the same buyer debit (#22961).
+    // A failed leg must
     // NOT be swallowed: settlement stays recoverable and the caller sees the
     // failure instead of a silently half-paid creator (#22961).
     if (creatorEarnings > 0 && settlement.creator_user_id && !settlement.creator_ledger_entry_id) {
