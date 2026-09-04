@@ -133,7 +133,6 @@ export const mcpSettlementsRepository = {
     id: string,
     leg: {
       affiliate_ledger_entry_id?: string;
-      creator_credit_transaction_id?: string;
       creator_ledger_entry_id?: string;
       mcp_usage_id?: string;
     },

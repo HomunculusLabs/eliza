@@ -4,8 +4,9 @@
  *
  * Before the settlement authority, one MCP purchase could mint duplicate
  * value on delivery replay: the creator earning was keyed on the constant
- * MCP id with no dedupe, the creator org-credit and the usage row had no
- * idempotency at all, and the affiliate leg deduped only when the caller
+ * MCP id with no dedupe, the legacy creator org-credit duplicated the funded
+ * creator entitlement, the usage row had no idempotency at all, and the
+ * affiliate leg deduped only when the caller
  * passed a precharge id. This suite drives the REAL
  * `userMcpsService.recordUsageWithoutDeduction` and `recordUsage` against
  * PGlite and asserts conservation of value across:
@@ -292,8 +293,8 @@ describe("MCP settlement balanced ledger (#22961)", () => {
     expect(result.settlementId).toBeTruthy();
 
     const s = await balances(fx);
-    // 10 points base = $0.10; creator share 70% => $0.07 each side; affiliate $0.02.
-    expect(s.creatorOrg).toBe(0.07);
+    // 10 points base = $0.10; creator share 70% => $0.07 redeemable; affiliate $0.02.
+    expect(s.creatorOrg).toBe(0);
     expect(s.creatorRedeemable).toBe(0.07);
     expect(s.affiliateRedeemable).toBe(0.02);
     expect(s.usageRows).toBe(1);
@@ -306,7 +307,6 @@ describe("MCP settlement balanced ledger (#22961)", () => {
     expect(receipt.status).toBe("settled");
     expect(receipt.settled_at).not.toBeNull();
     expect(receipt.mcp_usage_id).toBeTruthy();
-    expect(receipt.creator_credit_transaction_id).toBeTruthy();
     expect(receipt.creator_ledger_entry_id).toBeTruthy();
     expect(receipt.affiliate_ledger_entry_id).toBeTruthy();
     // Buyer debit conservation: total = base + affiliate fee + platform fee.
@@ -336,7 +336,7 @@ describe("MCP settlement balanced ledger (#22961)", () => {
 
     const s = await balances(fx);
     const [receipt] = s.settlements;
-    const creatorOrgCredit = s.creatorOrg; // organizations.credit_balance leg
+    const creatorOrgCredit = s.creatorOrg; // no implicit organization-credit grant
     const creatorRedeemable = s.creatorRedeemable; // redeemable_earnings leg
     const affiliateRedeemable = s.affiliateRedeemable;
     const platformEarnings = Number(receipt.platform_earnings_usd);
@@ -344,15 +344,10 @@ describe("MCP settlement balanced ledger (#22961)", () => {
     // The receipt's charge decomposition must reconstruct the real debit.
     expect(Number(receipt.total_amount_usd)).toBeCloseTo(buyerDebit, 6);
 
-    // EXPECTED-AT-HEAD (review round 2026-09-01, #22961 ruling pending):
-    // creator 70% of 10 points = $0.07 to the org AND $0.07 to the creator's
-    // redeemable balance, affiliate $0.02, platform $0.05, debit $0.14. The
-    // credited legs + platform total $0.21 — a surplus of exactly ONE creator
-    // leg over the debit. If the maintainer ruling on #22961 drops the
-    // duplicated creator leg, these pins MUST be updated together: the
-    // surplus expectation below goes to 0 and the creatorRedeemable pin goes
-    // to 0. They exist so the economics cannot drift silently.
-    expect(creatorOrgCredit).toBeCloseTo(0.07, 6);
+    // One buyer debit funds exactly one creator entitlement plus the affiliate
+    // and platform shares. Creator earnings remain withdrawable; organization
+    // credits require the existing explicit earnings-to-credits funding path.
+    expect(creatorOrgCredit).toBe(0);
     expect(creatorRedeemable).toBeCloseTo(0.07, 6);
     expect(affiliateRedeemable).toBeCloseTo(0.02, 6);
     expect(platformEarnings).toBeCloseTo(0.05, 6);
@@ -360,16 +355,11 @@ describe("MCP settlement balanced ledger (#22961)", () => {
 
     const creditedPlusPlatform =
       creatorOrgCredit + creatorRedeemable + affiliateRedeemable + platformEarnings;
-    expect(creditedPlusPlatform).toBeCloseTo(0.21, 6);
+    expect(creditedPlusPlatform).toBeCloseTo(0.14, 6);
 
-    // The conservation sum: the divergence from the debit is exactly one
-    // creator leg (creatorRedeemable), to six decimals, on every settlement.
-    // This equality is the invariant the maintainer ruling will settle; when
-    // it settles the other way, this assertion fails loudly and forces the
-    // conscious update above.
+    // Every funded leg reconstructs the exact production-linked buyer debit.
     const surplus = creditedPlusPlatform - buyerDebit;
-    expect(surplus).toBeCloseTo(creatorRedeemable, 6);
-    expect(surplus).toBeCloseTo(0.07, 6);
+    expect(surplus).toBeCloseTo(0, 6);
   });
 
   test("retry of the same settlement: cumulative ledger delta is zero", async () => {
@@ -406,7 +396,7 @@ describe("MCP settlement balanced ledger (#22961)", () => {
     expect(results.every((r) => r.success)).toBe(true);
     expect(new Set(results.map((r) => r.settlementId)).size).toBe(1);
     expect(s.settlementRows).toBe(1);
-    expect(s.creatorOrg).toBe(0.07);
+    expect(s.creatorOrg).toBe(0);
     expect(s.creatorRedeemable).toBe(0.07);
     expect(s.affiliateRedeemable).toBe(0.02);
     expect(s.usageRows).toBe(1);
@@ -455,7 +445,7 @@ describe("MCP settlement balanced ledger (#22961)", () => {
     await userMcpsService.recordUsageWithoutDeduction(await prepaidParams(fx));
     const s = await balances(fx);
     expect(s.settlementRows).toBe(2);
-    expect(s.creatorOrg).toBeCloseTo(0.14, 6);
+    expect(s.creatorOrg).toBe(0);
     expect(s.creatorRedeemable).toBeCloseTo(0.14, 6);
     expect(s.affiliateRedeemable).toBeCloseTo(0.04, 6);
     expect(s.usageRows).toBe(2);
@@ -466,7 +456,7 @@ describe("MCP settlement balanced ledger (#22961)", () => {
     if (!pgliteReady) return;
     const params = await prepaidParams(fx);
     // Simulate a crash mid-settlement: the receipt exists and the affiliate
-    // leg is linked, but the creator legs, usage, and terminal state are not.
+    // leg is linked, but the creator earning, usage, and terminal state are not.
     // The next delivery must complete only the missing legs.
     const { mcpSettlementsRepository } = await import("../../../db/repositories/mcp-settlements");
     const { settlement } = await mcpSettlementsRepository.claim({
@@ -496,7 +486,7 @@ describe("MCP settlement balanced ledger (#22961)", () => {
 
     const s = await balances(fx);
     expect(s.settlementRows).toBe(1);
-    expect(s.creatorOrg).toBe(0.07);
+    expect(s.creatorOrg).toBe(0);
     expect(s.creatorRedeemable).toBe(0.07);
     expect(s.affiliateRedeemable).toBe(0.02);
     expect(s.usageRows).toBe(1);
@@ -516,7 +506,7 @@ describe("MCP settlement balanced ledger (#22961)", () => {
     expect(first.success).toBe(true);
     const s1 = await balances(fx);
     expect(s1.buyer).toBeCloseTo(999.9, 6);
-    expect(s1.creatorOrg).toBeCloseTo(0.07, 6);
+    expect(s1.creatorOrg).toBe(0);
     expect(s1.creatorRedeemable).toBeCloseTo(0.07, 6);
     expect(s1.settlementRows).toBe(1);
 
@@ -544,7 +534,7 @@ describe("MCP settlement balanced ledger (#22961)", () => {
     expect(second.totalPriceUsd).toBeCloseTo(first.totalPriceUsd, 9);
     const s2 = await balances(fx);
     expect(s2.settlementRows).toBe(1);
-    expect(s2.creatorOrg).toBeCloseTo(0.07, 6);
+    expect(s2.creatorOrg).toBe(0);
     expect(s2.creatorRedeemable).toBeCloseTo(0.07, 6);
     expect(s2.usageRows).toBe(1);
     expect(s2.mcpTotalRequests).toBe(1);
@@ -649,7 +639,7 @@ describe("MCP settlement balanced ledger (#22961)", () => {
     if (!pgliteReady) return;
     const params = await prepaidParams(fx);
     // Crash simulation: claim the receipt, apply the affiliate leg ONLY, then
-    // "evict" — creator legs, usage, and terminal state never run. The sweep
+    // "evict" — creator earning, usage, and terminal state never run. The sweep
     // must complete exactly the missing legs from the receipt snapshot.
     const { mcpSettlementsRepository } = await import("../../../db/repositories/mcp-settlements");
     const { settlement, created } = await mcpSettlementsRepository.claim({
@@ -699,8 +689,8 @@ describe("MCP settlement balanced ledger (#22961)", () => {
     const s = await balances(fx);
     expect(s.settlementRows).toBe(1);
     // Exactly one application of every leg: affiliate pre-crash, the rest by
-    // the sweep; buyer paid once, creator paid once per rail.
-    expect(s.creatorOrg).toBeCloseTo(0.07, 6);
+    // the sweep; buyer paid once and creator earnings were credited once.
+    expect(s.creatorOrg).toBe(0);
     expect(s.creatorRedeemable).toBeCloseTo(0.07, 6);
     expect(s.affiliateRedeemable).toBeCloseTo(0.02, 6);
     expect(s.usageRows).toBe(1);
@@ -708,7 +698,6 @@ describe("MCP settlement balanced ledger (#22961)", () => {
     const [receipt] = s.settlements;
     expect(receipt.status).toBe("settled");
     expect(receipt.mcp_usage_id).toBeTruthy();
-    expect(receipt.creator_credit_transaction_id).toBeTruthy();
     expect(receipt.creator_ledger_entry_id).toBeTruthy();
 
     // A second sweep pass is a no-op (terminal receipts are not due).
@@ -716,7 +705,7 @@ describe("MCP settlement balanced ledger (#22961)", () => {
     expect(stats2.resumed).toBe(0);
     const s2 = await balances(fx);
     expect(s2.usageRows).toBe(1);
-    expect(s2.creatorOrg).toBeCloseTo(0.07, 6);
+    expect(s2.creatorOrg).toBe(0);
   });
 
   test("durable sweep refunds an orphaned precharge exactly once", async () => {
@@ -1225,7 +1214,7 @@ describe("MCP settlement balanced ledger (#22961)", () => {
 
     const s = await balances(fx);
     expect(s.settlementRows).toBe(1);
-    expect(s.creatorOrg).toBeCloseTo(0.07, 6);
+    expect(s.creatorOrg).toBe(0);
     expect(s.creatorRedeemable).toBeCloseTo(0.07, 6);
     expect(s.affiliateRedeemable).toBeCloseTo(0.02, 6);
     // The settled debit is protected from the sweep by its receipt.

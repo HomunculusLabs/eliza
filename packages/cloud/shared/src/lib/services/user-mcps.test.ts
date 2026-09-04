@@ -251,7 +251,6 @@ mock.module("../../db/repositories/mcp-settlements", () => ({
         status: "settling",
         mcp_usage_id: null,
         affiliate_ledger_entry_id: null,
-        creator_credit_transaction_id: null,
         creator_ledger_entry_id: null,
         ...row,
       };
