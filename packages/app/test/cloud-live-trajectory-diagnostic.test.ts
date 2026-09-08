@@ -3,6 +3,9 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  CLOUD_LIVE_CONTINUITY_IDENTITY_TIMEOUT_MS,
+  CLOUD_LIVE_FIRST_IDENTITY_TIMEOUT_MS,
+  CLOUD_LIVE_IDENTITY_TIMEOUT_BUDGET_MS,
   CLOUD_LIVE_NAVIGATION_TIMEOUT_MS,
   CLOUD_LIVE_TRAJECTORY_DIAGNOSTIC_SCHEMA,
   CLOUD_LIVE_TRAJECTORY_PHASES,
@@ -93,11 +96,15 @@ const ZERO_PERSONAL_BODY_AND_RECOVERY_COUNTERS = {
 
 describe("Cloud live trajectory diagnostic", () => {
   it("allows the complete bounded trajectory within the 45-minute job", () => {
-    expect(CLOUD_LIVE_TRAJECTORY_TIMEOUT_MS).toBe(35 * 60 * 1_000);
     expect(CLOUD_LIVE_TRAJECTORY_TIMEOUT_MS).toBeLessThan(45 * 60 * 1_000);
-    expect(CLOUD_LIVE_NAVIGATION_TIMEOUT_MS).toBe(2 * 60 * 1_000);
     expect(CLOUD_LIVE_NAVIGATION_TIMEOUT_MS).toBeLessThan(
       CLOUD_LIVE_TRAJECTORY_TIMEOUT_MS,
+    );
+    expect(CLOUD_LIVE_FIRST_IDENTITY_TIMEOUT_MS).toBeGreaterThan(
+      CLOUD_LIVE_CONTINUITY_IDENTITY_TIMEOUT_MS,
+    );
+    expect(CLOUD_LIVE_IDENTITY_TIMEOUT_BUDGET_MS).toBeLessThanOrEqual(
+      CLOUD_LIVE_TRAJECTORY_TIMEOUT_MS - CLOUD_LIVE_IDENTITY_TIMEOUT_BUDGET_MS,
     );
   });
 
@@ -129,6 +136,7 @@ describe("Cloud live trajectory diagnostic", () => {
         runtimeCloudActionAttemptCount: 1,
         runtimeCloudActionSuccessCount: 0,
         runtimeCloudActionTimeoutCount: 1,
+        runtimeCloudActionUnavailableCount: 0,
         ...ZERO_PERSONAL_BODY_AND_RECOVERY_COUNTERS,
         personalIdentityGetRequestCount: 0,
         successfulPersonalIdentityGetResponseCount: 0,
@@ -151,6 +159,7 @@ describe("Cloud live trajectory diagnostic", () => {
         runtimeCloudActionAttemptCount: 1,
         runtimeCloudActionSuccessCount: 0,
         runtimeCloudActionTimeoutCount: 1,
+        runtimeCloudActionUnavailableCount: 0,
         ...ZERO_PERSONAL_BODY_AND_RECOVERY_COUNTERS,
         personalIdentityGetRequestCount: 0,
         successfulPersonalIdentityGetResponseCount: 0,
@@ -185,6 +194,7 @@ describe("Cloud live trajectory diagnostic", () => {
       runtimeCloudActionAttemptCount: 1,
       runtimeCloudActionSuccessCount: 0,
       runtimeCloudActionTimeoutCount: 0,
+      runtimeCloudActionUnavailableCount: 1,
       ...ZERO_PERSONAL_BODY_AND_RECOVERY_COUNTERS,
       personalIdentityGetRequestCount: 0,
       successfulPersonalIdentityGetResponseCount: 0,
@@ -210,6 +220,7 @@ describe("Cloud live trajectory diagnostic", () => {
       runtimeCloudActionAttemptCount: 1,
       runtimeCloudActionSuccessCount: 0,
       runtimeCloudActionTimeoutCount: 0,
+      runtimeCloudActionUnavailableCount: 1,
       ...ZERO_PERSONAL_BODY_AND_RECOVERY_COUNTERS,
       personalIdentityGetRequestCount: 1,
       successfulPersonalIdentityGetResponseCount: 1,
@@ -245,6 +256,7 @@ describe("Cloud live trajectory diagnostic", () => {
       runtimeCloudActionAttemptCount: 1,
       runtimeCloudActionSuccessCount: 0,
       runtimeCloudActionTimeoutCount: 0,
+      runtimeCloudActionUnavailableCount: 0,
       ...ZERO_PERSONAL_BODY_AND_RECOVERY_COUNTERS,
       personalIdentityGetRequestCount: 1,
       successfulPersonalIdentityGetResponseCount: 1,

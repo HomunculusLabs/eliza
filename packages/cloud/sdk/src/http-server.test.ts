@@ -5,7 +5,7 @@
 import { createServer } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ElizaCloudClient } from "./client.js";
-import { ElizaCloudHttpClient } from "./http.js";
+import { CloudApiClient, ElizaCloudHttpClient } from "./http.js";
 
 let baseUrl: string;
 const server = createServer((req, res) => {
@@ -20,6 +20,17 @@ const server = createServer((req, res) => {
   if (path === "/empty") return send("", "application/json");
   if (path === "/malformed") return send("{broken", "application/json");
   if (path === "/raw") return send("complete server text", "text/plain");
+  if (path.startsWith("/credits?")) {
+    res.statusCode = 402;
+    const amount = new URL(path, "http://localhost").searchParams.get("amount");
+    return send(
+      JSON.stringify({
+        error: "Insufficient credits",
+        ...(amount === null ? {} : { requiredCredits: Number(amount) }),
+      }),
+      "application/json",
+    );
+  }
   if (path === "/bodyless/204" || path === "/bodyless/205") {
     res.statusCode = Number(path.split("/")[2]);
     return res.end();
@@ -44,6 +55,21 @@ afterAll(async () => {
 });
 
 describe("real HTTP parsed response contracts", () => {
+  it.each([undefined, 0, 12.5])(
+    "preserves the reported credit amount %s in HTTP 402 failures",
+    async (requiredCredits) => {
+      const query =
+        requiredCredits === undefined ? "" : `amount=${requiredCredits}`;
+      await expect(
+        new ElizaCloudHttpClient({ baseUrl }).get(`/credits?${query}`),
+      ).rejects.toMatchObject({
+        name: "InsufficientCreditsError",
+        statusCode: 402,
+        requiredCredits,
+        errorBody: { error: "Insufficient credits", requiredCredits },
+      });
+    },
+  );
   it("fails the public account request on an HTML maintenance page", async () => {
     await expect(
       new ElizaCloudClient({ baseUrl }).getUser(),
@@ -86,6 +112,30 @@ describe("real HTTP parsed response contracts", () => {
       new ElizaCloudHttpClient({ baseUrl }).get(`/bodyless/${status}`),
     ).resolves.toBeUndefined();
   });
+  it.each([204, 205])(
+    "preserves successful bodyless mutations with HTTP %s",
+    async (status) => {
+      const client = new CloudApiClient(baseUrl);
+      const path = `/bodyless/${status}`;
+      await expect(
+        client.post(path, { value: "updated" }),
+      ).resolves.toBeUndefined();
+      await expect(
+        client.put(path, { value: "updated" }),
+      ).resolves.toBeUndefined();
+      await expect(
+        client.patch(path, { value: "updated" }),
+      ).resolves.toBeUndefined();
+      await expect(client.delete(path)).resolves.toBeUndefined();
+      await expect(
+        client.postUnauthenticated(path, { value: "updated" }),
+      ).resolves.toBeUndefined();
+      await expect(client.requestData("DELETE", path)).rejects.toMatchObject({
+        statusCode: status,
+        errorBody: { code: "empty_response_body" },
+      });
+    },
+  );
   it("returns absence for HEAD and preserves text through raw access", async () => {
     const client = new ElizaCloudHttpClient({ baseUrl });
     await expect(client.request("HEAD", "/head")).resolves.toBeUndefined();
