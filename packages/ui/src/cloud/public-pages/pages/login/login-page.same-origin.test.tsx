@@ -53,6 +53,13 @@ vi.mock("@elizaos/login", () => ({
 }));
 
 vi.mock("@elizaos/shared/steward-session-client", () => ({
+  // storage-bridge (reached transitively via agent-profiles) reads
+  // STEWARD_TOKEN_KEY and registers token persistence/removal callbacks at
+  // module init to keep credentials out of native Preferences, so the partial
+  // mock must provide them or suite collection fails.
+  STEWARD_TOKEN_KEY: "steward_session_token",
+  registerStewardTokenPersistence: () => undefined,
+  registerStewardTokenRemoval: () => undefined,
   hasStewardAuthedCookie: () => false,
   readStoredStewardToken: () => null,
   writeStoredStewardToken: () => undefined,
