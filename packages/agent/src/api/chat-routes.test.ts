@@ -13,7 +13,9 @@ import {
   createMessageMemory,
   ElizaError,
   type Memory,
+  quarantinePostDeliveryTasks,
   stringToUuid,
+  trackPostDeliveryTask,
   type UUID,
 } from "@elizaos/core";
 import type { LogEntry } from "@elizaos/shared";
@@ -212,6 +214,112 @@ function makeRuntime(
       ) => run(),
     },
   } as unknown as AgentRuntime;
+}
+
+/**
+ * Reply-capable runtime for the agent-message mirror route. The chat
+ * pre-handler drain resolves the turn deterministically (no model), and a
+ * room-scoped post-delivery task registered at connection time keeps the room
+ * drain pending behind a test-controlled gate — so a test can prove the HTTP
+ * response fires while the drain is still busy. `quarantineAfterReply`
+ * quarantines the runtime as soon as the reply text exists, making the
+ * finally-block room drain throw after the reply was sent (error-policy:J7
+ * path).
+ */
+function makeReplyRuntime(options: {
+  preHandlerText: string;
+  quarantineAfterReply?: boolean;
+}): {
+  runtime: AgentRuntime;
+  releaseDrain: () => void;
+  drainTaskSettled: () => boolean;
+} {
+  let releaseDrain: () => void = () => {};
+  let drainTaskSettled = false;
+  const drainGate = new Promise<void>((resolve) => {
+    releaseDrain = resolve;
+  });
+  const base = makeRuntime();
+  const runtime = {
+    ...base,
+    logger: {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    },
+    reportError: vi.fn(),
+    createLogs: vi.fn(async () => []),
+    getRoom: async () => null,
+    getParticipantsForRoom: async () => [],
+    ensureConnection: async (args: { roomId: UUID }) => {
+      // Hold the room's post-delivery drain open behind drainGate: the task
+      // also honors its abort signal, so a quarantine still lets the drain
+      // quiesce instead of hanging the suite.
+      const lease = { release: async () => {} };
+      void trackPostDeliveryTask(
+        runtime,
+        "test:post-delivery",
+        async (signal: AbortSignal) => {
+          await new Promise<void>((resolve) => {
+            signal.addEventListener("abort", () => resolve(), { once: true });
+            drainGate.then(resolve);
+          });
+          drainTaskSettled = true;
+        },
+        { kind: "room-state", roomId: args.roomId, roomHandlerLease: lease },
+      );
+      return undefined;
+    },
+    drainChatPreHandlers: async () => {
+      if (options.quarantineAfterReply) {
+        quarantinePostDeliveryTasks(runtime, new Error("drain cancelled"));
+      }
+      return { responseText: options.preHandlerText };
+    },
+    roomHandlerQueue: {
+      currentLease: () => null,
+      ownsLease: () => true,
+      requiresExplicitOwnership: () => false,
+      currentOwnership: () => null,
+      withLease: async (
+        _room: UUID,
+        run: (lease: unknown) => Promise<unknown>,
+      ) => run({ release: async () => {} }),
+      runInLease: async (
+        _room: UUID,
+        _lease: unknown,
+        run: () => Promise<unknown>,
+      ) => run(),
+    },
+  } as unknown as AgentRuntime;
+
+  return {
+    runtime,
+    releaseDrain,
+    drainTaskSettled: () => drainTaskSettled,
+  };
+}
+
+/**
+ * Route context for the agent-message mirror whose `json` writer records
+ * calls and flips `res.headersSent` like a real response head, so the route's
+ * respond-once guard and post-reply catch arm observe realistic state.
+ */
+function makeMessageRouteCtx(state: ChatRouteState): {
+  ctx: ChatRouteContext;
+  jsonBodies: Array<{ body: unknown; status?: number }>;
+} {
+  const made = makeCtx("POST", `/api/agents/${AGENT_ID}/message`, {
+    state,
+    body: { userId: "user-1", text: "hello" },
+  });
+  const jsonBodies: Array<{ body: unknown; status?: number }> = [];
+  made.ctx.json = ((_resArg: unknown, body: unknown, status?: number) => {
+    (made.res as { headersSent: boolean }).headersSent = true;
+    jsonBodies.push({ body, status });
+  }) as ChatRouteContext["json"];
+  return { ctx: made.ctx, jsonBodies };
 }
 
 describe("handleChatRoutes", () => {
@@ -469,6 +577,83 @@ describe("handleChatRoutes", () => {
       { error: "Request body contains a blocked object key" },
       400,
     );
+  });
+
+  it("answers the agent-message mirror at the moment the reply settles", async () => {
+    // The reply must reach the HTTP caller while the room's post-delivery
+    // drain is still pending: the route answers in onReplyReady and the
+    // drain finishes behind the response (commit 9653b1bbfa4).
+    const { runtime, releaseDrain, drainTaskSettled } = makeReplyRuntime({
+      preHandlerText: "Ready when I say I am",
+    });
+    const { ctx, jsonBodies } = makeMessageRouteCtx(makeState({ runtime }));
+    const handled = handleChatRoutes(ctx);
+    // The room's post-delivery drain is held open behind drainGate; the
+    // response must already be on the wire while the route promise is still
+    // pending inside generateChatResponse's finally-block drain.
+    await vi.waitFor(() => {
+      expect(jsonBodies.length).toBe(1);
+    });
+    expect(jsonBodies[0]).toEqual({
+      body: { response: "Ready when I say I am", agentName: "Eliza" },
+    });
+    // The room's post-delivery task was still pending when the response was
+    // written and settles only now, after the route has fully returned.
+    expect(drainTaskSettled()).toBe(false);
+    releaseDrain();
+    await expect(handled).resolves.toBe(true);
+    await vi.waitFor(() => {
+      expect(drainTaskSettled()).toBe(true);
+    });
+  });
+
+  it("writes the agent-message mirror response exactly once", async () => {
+    // Both onReplyReady and the awaited ChatGenerationResult call respond();
+    // the guard must keep the response single-shot even though the drain is
+    // still pending when the second call fires.
+    const { runtime, releaseDrain } = makeReplyRuntime({
+      preHandlerText: "Once is enough",
+    });
+    const { ctx, jsonBodies } = makeMessageRouteCtx(makeState({ runtime }));
+    const handled = handleChatRoutes(ctx);
+    // The response settles via onReplyReady while the drain is still pending;
+    // the awaited result's second respond() call must be a no-op.
+    await vi.waitFor(() => {
+      expect(jsonBodies.length).toBe(1);
+    });
+    releaseDrain();
+    await expect(handled).resolves.toBe(true);
+    expect(jsonBodies.length).toBe(1);
+    expect(jsonBodies[0]).toEqual({
+      body: { response: "Once is enough", agentName: "Eliza" },
+    });
+  });
+
+  it("keeps the agent-message mirror answered when the drain fails afterwards", async () => {
+    // error-policy:J7 — a post-delivery drain failure after the reply was
+    // sent is warn-logged diagnostics; the caller must not receive a second
+    // write or a phantom error response.
+    const { runtime } = makeReplyRuntime({
+      preHandlerText: "Delivered before the crash",
+      quarantineAfterReply: true,
+    });
+    const { ctx, jsonBodies } = makeMessageRouteCtx(makeState({ runtime }));
+    await expect(handleChatRoutes(ctx)).resolves.toBe(true);
+    expect(jsonBodies.length).toBe(1);
+    expect(jsonBodies[0]).toEqual({
+      body: { response: "Delivered before the crash", agentName: "Eliza" },
+    });
+    const warn = runtime.logger.warn as ReturnType<typeof vi.fn>;
+    expect(warn).toHaveBeenCalled();
+    expect(
+      warn.mock.calls.some((args) =>
+        args.some(
+          (arg) =>
+            typeof arg === "string" &&
+            arg.includes("post-delivery drain failed after the reply was sent"),
+        ),
+      ),
+    ).toBe(true);
   });
 });
 
