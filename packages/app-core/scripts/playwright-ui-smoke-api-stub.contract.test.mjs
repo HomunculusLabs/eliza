@@ -159,6 +159,42 @@ it("serves truthful designed-empty local inference and owner surfaces", async ()
   });
 });
 
+it("serves canonical typed contracts for cloud credits and local-inference providers", async () => {
+  // Mirrors the real plugin-local-inference handler's zero-state (no device
+  // bridge, no installed bundle) so Settings' Models & Providers panel and
+  // detached-Settings polls never surface the catch-all 501 (#30867).
+  const providers = await jsonGet("/api/local-inference/providers");
+  assert.equal(providers.providers.length, 2);
+  const [capacitor, local] = providers.providers;
+  assert.equal(capacitor.id, "capacitor-llama");
+  assert.equal(capacitor.kind, "local");
+  assert.deepEqual(capacitor.enableState, {
+    enabled: false,
+    reason: "Waiting for device bridge",
+  });
+  // The real route reports capacitor-llama's registered slots unconditionally
+  // — the handler bindings — distinct from enablement.
+  assert.deepEqual(capacitor.registeredSlots, [
+    "TEXT_SMALL",
+    "TEXT_LARGE",
+    "TEXT_EMBEDDING",
+  ]);
+  assert.equal(capacitor.servingVia, null);
+  assert.equal(local.id, "eliza-local-inference");
+  assert.deepEqual(local.enableState, {
+    enabled: false,
+    reason: "No Eliza-1 bundle installed",
+  });
+  assert.deepEqual(local.registeredSlots, []);
+
+  // The cloud credits poll answers with the disconnected contract (balance
+  // null, never fabricated) when a page-level override reports connected.
+  assert.deepEqual(await jsonGet("/api/cloud/credits"), {
+    connected: false,
+    balance: null,
+  });
+});
+
 it("lists every known voice model as uninstalled without fabricating readiness", async () => {
   const { installations } = await jsonGet("/api/local-inference/voice-models");
   const ids = installations.map((installation) => installation.id);

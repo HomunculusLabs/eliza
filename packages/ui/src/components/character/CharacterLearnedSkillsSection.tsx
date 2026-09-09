@@ -9,6 +9,7 @@
 import { useCallback, useMemo, useState } from "react";
 import { useAgentElement } from "../../agent-surface";
 import { client } from "../../api/client";
+import { dispatchChatPrefill } from "../../events";
 import { useFetchData } from "../../hooks";
 import {
   type TranslationContextValue,
@@ -111,6 +112,18 @@ export function CharacterLearnedSkillsSection({
     grouped.active.length === 0 &&
     grouped.disabled.length === 0;
 
+  // The empty-state CTA hands the learning request to the one floating chat
+  // composer (CHAT_PREFILL_EVENT) instead of firing a background
+  // `sendChatMessage`: the user sees the conversation open with the complete
+  // request seeded for review, and send/progress/error stay owned by the chat
+  // surface instead of vanishing into a fire-and-forget bridge.
+  const startLearningInChat = useCallback(() => {
+    dispatchChatPrefill({
+      text: "Help me learn a new skill. Ask what capability I want to practice.",
+      select: true,
+    });
+  }, []);
+
   return (
     <section
       className="flex min-w-0 flex-col gap-4"
@@ -191,15 +204,7 @@ export function CharacterLearnedSkillsSection({
                 })}
               </p>
             </div>
-            <Button
-              type="button"
-              size="sm"
-              onClick={() =>
-                client.sendChatMessage(
-                  "Help me learn a new skill. Ask what capability I want to practice.",
-                )
-              }
-            >
+            <Button type="button" size="sm" onClick={startLearningInChat}>
               {t("learnedskills.startLearning", {
                 defaultValue: "Learn a skill",
               })}

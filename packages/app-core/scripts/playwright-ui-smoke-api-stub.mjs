@@ -3990,6 +3990,69 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Settings' Models & Providers panel (ProvidersList) polls this route every
+  // 10s while visible. A keyless smoke runtime has no device bridge and no
+  // installed Eliza-1 bundle, so both providers sit in their designed disabled
+  // state — mirroring plugin-local-inference's real /api/local-inference/providers
+  // zero-state instead of surfacing the catch-all 501 as a product console error.
+  if (
+    req.method === "GET" &&
+    url.pathname === "/api/local-inference/providers"
+  ) {
+    sendJson(req, res, 200, {
+      providers: [
+        {
+          id: "capacitor-llama",
+          label: "Eliza-1 on-device runtime (mobile)",
+          kind: "local",
+          description: "Runs Eliza-1 natively on iOS or Android via Capacitor.",
+          supportedSlots: ["TEXT_SMALL", "TEXT_LARGE", "TEXT_EMBEDDING"],
+          configureHref: null,
+          enableState: {
+            enabled: false,
+            reason: "Waiting for device bridge",
+          },
+          registeredSlots: ["TEXT_SMALL", "TEXT_LARGE", "TEXT_EMBEDDING"],
+          servingVia: null,
+          registeredTrigger: null,
+        },
+        {
+          id: "eliza-local-inference",
+          label: "Eliza-1 local inference",
+          kind: "local",
+          description:
+            "Eliza-1 bundles installed in this agent state directory.",
+          supportedSlots: [
+            "TEXT_SMALL",
+            "TEXT_LARGE",
+            "TEXT_EMBEDDING",
+            "IMAGE",
+            "IMAGE_DESCRIPTION",
+            "TEXT_TO_SPEECH",
+            "TRANSCRIPTION",
+          ],
+          configureHref: "#local-inference-panel",
+          enableState: {
+            enabled: false,
+            reason: "No Eliza-1 bundle installed",
+          },
+          registeredSlots: [],
+        },
+      ],
+    });
+    return;
+  }
+
+  // The Settings/detached-Settings cloud poll fetches credits right after a
+  // connected /api/cloud/status. The stub reports connected:false, so this is
+  // only reached when a spec's page-level route override reports connected —
+  // answer with the disconnected contract (balance null, never fabricated)
+  // instead of the catch-all 501 the diagnostics guard treats as a failure.
+  if (req.method === "GET" && url.pathname === "/api/cloud/credits") {
+    sendJson(req, res, 200, { connected: false, balance: null });
+    return;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/local-inference/catalog") {
     sendJson(req, res, 200, { models: [] });
     return;
