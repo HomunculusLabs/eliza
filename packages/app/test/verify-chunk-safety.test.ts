@@ -169,3 +169,84 @@ describe("verify-chunk-safety eagerness guard", () => {
     expect(output).toContain("entry static closure");
   });
 });
+
+// The renderer-entry guard (#30873): src/entry.ts dispatches to the real
+// renderer via dynamic import(), so the HTML entry closure walk above cannot
+// see the renderer's static graph. A renderer entry (named like
+// main-*.js / marketing-home-entry-*.js, or any other dynamic target of the
+// dispatcher chunk) that statically imports a lazy-by-design vendor chunk
+// must fail the gate even though the HTML entry itself stays clean.
+describe("verify-chunk-safety renderer-entry guard", () => {
+  function writeIndexHtml(entryFile: string): void {
+    writeFileSync(
+      join(workDir, "dist", "index.html"),
+      `<!doctype html><html><head><script type="module" crossorigin src="/assets/${entryFile}"></script></head><body></body></html>`,
+      "utf8",
+    );
+  }
+
+  it("FAILS when a dynamically-dispatched renderer entry statically imports vendor-crypto", () => {
+    // The dispatcher itself is clean: it only dynamically imports the app
+    // renderer entry, exactly like src/entry.ts does for import("./main").
+    writeChunk(
+      "index-CaYYxr8D.js",
+      'export const boot=()=>import("./index-DOWjB3rp.js");',
+    );
+    // The renderer entry statically imports the crypto chunk for a shared
+    // boot leaf (the #30873 shape: clsx/RemoveScroll/bs58 folded into vc).
+    writeChunk(
+      "index-DOWjB3rp.js",
+      'import{clsx}from"./vendor-crypto-DRnRpPYP.js";export const app=clsx;',
+    );
+    writeChunk(
+      "vendor-crypto-DRnRpPYP.js",
+      `export const clsx=1;function bn(){return ${CRYPTO_MARKER}}`,
+    );
+    writeIndexHtml("index-CaYYxr8D.js");
+
+    const { status, output } = runGate();
+    expect(status).toBe(1);
+    expect(output).toContain("renderer entry index-DOWjB3rp.js");
+    expect(output).toContain("vendor-crypto-DRnRpPYP.js");
+  });
+
+  it("FAILS when a named renderer entry (marketing-home-entry) statically imports vendor-crypto", () => {
+    writeChunk(
+      "index-CaYYxr8D.js",
+      'export const boot=()=>import("./marketing-home-entry-B1YssIhr.js");',
+    );
+    writeChunk(
+      "marketing-home-entry-B1YssIhr.js",
+      'import{x}from"./vendor-crypto-DRnRpPYP.js";export const page=x;',
+    );
+    writeChunk(
+      "vendor-crypto-DRnRpPYP.js",
+      `export const x=1;function bn(){return ${CRYPTO_MARKER}}`,
+    );
+    writeIndexHtml("index-CaYYxr8D.js");
+
+    const { status, output } = runGate();
+    expect(status).toBe(1);
+    expect(output).toContain("marketing-home-entry-B1YssIhr.js");
+  });
+
+  it("PASSES when the renderer entry keeps vendor-crypto behind a further dynamic import()", () => {
+    writeChunk(
+      "index-CaYYxr8D.js",
+      'export const boot=()=>import("./index-DOWjB3rp.js");',
+    );
+    writeChunk(
+      "index-DOWjB3rp.js",
+      'export const loadWallet=()=>import("./vendor-crypto-DRnRpPYP.js");export const app=1;',
+    );
+    writeChunk(
+      "vendor-crypto-DRnRpPYP.js",
+      `export const a=1;function bn(){return ${CRYPTO_MARKER}}`,
+    );
+    writeIndexHtml("index-CaYYxr8D.js");
+
+    const { status, output } = runGate();
+    expect(status).toBe(0);
+    expect(output).toContain("renderer entry index-DOWjB3rp.js");
+  });
+});

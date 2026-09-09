@@ -1915,9 +1915,32 @@ function resolveManualChunk(id: string): string | undefined {
   // wallet chunk into the entry's static import closure. They import nothing
   // outside themselves, so the vendor-crypto → vendor-boot-leaves edge cannot
   // form the cross-chunk init cycle the crypto pin guards against.
+  //
+  // The bs58/base-x pin must stay version-scoped: the nested `bs58@4` /
+  // `base-x@3` copies under @solana/web3.js depend on the Buffer polyfill
+  // pinned to `vendor-crypto`, and pulling those into boot-leaves creates a
+  // boot-leaves→vendor-crypto edge that forces every boot-leaves consumer to
+  // initialize the crypto chunk (worse than the original bug). Match only the
+  // hoisted store paths (`.bun/bs58@6…`, `.bun/base-x@5…`) that the first-
+  // party login/homepage code imports. If the hoisted bs58 major moves, the
+  // pin stops matching and the renderer-entry guard in
+  // scripts/verify-chunk-safety.mjs fails the build instead of letting the
+  // regression ship.
+  // `@tanstack/react-query` (+ its sole dep `@tanstack/query-core`) is a
+  // direct first-party dependency of `@elizaos/ui` (CloudRouterShell, cloud
+  // analytics, approvals) AND a peer dependency of the pinned wagmi stack —
+  // unpinned, the manual-chunk fold drags it into `vendor-crypto`, so every
+  // public-web/cloud surface statically imports the crypto chunk for
+  // `QueryClientProvider` (#30873). Same leaf shape as the react-remove-scroll
+  // family: only external import is react (vendor-react).
+  const hoistedBs58 = /\/node_modules\/\.bun\/(bs58@6|base-x@5)[^/]*\//.test(
+    normalizedId,
+  );
   if (
     normalizedId.includes("/node_modules/@noble/") ||
     /\/node_modules\/(uuid|zod|clsx|eventemitter3)\//.test(normalizedId) ||
+    /\/node_modules\/(aria-hidden|tslib)\//.test(normalizedId) ||
+    hoistedBs58 ||
     /\/node_modules\/(bs58|base-x)\/src\/esm\//.test(normalizedId)
   ) {
     return "vendor-boot-leaves";

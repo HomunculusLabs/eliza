@@ -161,6 +161,53 @@ console.log(
 const MUST_STAY_LAZY =
   /^vendor-(crypto|solana|wallet|three|vrm|draco|phonemizer)-/;
 
+// Renderer entry chunks selected by src/entry.ts. The HTML module script is
+// only the DISPATCHER: it dynamically imports one of these real renderer
+// entries, so a static closure walk that stops at the dynamic boundary sees
+// only the dispatcher and misses the renderer's eager graph entirely (#30873:
+// the app entry statically imported vendor-crypto for clsx/RemoveScroll/bs58
+// while the guard passed). Each renderer entry's OWN static closure must
+// therefore be guarded too — dynamic dispatch defers the fetch, but once the
+// renderer chunk loads, everything in its static closure is fetched+parsed
+// before first paint of that surface.
+const RENDERER_ENTRY_RE =
+  /^(main|marketing-home-entry|public-web-entry|boot-failure)-[^.]+\.js$/;
+
+function collectRendererEntryChunks() {
+  // Named renderer entries from src/entry.ts, plus the app entry chunk that
+  // entry.ts reaches via `import("./main")` — Rollup names that chunk by its
+  // leading module (currently index-*.js because main.tsx re-exports through
+  // shared facades), so discover it from the dispatcher chunk's own dynamic
+  // import targets: any dynamic target that is not a NAMED renderer entry is
+  // the app renderer itself and must be guarded the same way.
+  const named = files.filter((f) => RENDERER_ENTRY_RE.test(f));
+  const extra = new Set();
+  const dispatcher = collectEntryStaticClosure()?.entryFile;
+  if (dispatcher) {
+    const dispatcherPath = path.join(distAssets, dispatcher);
+    if (existsSync(dispatcherPath)) {
+      const body = readFileSync(dispatcherPath, "utf8");
+      const dynamicRe = /import\(\s*["'](\.\/[^"']+\.js)["']\)/g;
+      let m = dynamicRe.exec(body);
+      while (m !== null) {
+        const dep = path.posix.normalize(m[1]).replace(/^\.\//, "");
+        // A dynamic target that IS a lazy-by-design vendor chunk is the
+        // deferred payload itself (a lazy boundary), not a renderer entry —
+        // guarding it would flag every legitimate dynamic wallet import.
+        if (
+          dep.endsWith(".js") &&
+          !RENDERER_ENTRY_RE.test(dep) &&
+          !MUST_STAY_LAZY.test(dep)
+        ) {
+          extra.add(dep);
+        }
+        m = dynamicRe.exec(body);
+      }
+    }
+  }
+  return [...new Set([...named, ...extra])];
+}
+
 function collectEntryStaticClosure() {
   let indexHtml;
   try {
@@ -225,6 +272,61 @@ if (entryClosure) {
 } else {
   console.warn(
     "[verify-chunk-safety] note: no module-script entry found in dist/index.html — skipping the eagerness guard.",
+  );
+}
+
+// ── Renderer-entry eagerness guard (#30873) ──
+// src/entry.ts dynamically imports the real renderer entry (main /
+// marketing-home-entry / public-web-entry), so the HTML entry closure above
+// ends at that dynamic boundary and never sees the renderer's static graph.
+// Walk each renderer entry's static import closure with the same rule: no
+// lazy-by-design vendor chunk may be reachable without a further dynamic
+// import() boundary, or that surface fetches the multi-MB wallet graph before
+// first paint.
+function collectStaticClosureFrom(startFile) {
+  const seen = new Set([startFile]);
+  const pending = [startFile];
+  while (pending.length > 0) {
+    const file = pending.pop();
+    const filePath = path.join(distAssets, file);
+    if (!existsSync(filePath)) continue;
+    const body = readFileSync(filePath, "utf8");
+    const staticImportRe = /(?:from|import)\s*["'](\.\/[^"']+\.js)["']/g;
+    let m = staticImportRe.exec(body);
+    while (m !== null) {
+      const dep = path.posix.normalize(m[1]).replace(/^\.\//, "");
+      if (dep.endsWith(".js") && !seen.has(dep)) {
+        seen.add(dep);
+        pending.push(dep);
+      }
+      m = staticImportRe.exec(body);
+    }
+    staticImportRe.lastIndex = 0;
+  }
+  return seen;
+}
+
+const rendererEntryChunks = collectRendererEntryChunks();
+for (const rendererEntry of rendererEntryChunks) {
+  const closure = collectStaticClosureFrom(rendererEntry);
+  const eagerHeavy = [...closure].filter((f) => MUST_STAY_LAZY.test(f));
+  if (eagerHeavy.length > 0) {
+    console.error(
+      `[verify-chunk-safety] FAIL: renderer entry ${rendererEntry} statically imports lazy-by-design vendor chunk(s) (fetched+parsed before that surface's first paint):`,
+    );
+    for (const f of eagerHeavy) console.error(`  - ${f}`);
+    console.error(
+      "\nThe HTML entry only dispatches to the renderer entry via a dynamic\n" +
+        "import, so this graph was invisible to the entry closure walk. A shared\n" +
+        "boot dependency (clsx / react-remove-scroll / bs58 class) was probably\n" +
+        "folded into a pinned wallet chunk by the manual-chunk fold — pin such\n" +
+        "leaves to vendor-boot-leaves in vite.config.ts's resolveManualChunk\n" +
+        "(see the #30873 group). Do NOT deploy this bundle.",
+    );
+    process.exit(1);
+  }
+  console.log(
+    `[verify-chunk-safety] OK: renderer entry ${rendererEntry} static closure (${closure.size} chunks) contains no lazy-by-design vendor chunk.`,
   );
 }
 
