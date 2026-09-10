@@ -1427,6 +1427,7 @@ function MemoryViewerViewForAuthority({
       <FramedPage gutterOwner="framed-page">
         <FramedPageHeader
           title={t("memoryviewer.title", { defaultValue: "Memories" })}
+          showBack
           actions={
             memoryRuntimeUnavailable ? undefined : (
               <ViewHeaderSidebarTrigger

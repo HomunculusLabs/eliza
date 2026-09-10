@@ -93,7 +93,7 @@ export function WalletSectionNav({
           data-testid="wallet-section-header-inset"
           className={cn(isNativeWallet && "pt-[var(--safe-area-top,0px)]")}
         >
-          <ViewHeader title="Wallet" />
+          <ViewHeader title="Wallet" showBack />
         </div>
         <SectionNav
           group={WALLET_SECTION_GROUP}

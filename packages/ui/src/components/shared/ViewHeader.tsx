@@ -87,6 +87,10 @@ export function ViewBackButton({
  * section, they do not nest two.
  */
 export function ViewHeader({
+  title,
+  onBack,
+  backLabel,
+  showBack = false,
   right,
   className,
 }: {
@@ -94,10 +98,13 @@ export function ViewHeader({
   /** Override the default (launcher) back target — e.g. a sub-view returning to its hub. */
   onBack?: () => void;
   /** Accessible + agent label for the back control. Defaults to the launcher
-   *  wording; a sub-view returning to its hub should name that hub (e.g.
-   *  "Back to Settings") so the icon-only button is announced correctly. */
+   * wording; a sub-view returning to its hub should name that hub (e.g.
+   * "Back to Settings") so the icon-only button is announced correctly. */
   backLabel?: string;
-  /** Hide the back control entirely (a view with no meaningful "back"). */
+  /** Opt in to the titled navigation bar (back control + centered title).
+   * Only surfaces with no other back affordance — e.g. compact Settings,
+   * which has no persistent sidebar — should set this; every other view
+   * keeps the chromeless trailing-actions row (#30980). */
   showBack?: boolean;
   /** Optional trailing controls (actions, filters). */
   right?: ReactNode;
@@ -105,7 +112,39 @@ export function ViewHeader({
 }) {
   // Views no longer repeat a page title and launcher/back button above their
   // content. Keep real page actions (Add, filters, etc.) available without an
-  // empty header row when a view has no actions.
+  // empty header row when a view has no actions. The titled navigation bar is
+  // reserved for opt-in surfaces that would otherwise trap the user: compact
+  // Settings must return section → hub → launcher with no sidebar affordance.
+  if (showBack) {
+    // Title is centered over the FULL header width, not within a grid track, so
+    // it stays optically centered regardless of how wide the back button or the
+    // trailing actions are (#13451: view title is centered in the header). The
+    // controls float at the edges of a `relative` row and the `<h1>` is a
+    // non-responsive `absolute inset-x-0` centered layer. It reserves
+    // symmetric side room (`px-12`, wider than the icon back button) and
+    // truncates, so a long title never slides under the edge controls; the flex
+    // controls sit above it (`z-10`, pointer-events on) and stay clickable
+    // while the title layer is `pointer-events-none`.
+    return (
+      <header
+        data-testid="view-header"
+        className={cn(
+          "relative flex min-h-14 shrink-0 items-center justify-between gap-1 px-3 py-2.5 sm:gap-2 sm:px-4",
+          className,
+        )}
+      >
+        <ViewBackButton onBack={onBack} label={backLabel} />
+        <h1 className="pointer-events-none absolute inset-x-0 mx-auto max-w-[calc(100%-6rem)] truncate px-12 text-center text-lg font-semibold tracking-tight text-txt-strong">
+          {title}
+        </h1>
+        {right ? (
+          <div className="relative z-10">{right}</div>
+        ) : (
+          <span aria-hidden />
+        )}
+      </header>
+    );
+  }
   if (!right) return null;
   return (
     <div

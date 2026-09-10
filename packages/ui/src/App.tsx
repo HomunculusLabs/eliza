@@ -502,7 +502,7 @@ function ViewSurfaceFrame({
       nav={nav}
       pageLayout={manifest.layout}
       reserveChatClearance={!surfaceOwnsViewport(declaration)}
-      header={showHeader ? <ViewHeader title={title} /> : undefined}
+      header={showHeader ? <ViewHeader title={title} showBack /> : undefined}
     >
       <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         {children}
@@ -1456,7 +1456,7 @@ function buildStaticTabRenderers(): Record<
     (tab: Tab, node: ReactNode) =>
     ({ pageLayout }: StaticTabRenderContext) => (
       <AppWorkspaceContent
-        header={<ViewHeader title={titleForTab(tab)} />}
+        header={<ViewHeader title={titleForTab(tab)} showBack />}
         pageLayout={pageLayout}
       >
         {node}

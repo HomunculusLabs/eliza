@@ -99,6 +99,7 @@ function ManagedCloudRouteFrame({
     <div className="theme-cloud flex min-h-0 min-w-0 flex-1 flex-col bg-bg text-txt">
       <ViewHeader
         title={pageInfo?.title ?? "Cloud"}
+        showBack
         onBack={isCloudOverview ? undefined : () => navigate("/cloud")}
         backLabel={
           isCloudOverview ? "Back to launcher" : "Back to Cloud overview"

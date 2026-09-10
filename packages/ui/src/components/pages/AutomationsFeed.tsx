@@ -671,6 +671,7 @@ export function AutomationsFeed({
         {/* Uniform view header (#13451/#13597): bare-icon back, centered title. */}
         <FramedPageHeader
           title={t("automationsfeed.title", { defaultValue: "Automations" })}
+          showBack
           actions={
             <DropdownMenu open={createOpen} onOpenChange={setCreateOpen}>
               <DropdownMenuTrigger asChild>

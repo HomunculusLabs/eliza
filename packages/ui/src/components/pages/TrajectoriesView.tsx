@@ -734,6 +734,7 @@ function TrajectoriesViewForAuthority({
                   defaultValue: "Trajectories",
                 })
           }
+          showBack
           onBack={
             showingMobileDetail ? () => onSelectTrajectory(null) : undefined
           }
