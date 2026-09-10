@@ -327,7 +327,10 @@ describe("downloadAttachment — <a download> fallback path", () => {
   it("does not start an anchor download when the user cancels the picker", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () => new Response(new Blob(["hello"]))),
+      // A string body lets undici construct its own spec Blob; a jsdom
+      // (cross-realm) Blob body has no `.stream()` undici accepts, so
+      // `Response.blob()` throws and the picker branch is skipped entirely.
+      vi.fn(async () => new Response("hello")),
     );
     vi.stubGlobal("window", {
       showSaveFilePicker: vi.fn(async () => {
