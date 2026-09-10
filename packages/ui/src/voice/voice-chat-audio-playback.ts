@@ -17,6 +17,17 @@ interface MutableCell<T> {
   current: T;
 }
 
+export interface VoicePlaybackWatchdogTiming {
+  /** Minimum initial wall-clock watchdog delay; covers short/zero-duration buffers. */
+  floorMs?: number;
+  /** Wall-clock grace over nominal duration before the watchdog retires a still-running segment whose `ended` never arrived. */
+  graceMs?: number;
+  /** Poll interval once the nominal watchdog deadline has passed. */
+  pollMs?: number;
+  /** Hard wall-clock budget past the nominal deadline before a stalled segment settles as an error. */
+  suspensionDeadlineMs?: number;
+}
+
 export interface DecodedVoicePlaybackOptions {
   context: AudioContext;
   audioBuffer: AudioBuffer;
@@ -36,6 +47,8 @@ export interface DecodedVoicePlaybackOptions {
   clearSpeechTimers: () => void;
   emitPlaybackStart: (event: VoicePlaybackStartEvent) => void;
   tracePlayback?: boolean;
+  /** Injectable watchdog timing so tests can exercise the suspension contract deterministically. */
+  watchdogTiming?: VoicePlaybackWatchdogTiming;
 }
 
 export async function playDecodedVoiceAudio({
@@ -57,6 +70,7 @@ export async function playDecodedVoiceAudio({
   clearSpeechTimers,
   emitPlaybackStart,
   tracePlayback = false,
+  watchdogTiming,
 }: DecodedVoicePlaybackOptions): Promise<void> {
   if (generation !== generationRef.current) return;
 
@@ -94,14 +108,19 @@ export async function playDecodedVoiceAudio({
     return;
   }
 
-  await new Promise<void>((resolve) => {
+  await new Promise<void>((resolve, reject) => {
     let finished = false;
+    let watchdogPoll: ReturnType<typeof setTimeout> | null = null;
     const playStartMs = performance.now();
-    let wrappedFinish: (() => void) | null = null;
+    let wrappedFinish: ((failure?: unknown) => void) | null = null;
 
-    const finish = () => {
+    const finish = (failure?: unknown) => {
       if (finished) return;
       finished = true;
+      if (watchdogPoll !== null) {
+        clearTimeout(watchdogPoll);
+        watchdogPoll = null;
+      }
       tapLifecycle.finish();
       if (wrappedFinish && activeTaskFinishRef.current === wrappedFinish) {
         activeTaskFinishRef.current = null;
@@ -129,18 +148,25 @@ export async function playDecodedVoiceAudio({
         });
       }
       clearSpeechTimers();
-      resolve();
+      if (failure !== undefined) reject(failure);
+      else resolve();
     };
 
-    wrappedFinish = () => {
+    wrappedFinish = (failure?: unknown) => {
       if (tracePlayback) {
         ttsDebug("play:web-audio:end", {
           provider,
           segment: task.segment,
           elapsedMs: Math.round(performance.now() - playStartMs),
+          ...(failure !== undefined
+            ? {
+                watchdogError:
+                  failure instanceof Error ? failure.message : String(failure),
+              }
+            : {}),
         });
       }
-      finish();
+      finish(failure);
     };
 
     if (tracePlayback) {
@@ -156,12 +182,71 @@ export async function playDecodedVoiceAudio({
     }
 
     activeTaskFinishRef.current = wrappedFinish;
-    source.onended = wrappedFinish;
+    // `onended` dispatches with an Event argument; call through explicitly so
+    // the argument is never mistaken for a watchdog failure payload.
+    source.onended = () => wrappedFinish?.();
     tapLifecycle.start(playStartMs);
-    speechTimeoutRef.current = setTimeout(
-      wrappedFinish,
-      Math.max(2500, Math.ceil(audioBuffer.duration * 1000) + 1200),
+
+    // Wall-clock watchdog. If the nominal deadline passes with no `ended`
+    // event, do NOT retire the segment as successful on wall time alone: a
+    // suspended/interrupted AudioContext freezes the audio clock (and with it
+    // the source's `ended` event) while wall time keeps running. Poll the
+    // context state and the audio-clock progress (#31027):
+    // - context `closed` → settle as a typed error (truthful failure, no
+    //   fabricated success);
+    // - context suspended/interrupted → the buffered source is paused, not
+    //   lost; keep waiting for resume + natural `ended` (the same source node
+    //   resumes without replaying delivered PCM) until the hard suspension
+    //   deadline, then settle as a typed error;
+    // - context running → legacy safety net for a lost `ended` dispatch:
+    //   retire the segment as successful once the audio clock has had the
+    //   grace to pass nominal end-of-buffer.
+    const floorMs = watchdogTiming?.floorMs ?? 2500;
+    const graceMs = watchdogTiming?.graceMs ?? 1200;
+    const pollMs = watchdogTiming?.pollMs ?? 100;
+    const suspensionDeadlineMs = watchdogTiming?.suspensionDeadlineMs ?? 30_000;
+    const nominalMs = Math.max(
+      floorMs,
+      Math.ceil(audioBuffer.duration * 1000) + graceMs,
     );
+    const settleDeadlineMs = nominalMs + suspensionDeadlineMs;
+    // Audio-clock reading at schedule time; the watchdog computes progress as
+    // `context.currentTime - sourceStartClock` so a suspended context (frozen
+    // audio clock) reads as zero progress rather than wall-clock elapsed.
+    const sourceStartClock = context.currentTime;
+    const pollWatchdog = () => {
+      if (finished) return;
+      watchdogPoll = null;
+      if (context.state === "closed") {
+        wrappedFinish?.(
+          new Error(
+            `Audio playback context closed before the segment finished (state=${context.state})`,
+          ),
+        );
+        return;
+      }
+      const audioElapsedMs = (context.currentTime - sourceStartClock) * 1000;
+      if (context.state === "running") {
+        if (audioElapsedMs >= nominalMs - graceMs) {
+          wrappedFinish?.();
+        } else {
+          watchdogPoll = setTimeout(pollWatchdog, pollMs);
+        }
+        return;
+      }
+      // suspended / interrupted — keep the graph intact so resume delivers
+      // the remaining buffered PCM, bounded by the hard deadline.
+      if (performance.now() - playStartMs >= settleDeadlineMs) {
+        wrappedFinish?.(
+          new Error(
+            `Audio playback remained ${context.state} for ${suspensionDeadlineMs}ms past the nominal ${nominalMs}ms watchdog deadline; giving up rather than reporting unfinished audio as completed`,
+          ),
+        );
+        return;
+      }
+      watchdogPoll = setTimeout(pollWatchdog, pollMs);
+    };
+    speechTimeoutRef.current = setTimeout(pollWatchdog, nominalMs);
 
     source.start(0);
     emitPlaybackStart({
