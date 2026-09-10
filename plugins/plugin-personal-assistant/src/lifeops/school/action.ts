@@ -210,7 +210,7 @@ export function createSchoolSourceFactAction(
     contexts: ["general", "calendar", "tasks", "documents", "inbox"],
     roleGate: { minRole: "OWNER" },
     suppressPostActionContinuation: true,
-    toolSchemaStrict: false,
+    toolSchemaStrict: "optional_compatible",
     validate: deps.authorize,
     parameters: [
       {

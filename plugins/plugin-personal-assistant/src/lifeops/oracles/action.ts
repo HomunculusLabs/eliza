@@ -368,7 +368,7 @@ export function createLocalConditionsAction(
     contexts: ["general", "calendar", "tasks"],
     roleGate: { minRole: "OWNER" },
     suppressPostActionContinuation: true,
-    toolSchemaStrict: false,
+    toolSchemaStrict: "optional_compatible",
     validate: deps.authorize,
     parameters: [
       {

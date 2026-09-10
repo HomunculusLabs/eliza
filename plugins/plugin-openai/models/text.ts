@@ -820,9 +820,23 @@ function normalizeNativeToolsForCall(
   // since an omitted flag is not the same as false to the compiler. Schema
   // handling below still follows each tool's declared flag (a declared
   // non-strict schema passes through raw; everything else is sanitized).
+  // A tool marked `strictOptionalCompatible` (#30983) declares that its
+  // non-strict flag exists ONLY to keep optional properties optional; this
+  // strict grammar supports that natively, so it counts as strict for the
+  // request-wide flag and for schema handling — required arguments (the
+  // planner's `eliza_turn_scope`) stay enforced.
+  const optionalCompatibleCountsAsStrict = (rawTool: unknown): boolean => {
+    const tool = asRecord(rawTool);
+    const functionTool = asRecord(tool.function);
+    return (
+      options.cerebrasMode === true &&
+      (tool.strictOptionalCompatible === true || functionTool.strictOptionalCompatible === true)
+    );
+  };
   const cerebrasRequestStrict =
     options.cerebrasMode === true &&
     tools.every((rawTool) => {
+      if (optionalCompatibleCountsAsStrict(rawTool)) return true;
       const tool = asRecord(rawTool);
       const functionTool = asRecord(tool.function);
       const declared =
@@ -855,6 +869,12 @@ function normalizeNativeToolsForCall(
         : typeof functionTool.strict === "boolean"
           ? functionTool.strict
           : undefined;
+    // #30983: on the optional-property-compatible strict grammar, an
+    // optional_compatible tool's schema takes the strict path — that path
+    // preserves declared optional properties here, so required arguments stay
+    // enforced without forcing placeholder values for unused operation fields.
+    const strictForSchema =
+      strict === false && optionalCompatibleCountsAsStrict(rawTool) ? true : strict;
     const recordArgTransforms: RecordArgTransform[] = [];
     // The production strict Cerebras path used to call sanitizeJsonSchema
     // (raw Array.isArray / object spread / Object.entries / .map / unbounded
@@ -884,7 +904,7 @@ function normalizeNativeToolsForCall(
         : deepToWellFormedUnicode(rawSchema);
     }
     let inputSchema: JSONSchema7;
-    if (strict === false) {
+    if (strictForSchema === false) {
       if (!rawSchema || typeof rawSchema !== "object" || Array.isArray(rawSchema)) {
         throw new ElizaError("[OpenAI] Non-strict native tool schema must be a JSON object.", {
           code: "OPENAI_INVALID_NON_STRICT_TOOL_SCHEMA",
@@ -905,7 +925,7 @@ function normalizeNativeToolsForCall(
       // Pass isRoot: true so the top-level invariant is enforced (must be
       // type:"object" with no root oneOf/anyOf/enum/not).
       inputSchema = normalizeSchemaForCerebras(inputSchema, true, {
-        strict: strict !== false,
+        strict: strictForSchema !== false,
       }) as JSONSchema7;
     }
 

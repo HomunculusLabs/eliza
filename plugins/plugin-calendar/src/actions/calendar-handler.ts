@@ -4330,7 +4330,7 @@ export function createCalendarActionRunner(
 const calendarAction: CalendarHandlerAction = {
   name: "CALENDAR",
   // This operation union needs absent optional detail fields to stay absent on the wire.
-  toolSchemaStrict: false,
+  toolSchemaStrict: "optional_compatible",
   similes: [
     "CALENDAR_ACTION",
     "CHECK_CALENDAR",

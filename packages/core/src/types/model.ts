@@ -314,6 +314,16 @@ export interface ToolDefinition {
 	contexts?: AgentContext[];
 	metadata?: Record<string, JsonValue | object | undefined>;
 	strict?: boolean;
+	/**
+	 * Typed marker accompanying `strict: false` for a tool whose schema relies
+	 * on optional properties (actions that declared
+	 * `toolSchemaStrict: "optional_compatible"`, #30983). A provider whose
+	 * strict grammar keeps optional properties optional must treat the tool as
+	 * strict — enforcing required arguments like the planner's turn scope —
+	 * while every other transport keeps the plain non-strict fallback. Only
+	 * meaningful together with `strict: false`.
+	 */
+	strictOptionalCompatible?: boolean;
 }
 
 export type ToolChoice =

@@ -1562,7 +1562,7 @@ export const calendarAction: Action & {
 } = {
   name: ACTION_NAME,
   // Keep optional operation-specific details optional in provider tool schemas.
-  toolSchemaStrict: false,
+  toolSchemaStrict: "optional_compatible",
   similes: [
     "CALENDAR",
     "SCHEDULE",

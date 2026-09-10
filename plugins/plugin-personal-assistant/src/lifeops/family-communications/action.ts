@@ -221,7 +221,7 @@ export function createFamilyCommunicationsAction(
       "separate a spoken family request into proposals, or show a child their safe weekly logistics -> FAMILY_COMMUNICATIONS",
     contexts: ["general", "calendar", "tasks"],
     suppressPostActionContinuation: true,
-    toolSchemaStrict: false,
+    toolSchemaStrict: "optional_compatible",
     // The tool is advertised only while its service is live: after a failed
     // boot-time start the planner otherwise selected it, paid a full tool stage
     // and evaluation, and the handler threw (live 2026-09-05). The runtime

@@ -596,11 +596,15 @@ export interface Action {
 	 *
 	 * Defaults to true. Set false only for an aggregator whose single planner
 	 * tool intentionally spans multiple parameter shapes and therefore needs
-	 * optional fields to remain optional on the wire. Runtime argument
+	 * optional fields to remain optional on the wire — but prefer
+	 * `"optional_compatible"`, which declares the same need while letting
+	 * providers whose strict grammar natively supports optional properties
+	 * (Cerebras) keep the tool strict so required arguments such as the
+	 * planner's `eliza_turn_scope` stay enforced (#30983). Runtime argument
 	 * validation and the handler's resolved child contract still enforce the
 	 * selected operation before execution.
 	 */
-	toolSchemaStrict?: boolean;
+	toolSchemaStrict?: boolean | "optional_compatible";
 
 	/**
 	 * Domain contexts this action belongs to.

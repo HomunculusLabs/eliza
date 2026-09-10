@@ -811,7 +811,7 @@ export const householdCoordinationAction: Action = {
   contexts: ["general", "calendar", "contacts", "tasks", "admin"],
   roleGate: { minRole: "OWNER" },
   suppressPostActionContinuation: true,
-  toolSchemaStrict: false,
+  toolSchemaStrict: "optional_compatible",
   validate: async (runtime: IAgentRuntime, message: Memory) =>
     await hasLifeOpsAccess(runtime, message),
   parameters: [

@@ -3,6 +3,7 @@
 import { normalizeActionJsonSchema } from "../../actions/action-schema";
 import { promotedSubactionParent } from "../../actions/promote-subactions";
 import {
+	actionToolStrictness,
 	buildPlannerToolsFromTieredActions,
 	CORE_PLANNER_TERMINALS,
 } from "../../actions/to-tool";
@@ -587,7 +588,7 @@ export function collectPlannerTools(
 					name: alias.name,
 					description: alias.description,
 					routingHint: alias.routingHint,
-					strict: alias.toolSchemaStrict ?? true,
+					...actionToolStrictness(alias),
 					parameters: {
 						...schema,
 						parentParameterNames: Object.keys(properties),

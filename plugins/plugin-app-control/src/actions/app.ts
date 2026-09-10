@@ -210,7 +210,7 @@ export function createAppAction(deps: AppActionDeps = {}): Action {
 		suppressPostActionContinuation: true,
 		// Optional create-choice bindings must remain absent on ordinary calls.
 		// Runtime schema validation still rejects invalid supplied arguments.
-		toolSchemaStrict: false,
+		toolSchemaStrict: "optional_compatible",
 
 		parameters: [
 			{

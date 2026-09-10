@@ -194,7 +194,7 @@ export function createHouseholdOperationsAction(
     contexts: ["general", "calendar", "tasks", "finances", "documents"],
     roleGate: { minRole: "OWNER" },
     suppressPostActionContinuation: true,
-    toolSchemaStrict: false,
+    toolSchemaStrict: "optional_compatible",
     validate: deps.authorize,
     parameters: [
       {

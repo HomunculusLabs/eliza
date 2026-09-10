@@ -2652,7 +2652,7 @@ export function createViewsAction(deps: ViewsActionDeps = {}): Action {
 			"show/open navigates UI; interact invokes capabilities without navigation; Notes data uses NOTES, Calendar data uses CALENDAR; open-and-edit requires both operations",
 		routingHint: VIEWS_ROUTING_HINT,
 		allowAdditionalParameters: true,
-		toolSchemaStrict: false,
+		toolSchemaStrict: "optional_compatible",
 		// Navigation and layout modes report their authoritative outcome through
 		// their handler callback. Data-bearing capability interactions stay
 		// internal and request a model-written finishing pass.

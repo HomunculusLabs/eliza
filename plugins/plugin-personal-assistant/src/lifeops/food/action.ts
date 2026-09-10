@@ -203,7 +203,7 @@ export function createFoodDomainAction(
     contexts: ["general", "tasks"],
     roleGate: { minRole: "OWNER" },
     suppressPostActionContinuation: true,
-    toolSchemaStrict: false,
+    toolSchemaStrict: "optional_compatible",
     validate: deps.authorize,
     parameters: [
       {

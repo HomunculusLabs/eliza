@@ -152,6 +152,7 @@ export interface PlannerToolDefinition {
 		description: string;
 		parameters: ActionParametersJsonSchema | JsonSchema;
 		strict: boolean;
+		strictOptionalCompatible?: boolean;
 	};
 }
 
@@ -286,6 +287,28 @@ export type PlannerToolActionShape = Pick<
 	subActions?: Action["subActions"];
 };
 
+/**
+ * Resolve an action's declared tool-schema strictness to the provider-facing
+ * wire fields (#30983). `false` and `"optional_compatible"` both lower the wire
+ * `strict` flag so legacy strict grammars that force every declared property
+ * stay compatible; the latter additionally sets the typed
+ * `strictOptionalCompatible` marker so a provider whose strict grammar
+ * natively supports optional properties (Cerebras) can upgrade the tool back
+ * to strict, keeping required arguments such as the planner's
+ * `eliza_turn_scope` enforced.
+ */
+export function actionToolStrictness(action: {
+	toolSchemaStrict?: boolean | "optional_compatible";
+}): { strict: boolean; strictOptionalCompatible?: boolean } {
+	if (action.toolSchemaStrict === false) {
+		return { strict: false };
+	}
+	if (action.toolSchemaStrict === "optional_compatible") {
+		return { strict: false, strictOptionalCompatible: true };
+	}
+	return { strict: true };
+}
+
 function actionToPlannerTool(action: PlannerToolActionShape): ToolDefinition {
 	assertNativeToolName(action.name);
 	const baseDescription = action.description;
@@ -297,11 +320,13 @@ function actionToPlannerTool(action: PlannerToolActionShape): ToolDefinition {
 		parameters: action.parameters,
 		allowAdditionalParameters: action.allowAdditionalParameters,
 	});
+	const { strict, strictOptionalCompatible } = actionToolStrictness(action);
 	return {
 		name: action.name,
 		description,
 		type: "function",
-		strict: action.toolSchemaStrict ?? true,
+		strict,
+		...(strictOptionalCompatible ? { strictOptionalCompatible } : {}),
 		parameters,
 	};
 }
@@ -591,6 +616,7 @@ export const CORE_PLANNER_TERMINALS: ReadonlyArray<ToolDefinition> =
  */
 export function actionToTool(action: Action): PlannerToolDefinition {
 	assertNativeToolName(action.name);
+	const { strict, strictOptionalCompatible } = actionToolStrictness(action);
 
 	return {
 		type: "function",
@@ -598,7 +624,8 @@ export function actionToTool(action: Action): PlannerToolDefinition {
 			name: action.name,
 			description: action.description,
 			parameters: actionToJsonSchema(action),
-			strict: action.toolSchemaStrict ?? true,
+			strict,
+			...(strictOptionalCompatible ? { strictOptionalCompatible } : {}),
 		},
 	};
 }
