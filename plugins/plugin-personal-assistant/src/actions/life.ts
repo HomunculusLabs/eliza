@@ -1708,6 +1708,41 @@ function buildRuleBasedLifeReply(args: {
   return args.fallback;
 }
 
+// Scenarios where the action provably persisted nothing yet: any past-tense
+// completion claim in a model-rendered reply is fabricated by definition.
+// Live receipt (#30959): a clarify reply for a todo that returned
+// MISSING_DEFINITION_FIELD still claimed the assistant "had the todo down".
+// Lexical guard only — negated and future-tense phrasing ("not saved yet",
+// "it'll be saved once you confirm") is deliberately excluded so legitimate
+// preview/clarify wording passes through unchanged.
+const NOTHING_PERSISTED_LIFE_SCENARIOS = new Set<LifeReplyScenario>([
+  "reply_only",
+  "clarify_create_definition",
+  "clarify_create_goal",
+  "preview_definition",
+  "preview_goal",
+]);
+
+const RENDERED_COMPLETION_CLAIM =
+  /(?<![a-z])(?:n['’]t\s+)?\b(?:i|we|it|that|they)\s*(?:'ve\s+|'s\s+|'re\s+|ve\s+|have\s+|has\s+|are\s+|is\s+)?(?:saved|added|created|stored|logged|jotted|noted down|marked|checked off|crossed off)\b|\bgot\s+(?:it|that|the\b[^.!?]{0,30})\s+down\b|\bdone\s+deal\b/i;
+
+function rejectsFabricatedCompletion(
+  scenario: LifeReplyScenario,
+  reply: GroundedActionReply,
+): boolean {
+  return (
+    reply.kind === "model" &&
+    NOTHING_PERSISTED_LIFE_SCENARIOS.has(scenario) &&
+    !/\b(?:not|never|won'?t|wouldn'?t|until|once|if|when|before)\b[^.!?]{0,40}(?:saved|added|created|stored|logged|marked|down)\b/i.test(
+      reply.text,
+    ) &&
+    !/\b(?:will|'ll|going to)\s+be\s+(?:saved|added|created|stored|logged|marked)\b/i.test(
+      reply.text,
+    ) &&
+    RENDERED_COMPLETION_CLAIM.test(reply.text)
+  );
+}
+
 async function renderLifeActionReply(args: {
   runtime: IAgentRuntime;
   message: Memory;
@@ -1724,7 +1759,7 @@ async function renderLifeActionReply(args: {
     fallback,
     context,
   });
-  return renderGroundedActionReply({
+  const rendered = await renderGroundedActionReply({
     runtime,
     message,
     state,
@@ -1749,6 +1784,13 @@ async function renderLifeActionReply(args: {
       "Answer only about the user's tracked items (todos, reminders, goals, routines, habits, alarms). If the user's message also asked about something outside these records — a personal fact, general knowledge, another tool — leave that part unaddressed rather than answering or denying it; the assistant covers it separately.",
     ],
   });
+  if (
+    rendered.kind === "model" &&
+    rejectsFabricatedCompletion(scenario, rendered)
+  ) {
+    return { kind: "model", text: naturalFallback };
+  }
+  return rendered;
 }
 
 // Keep reply availability attached to the outcome until the action boundary

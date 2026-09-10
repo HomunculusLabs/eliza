@@ -1331,6 +1331,44 @@ describe("runLifeOperationHandler clarification contract", () => {
     expect(serviceState.createCalls).toHaveLength(0);
   });
 
+  it("saves an explicitly undated todo even when a later separate calendar operation supplies its own time (#30959)", async () => {
+    const ownerText =
+      "Add buy milk with no due date. Then create a calendar event called Grocery run from 11:00 to 11:30.";
+    const runtime = makeRuntime((prompt) => {
+      if (prompt.includes("create_definition request")) {
+        return taskPlanJson({
+          requestKind: "todo",
+          title: "Buy milk",
+          cadenceKind: "unscheduled",
+        });
+      }
+      return "";
+    });
+
+    const result = await runLifeOperationHandler(
+      runtime,
+      makeMessage(ownerText),
+      undefined,
+      {
+        parameters: {
+          action: "create",
+          intent: ownerText,
+          ownerSurface: "OWNER_TODOS",
+        },
+      } as HandlerOptions,
+    );
+
+    // The calendar operation's 11:00 belongs to Grocery run, not the todo:
+    // the todo's unscheduled cadence must survive and persist in one turn.
+    expect(result.success).toBe(true);
+    expect(serviceState.createCalls).toEqual([
+      expect.objectContaining({
+        kind: "task",
+        cadence: { kind: "unscheduled" },
+      }),
+    ]);
+  });
+
   it.each([
     "add buy milk as a todo",
     "add buy milk tomorrow at 9 as a todo",
@@ -1373,6 +1411,55 @@ describe("runLifeOperationHandler clarification contract", () => {
       expect(serviceState.createCalls).toHaveLength(0);
     },
   );
+
+  it("does not let a rendered clarify reply claim a todo was saved when creation is awaiting input (#30959)", async () => {
+    const runtime = makeRuntime((prompt) => {
+      if (prompt.includes("create_definition request")) {
+        return taskPlanJson({
+          requestKind: "todo",
+          title: "Buy milk",
+          cadenceKind: "unscheduled",
+        });
+      }
+      // "add buy milk" carries no explicit undated authority, so the create
+      // clarifies for a schedule; the reply renderer fabricates a receipt.
+      if (prompt.includes("Write the assistant's user-facing reply")) {
+        return "Got it down! I've added the todo and I'm ready when you are.";
+      }
+      return "";
+    });
+
+    const result = await runLifeOperationHandler(
+      runtime,
+      makeMessage("add buy milk"),
+      undefined,
+      {
+        parameters: {
+          action: "create",
+          intent: "add buy milk",
+          ownerSurface: "OWNER_TODOS",
+        },
+      } as HandlerOptions,
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      values: {
+        error: "MISSING_DEFINITION_FIELD",
+        missingField: "schedule",
+        awaitingUserInput: true,
+      },
+    });
+    const replyText =
+      typeof result.text === "string"
+        ? result.text
+        : result.text?.kind === "model"
+          ? result.text.text
+          : "";
+    expect(replyText).not.toMatch(
+      /\bgot\s+(?:it|that)\s+down\b|'ve\s+added\b|have\s+added\b/i,
+    );
+  });
 
   it.each(MULTILINGUAL_CONTRADICTORY_UNSCHEDULED_TEXTS)(
     "rejects a contradicted no-date todo through the handler in %s",

@@ -162,6 +162,38 @@ describe("textStatesExplicitUndatedTodo", () => {
       ),
     ).toBe(false);
   });
+
+  it.each([
+    // #30959: a later, separate calendar operation in the same message owns
+    // its own times and must not correct or complete the todo's authority.
+    "Add buy milk with no due date. Then create a calendar event called Grocery run from 11:00 to 11:30.",
+    "Add buy milk with no due date; also schedule a meeting tomorrow at 9",
+    "add buy milk as an undated task, then put a dentist appointment on my calendar friday at 2",
+    "add buy milk with no due date, and add a reminder to call mom tomorrow at 6",
+    "add buy milk with no due date, then a meeting from 3 to 4",
+    "add buy milk with no due date and a calendar event from 11 to 12",
+  ])(
+    "keeps undated authority when a separate operation supplies its own time in %p",
+    (text) => {
+      expect(textStatesExplicitUndatedTodo(text)).toBe(true);
+      expect(textContradictsExplicitUndatedTodo(text)).toBe(false);
+    },
+  );
+
+  it.each([
+    // Corrections that target THIS todo still contradict its no-date
+    // directive; pronoun-led transforms never introduce a separate item.
+    "add buy milk with no due date, then make it friday",
+    "add buy milk with no due date, then schedule it for tomorrow at 9",
+    "no due date, then make it a 9am task",
+    "add buy milk with no due date, then put it on my calendar for monday",
+  ])(
+    "still contradicts when the later schedule targets the same todo in %p",
+    (text) => {
+      expect(textStatesExplicitUndatedTodo(text)).toBe(false);
+      expect(textContradictsExplicitUndatedTodo(text)).toBe(true);
+    },
+  );
 });
 
 describe("undated Todo extraction guidance", () => {
