@@ -723,8 +723,8 @@ describe("PaymentActivityCard reversal currency rendering (#26752 review)", () =
   });
 });
 
-describe("PaymentActivityCard payment-history pagination (#26752 P2)", () => {
-  it("shows pagination controls and requests the second page with the rows-so-far offset when hasMore is true", async () => {
+describe("PaymentActivityCard payment-history pagination (#30982 stable traversal)", () => {
+  it("requests the second page with the server continuation and appends it losslessly", async () => {
     const firstPage = Array.from({ length: 50 }, (_, i) =>
       stateRow({ id: `checkout_order:p1-${i}`, authorityId: `p1-${i}` }),
     );
@@ -737,14 +737,14 @@ describe("PaymentActivityCard payment-history pagination (#26752 P2)", () => {
     apiMock.mockResolvedValueOnce({
       states: firstPage,
       total: 51,
-      offset: 0,
       hasMore: true,
+      nextContinuation:
+        "eyJjIjoxNzcyNjU5MjYxMDAwMTIzLCJzIjoiY2hlY2tvdXRfb3JkZXIiLCJpIjoicDEtNDkifQ",
     });
     apiMock.mockResolvedValueOnce({
       states: [secondPageRow],
-      total: 51,
-      offset: 50,
       hasMore: false,
+      nextContinuation: null,
     });
     render(
       <MemoryRouter>
@@ -753,63 +753,37 @@ describe("PaymentActivityCard payment-history pagination (#26752 P2)", () => {
     );
 
     await screen.findAllByTestId("payment-state-row");
-    // Count line is honest: 50 of the org's real 51 persisted payments.
+    // Count line describes the loaded traversal, never claiming all current
+    // payments are shown (a concurrent purchase needs Refresh).
     expect(screen.getByTestId("payment-activity-count").textContent).toBe(
-      "Showing 50 of 51 payments",
+      "Showing 50 payments",
     );
 
     const actor = userEvent.setup();
     await actor.click(screen.getByTestId("payment-activity-load-more"));
 
-    // The second page is requested at offset = rows already shown (50), the
-    // route's own default limit — a larger fixed first-page limit would only
-    // move the cutoff (P2 review finding).
+    // The second page is requested with the server-owned continuation —
+    // NOT rows-already-shown: a purchase created in another tab between
+    // pages no longer shifts the traversal boundary (#30982).
     expect(apiMock).toHaveBeenLastCalledWith(
-      "/api/v1/billing/payment-states?offset=50",
+      "/api/v1/billing/payment-states?continuation=eyJjIjoxNzcyNjU5MjYxMDAwMTIzLCJzIjoiY2hlY2tvdXRfb3JkZXIiLCJpIjoicDEtNDkifQ",
     );
     await waitFor(() => {
       expect(screen.getAllByTestId("payment-state-row").length).toBe(51);
     });
     // The older refunded payment from page 2 is now reachable in the card…
     expect(screen.getAllByTestId("payment-reversal-detail").length).toBe(1);
-    // …its detail link resolves to the payment-state detail surface…
-    const detailLink = screen.getAllByTestId("payment-authority-link")[50];
-    expect(detailLink.getAttribute("href")).toBe(
-      "/cloud/billing/payments/checkout_order%3Ap2-0",
-    );
-    // …and traversal ends honestly once the server says hasMore=false.
-    expect(screen.getByTestId("payment-activity-count").textContent).toBe(
-      "Showing 51 of 51 payments",
-    );
+    // …and traversal-end wording describes the loaded history, not all
+    // current payments.
     expect(screen.getByTestId("payment-activity-end").textContent).toBe(
-      "All payments shown",
+      "End of loaded payment history",
     );
     expect(screen.queryByTestId("payment-activity-load-more")).toBeNull();
+    // Refresh is offered as the explicit contract for newly created payments.
+    expect(screen.getByTestId("payment-activity-refresh")).toBeTruthy();
   });
 
-  it("hides the load-more control when the first page holds the entire history", async () => {
-    apiMock.mockResolvedValue({
-      states: [stateRow()],
-      total: 1,
-      offset: 0,
-      hasMore: false,
-    });
-    render(
-      <MemoryRouter>
-        <PaymentActivityCard />
-      </MemoryRouter>,
-    );
-    await screen.findAllByTestId("payment-state-row");
-    expect(screen.queryByTestId("payment-activity-load-more")).toBeNull();
-    expect(screen.getByTestId("payment-activity-end").textContent).toBe(
-      "All payments shown",
-    );
-    expect(screen.getByTestId("payment-activity-count").textContent).toBe(
-      "Showing 1 of 1 payments",
-    );
-  });
-
-  it("keeps already-loaded rows and offers a retry when a page-2 fetch fails", async () => {
+  it("falls back to the offset protocol when the server predates continuation", async () => {
     const firstPage = Array.from({ length: 50 }, (_, i) =>
       stateRow({ id: `checkout_order:p1-${i}`, authorityId: `p1-${i}` }),
     );
@@ -818,13 +792,69 @@ describe("PaymentActivityCard payment-history pagination (#26752 P2)", () => {
       total: 51,
       offset: 0,
       hasMore: true,
+      // legacy payload: no nextContinuation field at all
     });
-    apiMock.mockRejectedValueOnce(new Error("paging transport down"));
     apiMock.mockResolvedValueOnce({
       states: [stateRow({ id: "checkout_order:p2-0", authorityId: "p2-0" })],
       total: 51,
       offset: 50,
       hasMore: false,
+    });
+    render(
+      <MemoryRouter>
+        <PaymentActivityCard />
+      </MemoryRouter>,
+    );
+    await screen.findAllByTestId("payment-state-row");
+
+    const actor = userEvent.setup();
+    await actor.click(screen.getByTestId("payment-activity-load-more"));
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/api/v1/billing/payment-states?offset=50",
+    );
+    await waitFor(() => {
+      expect(screen.getAllByTestId("payment-state-row").length).toBe(51);
+    });
+  });
+
+  it("hides the load-more control when the first page holds the entire history", async () => {
+    apiMock.mockResolvedValue({
+      states: [stateRow()],
+      total: 1,
+      hasMore: false,
+      nextContinuation: null,
+    });
+    render(
+      <MemoryRouter>
+        <PaymentActivityCard />
+      </MemoryRouter>,
+    );
+    await screen.findAllByTestId("payment-state-row");
+    expect(screen.queryByTestId("payment-activity-load-more")).toBeNull();
+    expect(screen.getByTestId("payment-activity-end").textContent).toBe(
+      "End of loaded payment history",
+    );
+    expect(screen.getByTestId("payment-activity-count").textContent).toBe(
+      "Showing 1 payments",
+    );
+    expect(screen.getByTestId("payment-activity-refresh")).toBeTruthy();
+  });
+
+  it("keeps already-loaded rows and offers a retry when a page-2 fetch fails, then recovers with the same continuation", async () => {
+    const firstPage = Array.from({ length: 50 }, (_, i) =>
+      stateRow({ id: `checkout_order:p1-${i}`, authorityId: `p1-${i}` }),
+    );
+    apiMock.mockResolvedValueOnce({
+      states: firstPage,
+      total: 51,
+      hasMore: true,
+      nextContinuation: "eyJjIjoxLCJzIjoicGF5bWVudF9yZXF1ZXN0IiwiaSI6InAifQ",
+    });
+    apiMock.mockRejectedValueOnce(new Error("paging transport down"));
+    apiMock.mockResolvedValueOnce({
+      states: [stateRow({ id: "checkout_order:p2-0", authorityId: "p2-0" })],
+      hasMore: false,
+      nextContinuation: null,
     });
     render(
       <MemoryRouter>
@@ -844,14 +874,61 @@ describe("PaymentActivityCard payment-history pagination (#26752 P2)", () => {
       screen.getByTestId("payment-activity-load-more-error").textContent,
     ).toContain("paging transport down");
 
-    // Retry re-issues the same page request and recovers.
+    // Retry re-sends the SAME continuation (idempotent by design) and recovers.
     await actor.click(screen.getByTestId("payment-activity-load-more"));
     await waitFor(() => {
       expect(screen.getAllByTestId("payment-state-row").length).toBe(51);
     });
     expect(apiMock).toHaveBeenLastCalledWith(
-      "/api/v1/billing/payment-states?offset=50",
+      "/api/v1/billing/payment-states?continuation=eyJjIjoxLCJzIjoicGF5bWVudF9yZXF1ZXN0IiwiaSI6InAifQ",
     );
+  });
+
+  it("restarts the traversal on Refresh, surfacing a concurrently created payment", async () => {
+    const firstPage = Array.from({ length: 50 }, (_, i) =>
+      stateRow({ id: `checkout_order:p1-${i}`, authorityId: `p1-${i}` }),
+    );
+    apiMock.mockResolvedValueOnce({
+      states: firstPage,
+      total: 50,
+      hasMore: false,
+      nextContinuation: null,
+    });
+    // The other-tab purchase lands between the initial load and Refresh.
+    const afterConcurrent = [
+      stateRow({
+        id: "checkout_order:new-0",
+        authorityId: "new-0",
+        amountCents: 9999,
+      }),
+      ...firstPage,
+    ];
+    apiMock.mockResolvedValueOnce({
+      states: afterConcurrent,
+      total: 51,
+      hasMore: false,
+      nextContinuation: null,
+    });
+    render(
+      <MemoryRouter>
+        <PaymentActivityCard />
+      </MemoryRouter>,
+    );
+    await screen.findAllByTestId("payment-state-row");
+    expect(screen.getAllByTestId("payment-state-row").length).toBe(50);
+
+    const actor = userEvent.setup();
+    await actor.click(screen.getByTestId("payment-activity-refresh"));
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("payment-state-row").length).toBe(51);
+    });
+    // The new purchase is now the first row (server-authoritative order).
+    expect(screen.getAllByTestId("payment-state-row")[0].textContent).toContain(
+      "$99.99",
+    );
+    // Refresh restarted the traversal from the plain first-page endpoint.
+    expect(apiMock).toHaveBeenLastCalledWith("/api/v1/billing/payment-states");
   });
 
   it("degrades to no pagination controls when the envelope is absent", async () => {

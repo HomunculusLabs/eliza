@@ -27,7 +27,7 @@
  * can never collide with a real Stripe intent.
  */
 
-import { and, count, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, count, desc, eq, inArray, lt, or, sql } from "drizzle-orm";
 import { dbRead } from "../../db/client";
 import { creditTransactions } from "../../db/schemas/credit-transactions";
 import { paymentRequestReceipts } from "../../db/schemas/payment-request-receipts";
@@ -758,6 +758,129 @@ function projectOrderRow(
 /** Maximum page size across the payment-states surfaces. */
 export const PAYMENT_STATES_MAX_PAGE = 500;
 
+/**
+ * Server-owned continuation key for stable payment-history traversal
+ * (#30982): the last row's position in the deterministic ordering
+ * (created_at DESC, surface DESC, id DESC) as a single opaque base64url
+ * token. The keyset comparison happens in SQL against the union of both
+ * authority surfaces, so a purchase created between two pages cannot
+ * duplicate or omit any row — unlike an offset window, whose rank boundary
+ * every concurrent insertion shifts.
+ *
+ * Precision contract: created_at is a microsecond-precision PostgreSQL
+ * timestamp. The token carries the timestamp as epoch MICROseconds so the
+ * SQL comparison never truncates two distinct rows into one key. Encoding:
+ * JSON `{"c":epochMicros,"s":surface,"i":id}` → base64url; the token is
+ * opaque to clients by contract (they must echo it verbatim).
+ */
+export interface PaymentStatesContinuation {
+  /** created_at as epoch microseconds (full PostgreSQL precision). */
+  createdAtMicros: number;
+  /** Surface of the continuation row. */
+  surface: "payment_request" | "checkout_order";
+  /** Authority id of the continuation row. */
+  id: string;
+}
+
+function isPaymentStateSurface(value: unknown): value is "payment_request" | "checkout_order" {
+  return value === "payment_request" || value === "checkout_order";
+}
+
+/**
+ * Decodes a client-echoed continuation token. Fail-closed: any malformed,
+ * non-canonical, or truncated input is an explicit invalid result, never a
+ * silently reset traversal.
+ */
+export function decodePaymentStatesContinuation(
+  token: string,
+): { ok: true; value: PaymentStatesContinuation } | { ok: false; error: string } {
+  // Canonicality first: the token must be the exact base64url encoding of its
+  // bytes (the subscription-command-status cursor pattern). Padding,
+  // non-url alphabets, or trailing junk are invalid, not decoded leniently.
+  let bytes: Buffer;
+  try {
+    bytes = Buffer.from(token, "base64url");
+  } catch {
+    return { ok: false, error: "Invalid continuation: malformed base64url" };
+  }
+  if (bytes.toString("base64url") !== token || bytes.length === 0) {
+    return { ok: false, error: "Invalid continuation: non-canonical token" };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    return { ok: false, error: "Invalid continuation: malformed payload" };
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return { ok: false, error: "Invalid continuation: expected an object" };
+  }
+  const record = parsed as Record<string, unknown>;
+  const { c, s, i } = record;
+  if (
+    typeof c !== "number" ||
+    !Number.isSafeInteger(c) ||
+    c < 0 ||
+    !isPaymentStateSurface(s) ||
+    typeof i !== "string" ||
+    i.length === 0
+  ) {
+    return { ok: false, error: "Invalid continuation: missing or out-of-range fields" };
+  }
+  // No extra fields: the token must re-encode byte-identically, so a client
+  // cannot smuggle additional state through an echoed continuation.
+  if (encodePaymentStatesContinuation({ createdAtMicros: c, surface: s, id: i }) !== token) {
+    return { ok: false, error: "Invalid continuation: non-canonical payload" };
+  }
+  return { ok: true, value: { createdAtMicros: c, surface: s, id: i } };
+}
+
+/** Encodes a continuation token for the row that ends the current page. */
+export function encodePaymentStatesContinuation(row: {
+  createdAtMicros: number;
+  surface: "payment_request" | "checkout_order";
+  id: string;
+}): string {
+  const payload = JSON.stringify({
+    c: row.createdAtMicros,
+    s: row.surface,
+    i: row.id,
+  });
+  return Buffer.from(payload, "utf8").toString("base64url");
+}
+
+/** One ranked authority row as selected by the payment-states window query. */
+export interface RankedAuthorityRow {
+  id: string;
+  surface: "payment_request" | "checkout_order";
+  createdAt: Date;
+  /** created_at as epoch microseconds, selected in SQL at full precision. */
+  createdAtEpochMicros: string;
+}
+
+/**
+ * Builds the continuation token from a ranked window row's SQL-selected
+ * epoch-microseconds value — never from a JS Date, which cannot represent
+ * PostgreSQL's microsecond precision.
+ */
+function continuationTokenForWindowRow(row: RankedAuthorityRow): string {
+  return encodePaymentStatesContinuation({
+    createdAtMicros: Number(row.createdAtEpochMicros),
+    surface: row.surface,
+    id: row.id,
+  });
+}
+
+/** A stable-traversal page plus the server-owned continuation for the next. */
+export interface PaymentStatesPage {
+  rows: PaymentStateRow[];
+  /**
+   * Continuation for the next page, or null when this page ended the
+   * traversal (decided by the limit+1 probe, not a racy total).
+   */
+  nextContinuation: string | null;
+}
+
 export class PaymentHistoryService {
   /**
    * Lists the organization's purchase payment states from server authorities
@@ -776,17 +899,85 @@ export class PaymentHistoryService {
     limit = 50,
     offset = 0,
   ): Promise<PaymentStateRow[]> {
-    const boundedLimit = Math.min(Math.max(limit, 1), PAYMENT_STATES_MAX_PAGE);
-    const boundedOffset = Math.max(offset, 0);
+    const { windowRows } = await this.selectRankedWindow(organizationId, limit, {
+      offset,
+    });
+    if (windowRows.length === 0) return [];
+    return await this.hydrateAndProjectWindow(organizationId, windowRows);
+  }
 
-    // Window selection: rank the union in SQL. Each leg carries the key
-    // columns (created_at, id) plus the surface discriminator — authority
-    // ids are unique per TABLE, not across tables, so a raw UUID alone
-    // cannot identify a row and the surface must travel with it (both as
-    // the final SQL tie-breaker and to partition hydration). The outer
-    // query orders by the SAME key and applies limit/offset, so the window
-    // is exactly the page — no JS re-ranking that could disagree with SQL
-    // across pages.
+  /**
+   * First page plus the server-owned continuation that starts the stable
+   * traversal (#30982). `total` stays the caller-visible persisted count;
+   * the continuation pins the traversal's rank boundary so concurrent
+   * insertions cannot shift it.
+   */
+  async listPaymentStatesFirstPage(organizationId: string, limit = 50): Promise<PaymentStatesPage> {
+    const { windowRows, hasMore } = await this.selectRankedWindow(organizationId, limit, {
+      offset: 0,
+    });
+    if (windowRows.length === 0) {
+      return { rows: [], nextContinuation: null };
+    }
+    return {
+      rows: await this.hydrateAndProjectWindow(organizationId, windowRows),
+      nextContinuation: hasMore
+        ? continuationTokenForWindowRow(windowRows[windowRows.length - 1])
+        : null,
+    };
+  }
+
+  /**
+   * Keyset-continued page of the same stable ordering (#30982). The window
+   * starts strictly AFTER the continuation row's position
+   * (created_at DESC, surface DESC, id DESC), so a purchase created after
+   * the traversal began ranks BEFORE the continuation and can never enter
+   * the remaining tail: concurrent insertions can neither duplicate an
+   * already-shown row nor hide an unshown one — the failure mode offset
+   * pagination has when a new row shifts every rank below it.
+   */
+  async listPaymentStatesContinued(
+    organizationId: string,
+    continuation: PaymentStatesContinuation,
+    limit = 50,
+  ): Promise<PaymentStatesPage> {
+    const { windowRows, hasMore } = await this.selectRankedWindow(organizationId, limit, {
+      after: continuation,
+    });
+    if (windowRows.length === 0) {
+      return { rows: [], nextContinuation: null };
+    }
+    return {
+      rows: await this.hydrateAndProjectWindow(organizationId, windowRows),
+      nextContinuation: hasMore
+        ? continuationTokenForWindowRow(windowRows[windowRows.length - 1])
+        : null,
+    };
+  }
+
+  /**
+   * Window selection shared by the offset and keyset traversals: rank the
+   * union of both authority surfaces in SQL. Each leg carries the key
+   * columns (created_at, id) plus the surface discriminator — authority ids
+   * are unique per TABLE, not across tables, so a raw UUID alone cannot
+   * identify a row and the surface must travel with it (both as the final
+   * SQL tie-breaker and to partition hydration). The outer query orders by
+   * the SAME key, so the window is exactly the page — no JS re-ranking
+   * that could disagree with SQL across pages.
+   *
+   * `hasMore` is decided by fetching one row past the page, never by a
+   * total that concurrent writes can invalidate between queries.
+   */
+  private async selectRankedWindow(
+    organizationId: string,
+    limit: number,
+    mode: { offset: number } | { after: PaymentStatesContinuation },
+  ): Promise<{
+    windowRows: RankedAuthorityRow[];
+    hasMore: boolean;
+  }> {
+    const boundedLimit = Math.min(Math.max(limit, 1), PAYMENT_STATES_MAX_PAGE);
+
     const requestLeg = dbRead
       .select({
         id: paymentRequests.id,
@@ -804,24 +995,61 @@ export class PaymentHistoryService {
       .from(stripeCheckoutOrders)
       .where(eq(stripeCheckoutOrders.organization_id, organizationId));
     const ranked = requestLeg.unionAll(orderLeg).as("ranked_authorities");
-    // The union's inferred selection carries the first leg's literal
-    // surface type; the runtime value is either surface, so read the window
-    // through a widened row type.
-    const windowRows = (await dbRead
-      .select({
-        id: ranked.id,
-        surface: ranked.surface,
-        createdAt: ranked.createdAt,
-      })
-      .from(ranked)
-      .orderBy(desc(ranked.createdAt), desc(ranked.id), desc(ranked.surface))
-      .limit(boundedLimit)
-      .offset(boundedOffset)) as Array<{
-      id: string;
-      surface: "payment_request" | "checkout_order";
-      createdAt: Date;
-    }>;
 
+    // Epoch microseconds of created_at, computed entirely in SQL so the
+    // continuation token carries PostgreSQL's full microsecond precision —
+    // a JS Date would truncate it to milliseconds and collapse distinct
+    // rows onto one key. numeric × 1e6 → bigint is exact for the supported
+    // timestamp range (epoch micros stay below 2^53).
+    const epochMicros = sql`((extract(epoch from ${ranked.createdAt})::numeric * 1000000)::bigint)`;
+
+    const selection = {
+      id: ranked.id,
+      surface: ranked.surface,
+      createdAt: ranked.createdAt,
+      createdAtEpochMicros: sql<string>`${epochMicros}`.as("created_at_epoch_micros"),
+    };
+    const ordering = [desc(ranked.createdAt), desc(ranked.id), desc(ranked.surface)];
+
+    let query = dbRead.select(selection).from(ranked).$dynamic();
+    if ("after" in mode) {
+      // Keyset predicate in the ordering's OWN column order
+      // (created_at, then id, then surface — exactly the orderBy above), all
+      // in SQL:
+      //   created_at < K.created_at
+      //   OR (created_at = K.created_at AND id < K.id)
+      //   OR (= K.created_at AND id = K.id AND surface < K.surface)
+      // ("<" because the traversal is DESC: later rows are strictly smaller.)
+      // Comparing the columns in any other order would disagree with the
+      // orderBy on created_at ties and skip or repeat rows across pages.
+      query = query.where(
+        or(
+          lt(epochMicros, mode.after.createdAtMicros),
+          and(eq(epochMicros, mode.after.createdAtMicros), lt(ranked.id, mode.after.id)),
+          and(
+            eq(epochMicros, mode.after.createdAtMicros),
+            eq(ranked.id, mode.after.id),
+            lt(ranked.surface, mode.after.surface),
+          ),
+        ),
+      );
+    } else {
+      query = query.offset(Math.max(mode.offset, 0));
+    }
+    // One extra row decides hasMore without a second count query.
+    const fetched = (await query.orderBy(...ordering).limit(boundedLimit + 1)) as Array<
+      RankedAuthorityRow & { createdAtEpochMicros: string }
+    >;
+    const hasMore = fetched.length > boundedLimit;
+    const windowRows = hasMore ? fetched.slice(0, boundedLimit) : fetched;
+    return { windowRows, hasMore };
+  }
+
+  /** Shared per-surface hydration + projection for a ranked window's rows. */
+  private async hydrateAndProjectWindow(
+    organizationId: string,
+    windowRows: RankedAuthorityRow[],
+  ): Promise<PaymentStateRow[]> {
     // Partition the window by surface BEFORE hydration: a payment-request
     // id and a checkout-order id may collide as raw UUIDs, so each table is
     // queried only with ITS OWN window ids.

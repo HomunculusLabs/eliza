@@ -31,7 +31,10 @@ import { stripeCheckoutOrders } from "../../db/schemas/stripe-checkout-orders";
 import { userCharacters } from "../../db/schemas/user-characters";
 import { users } from "../../db/schemas/users";
 
-const { paymentHistoryService } = await import("./payment-history");
+const { decodePaymentStatesContinuation, encodePaymentStatesContinuation, paymentHistoryService } =
+  await import("./payment-history");
+
+type PaymentStatesContinuation = import("./payment-history").PaymentStatesContinuation;
 
 const PGLITE_TIMEOUT = 60_000;
 let organizationId = "";
@@ -2361,4 +2364,329 @@ describe("listPaymentStates — lossless traversal beyond the former route depth
     );
     expect(detail?.amountCents).toBe(300);
   }, 120_000);
+});
+
+// ---------------------------------------------------------------------------
+// #30982: stable keyset continuation traversal.
+// ---------------------------------------------------------------------------
+
+/** Sets a payment request's created_at to an exact microsecond timestamp. */
+async function setRequestCreatedAt(requestId: string, isoMicros: string) {
+  await dbWrite.execute(
+    sql`update payment_requests set created_at = ${isoMicros}::timestamp where id = ${requestId}`,
+  );
+}
+
+/** Walks the stable traversal from the first page, collecting every row id. */
+async function walkStableTraversal(
+  orgId: string,
+  limit: number,
+): Promise<{
+  ids: string[];
+  pages: number;
+}> {
+  const ids: string[] = [];
+  let pages = 0;
+  let page = await paymentHistoryService.listPaymentStatesFirstPage(orgId, limit);
+  pages++;
+  ids.push(...page.rows.map((r) => r.id));
+  while (page.nextContinuation !== null) {
+    const decoded = decodePaymentStatesContinuation(page.nextContinuation);
+    if (!decoded.ok) throw new Error(`bad continuation: ${decoded.error}`);
+    page = await paymentHistoryService.listPaymentStatesContinued(orgId, decoded.value, limit);
+    pages++;
+    ids.push(...page.rows.map((r) => r.id));
+  }
+  return { ids, pages };
+}
+
+describe("payment states — stable continuation traversal (#30982)", () => {
+  test("concurrent purchase insertion between pages cannot duplicate or omit rows", async () => {
+    // Seed 3 requests; page size 2; after fetching page 1, insert a NEWER
+    // request (the other-tab purchase). Offset pagination would show an old
+    // row twice and hide the new one; the stable traversal must not.
+    const r1 = await insertStripePaymentRequest({
+      organizationId,
+      amountCents: 100,
+      status: "pending",
+    });
+    const r2 = await insertStripePaymentRequest({
+      organizationId,
+      amountCents: 200,
+      status: "pending",
+    });
+    const r3 = await insertStripePaymentRequest({
+      organizationId,
+      amountCents: 300,
+      status: "pending",
+    });
+    await setRequestCreatedAt(r1.id, "2026-01-01T00:00:01.000001Z");
+    await setRequestCreatedAt(r2.id, "2026-01-01T00:00:02.000001Z");
+    await setRequestCreatedAt(r3.id, "2026-01-01T00:00:03.000001Z");
+
+    const page1 = await paymentHistoryService.listPaymentStatesFirstPage(organizationId, 2);
+    expect(page1.rows.map((r) => r.amountCents)).toEqual([300, 200]);
+    expect(page1.nextContinuation).not.toBeNull();
+
+    // The concurrent purchase: NEWER than everything (ranks first on a fresh
+    // offset traversal — the row that offset pagination trades for a dup).
+    await insertStripePaymentRequest({ organizationId, amountCents: 999, status: "pending" });
+    const newest = await dbWrite.execute(
+      sql`select id from payment_requests where amount_cents = 999`,
+    );
+    await setRequestCreatedAt((newest.rows[0] as { id: string }).id, "2026-01-01T00:00:09.999999Z");
+
+    const decoded = decodePaymentStatesContinuation(page1.nextContinuation as string);
+    expect(decoded.ok).toBe(true);
+    const page2 = await paymentHistoryService.listPaymentStatesContinued(
+      organizationId,
+      (decoded as { ok: true; value: PaymentStatesContinuation }).value,
+      2,
+    );
+    expect(page2.rows.map((r) => r.amountCents)).toEqual([100]);
+    expect(page2.nextContinuation).toBeNull();
+
+    // Full walk from scratch sees all 4 rows exactly once each.
+    const walk = await walkStableTraversal(organizationId, 2);
+    expect(walk.ids.length).toBe(4);
+    expect(new Set(walk.ids).size).toBe(4);
+  }, 60_000);
+
+  test("equal created_at across surfaces and ids: traversal visits every row exactly once (predicate mirrors orderBy)", async () => {
+    // Same microsecond timestamp on both surfaces with ids whose sort order
+    // disagrees with surface order — the case where a (created_at, surface,
+    // id) predicate would skip rows that orderBy (created_at, id, surface)
+    // still returns.
+    const req = await insertStripePaymentRequest({
+      organizationId,
+      amountCents: 100,
+      status: "pending",
+    });
+    const ord = await insertCheckoutOrder({
+      organizationId,
+      userId,
+      amountCents: 200,
+      status: "settled",
+      stripePaymentIntentId: "pi_30982_tie",
+      settledAt: new Date("2026-02-01T00:00:00Z"),
+      createdAt: new Date("2026-02-01T00:00:00Z"),
+    });
+    const req2 = await insertStripePaymentRequest({
+      organizationId,
+      amountCents: 300,
+      status: "pending",
+    });
+    await setRequestCreatedAt(req.id, "2026-02-01T00:00:00.123456Z");
+    await setRequestCreatedAt(req2.id, "2026-02-01T00:00:00.123456Z");
+    await dbWrite.execute(
+      sql`update stripe_checkout_orders set created_at = '2026-02-01T00:00:00.123456Z'::timestamp where id = ${ord.id}`,
+    );
+    // ids: request ids and order id are random UUIDs — force a known order
+    // where surface order and id order disagree. Event rows hold FKs to
+    // payment_requests.id and are irrelevant to traversal, so remove them
+    // before re-keying.
+    await dbWrite.execute(
+      sql`delete from payment_request_events where payment_request_id in (${req.id}, ${req2.id})`,
+    );
+    await dbWrite.execute(
+      sql`update payment_requests set id = 'aaaaaaaa-0000-0000-0000-0000000000a1' where id = ${req.id}`,
+    );
+    await dbWrite.execute(
+      sql`update payment_requests set id = 'aaaaaaaa-0000-0000-0000-0000000000a3' where id = ${req2.id}`,
+    );
+    await dbWrite.execute(
+      sql`update stripe_checkout_orders set id = 'aaaaaaaa-0000-0000-0000-0000000000b2' where id = ${ord.id}`,
+    );
+
+    const walk = await walkStableTraversal(organizationId, 1);
+    // 3 rows, one per page, exactly once each — no skips, no dups. Row ids
+    // are the projected stable ids (`{surface}:{authorityId}`).
+    expect(walk.pages).toBe(3);
+    expect(walk.ids.length).toBe(3);
+    expect(new Set(walk.ids).size).toBe(3);
+    // And the visit order matches the ordering (created_at DESC, id DESC,
+    // surface DESC): b2 (order) > a3 (req) > a1 (req) — authority UUIDs
+    // ordered desc, surface only as the final tie-break.
+    expect(walk.ids).toEqual([
+      "checkout_order:aaaaaaaa-0000-0000-0000-0000000000b2",
+      "payment_request:aaaaaaaa-0000-0000-0000-0000000000a3",
+      "payment_request:aaaaaaaa-0000-0000-0000-0000000000a1",
+    ]);
+  }, 60_000);
+
+  test("sub-millisecond timestamps keep distinct continuations (microsecond precision survives the token)", async () => {
+    const r1 = await insertStripePaymentRequest({
+      organizationId,
+      amountCents: 100,
+      status: "pending",
+    });
+    const r2 = await insertStripePaymentRequest({
+      organizationId,
+      amountCents: 200,
+      status: "pending",
+    });
+    const r3 = await insertStripePaymentRequest({
+      organizationId,
+      amountCents: 300,
+      status: "pending",
+    });
+    // Three requests within the SAME millisecond, distinct microseconds.
+    await setRequestCreatedAt(r1.id, "2026-03-01T00:00:00.000100Z");
+    await setRequestCreatedAt(r2.id, "2026-03-01T00:00:00.000200Z");
+    await setRequestCreatedAt(r3.id, "2026-03-01T00:00:00.000300Z");
+
+    const walk = await walkStableTraversal(organizationId, 1);
+    expect(walk.ids.length).toBe(3);
+    expect(new Set(walk.ids).size).toBe(3);
+    // Page-1 continuation must carry full microsecond precision. With
+    // limit=1 the first page holds the NEWEST row (.000300), so its
+    // continuation encodes the 300µs fraction — a ms-truncating
+    // implementation would collapse all three rows to the same key.
+    const page1 = await paymentHistoryService.listPaymentStatesFirstPage(organizationId, 1);
+    const decoded = decodePaymentStatesContinuation(page1.nextContinuation as string);
+    expect(decoded.ok).toBe(true);
+    if (decoded.ok) {
+      expect(decoded.value.createdAtMicros % 1_000_000).toBe(300);
+    }
+  }, 60_000);
+
+  test("retry of the same continuation is idempotent — same page, no state advance", async () => {
+    const r1 = await insertStripePaymentRequest({
+      organizationId,
+      amountCents: 100,
+      status: "pending",
+    });
+    const r2 = await insertStripePaymentRequest({
+      organizationId,
+      amountCents: 200,
+      status: "pending",
+    });
+    void r1;
+    const page1 = await paymentHistoryService.listPaymentStatesFirstPage(organizationId, 1);
+    const token = page1.nextContinuation as string;
+    const decoded = decodePaymentStatesContinuation(token);
+    expect(decoded.ok).toBe(true);
+    const first = await paymentHistoryService.listPaymentStatesContinued(
+      organizationId,
+      (decoded as { ok: true; value: PaymentStatesContinuation }).value,
+      1,
+    );
+    // Plain retry through the public API — the client re-sends the same token.
+    const second = await paymentHistoryService.listPaymentStatesContinued(
+      organizationId,
+      (decoded as { ok: true; value: PaymentStatesContinuation }).value,
+      1,
+    );
+    expect(second.rows.map((r) => r.id)).toEqual(first.rows.map((r) => r.id));
+    expect(second.nextContinuation).toBe(first.nextContinuation);
+    void r2;
+  }, 60_000);
+
+  test("malformed continuation tokens fail closed with typed errors", () => {
+    const badTokens = [
+      "", // empty
+      "!!!not-base64!!!",
+      Buffer.from("not json").toString("base64url"),
+      Buffer.from('{"c":"str","s":"payment_request","i":"x"}').toString("base64url"),
+      Buffer.from('{"c":1,"s":"bogus_surface","i":"x"}').toString("base64url"),
+      Buffer.from('{"c":1,"s":"payment_request"}').toString("base64url"),
+      Buffer.from('{"c":1.5,"s":"payment_request","i":"x"}').toString("base64url"),
+      Buffer.from('{"c":-1,"s":"payment_request","i":"x"}').toString("base64url"),
+      Buffer.from('{"c":1,"s":"payment_request","i":"x","extra":true}').toString("base64url"),
+      // canonical token + trailing junk (decodes leniently, fails round-trip):
+      `${Buffer.from('{"c":1,"s":"payment_request","i":"x"}').toString("base64url")}J`,
+    ];
+    for (const token of badTokens) {
+      const result = decodePaymentStatesContinuation(token);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toMatch(/^Invalid continuation: /);
+    }
+    // A well-formed canonical token decodes.
+    const good = encodePaymentStatesContinuation({
+      createdAtMicros: 1_772_659_261_000_123,
+      surface: "checkout_order",
+      id: "ord_123",
+    });
+    const decoded = decodePaymentStatesContinuation(good);
+    expect(decoded.ok).toBe(true);
+    if (decoded.ok) {
+      expect(decoded.value.createdAtMicros).toBe(1_772_659_261_000_123);
+      expect(decoded.value.surface).toBe("checkout_order");
+      expect(decoded.value.id).toBe("ord_123");
+    }
+  });
+
+  test("legacy offset callers keep the exact pre-#30982 contract", async () => {
+    const r1 = await insertStripePaymentRequest({
+      organizationId,
+      amountCents: 100,
+      status: "pending",
+    });
+    const r2 = await insertStripePaymentRequest({
+      organizationId,
+      amountCents: 200,
+      status: "pending",
+    });
+    const r3 = await insertStripePaymentRequest({
+      organizationId,
+      amountCents: 300,
+      status: "pending",
+    });
+    await setRequestCreatedAt(r1.id, "2026-04-01T00:00:01.000001Z");
+    await setRequestCreatedAt(r2.id, "2026-04-01T00:00:02.000001Z");
+    await setRequestCreatedAt(r3.id, "2026-04-01T00:00:03.000001Z");
+    const rows = await paymentHistoryService.listPaymentStates(organizationId, 2, 2);
+    expect(rows.map((r) => r.amountCents)).toEqual([100]);
+  }, 60_000);
+
+  test("org isolation holds across the continued traversal", async () => {
+    const mine = await insertStripePaymentRequest({
+      organizationId,
+      amountCents: 100,
+      status: "pending",
+    });
+    await setRequestCreatedAt(mine.id, "2026-05-01T00:00:01.000001Z");
+    const theirs = await insertStripePaymentRequest({
+      organizationId: otherOrganizationId,
+      amountCents: 200,
+      status: "pending",
+    });
+    void theirs;
+    const otherUser = await dbWrite.execute(
+      sql`select id from users where organization_id = ${otherOrganizationId}`,
+    );
+    const otherOrgOrder = await insertCheckoutOrder({
+      organizationId: otherOrganizationId,
+      userId: (otherUser.rows[0] as { id: string }).id,
+      amountCents: 300,
+      status: "settled",
+      stripePaymentIntentId: "pi_30982_iso",
+      settledAt: new Date("2026-05-01T00:00:02Z"),
+      createdAt: new Date("2026-05-01T00:00:02Z"),
+    });
+    void otherOrgOrder;
+    // Walk MY org's traversal; the other org's rows must never appear.
+    const walk = await walkStableTraversal(organizationId, 1);
+    expect(walk.ids.length).toBe(1);
+    // And a forged continuation pointing at THEIR row returns only my rows,
+    // never theirs (org scoping is enforced inside the keyset query too).
+    // Their row ranks NEWER than mine, so my row is in the remaining tail.
+    const forgedPositionMicros = Date.UTC(2026, 4, 1, 0, 0, 2, 2) * 1000; // 2026-05-01T00:00:02.002Z in µs
+    const forged = encodePaymentStatesContinuation({
+      createdAtMicros: forgedPositionMicros,
+      surface: "payment_request",
+      id: theirs.id,
+    });
+    const decoded = decodePaymentStatesContinuation(forged);
+    expect(decoded.ok).toBe(true);
+    if (decoded.ok) {
+      const leaked = await paymentHistoryService.listPaymentStatesContinued(
+        organizationId,
+        decoded.value,
+        10,
+      );
+      // Projected stable id, not the raw authority UUID.
+      expect(leaked.rows.map((r) => r.id)).toEqual([`payment_request:${mine.id}`]);
+    }
+  }, 60_000);
 });

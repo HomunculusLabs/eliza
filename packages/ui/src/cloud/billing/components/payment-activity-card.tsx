@@ -77,10 +77,16 @@ export interface PaymentStateDisplay {
 interface PaymentStatesResponse {
   states: PaymentStateDisplay[];
   /** Route contract fields; treated as optional so a payload missing them
-   *  still renders the page (no pagination controls) instead of erroring. */
+   * still renders the page (no pagination controls) instead of erroring. */
   total?: number;
   offset?: number;
   hasMore?: boolean;
+  /**
+   * #30982: server-owned continuation for the stable keyset traversal.
+   * Absent on legacy-offset payloads (older deploys) — the card then falls
+   * back to the offset protocol for the remaining pages.
+   */
+  nextContinuation?: string | null;
 }
 
 type FetchPhase =
@@ -92,6 +98,12 @@ type FetchPhase =
       hasMore: boolean;
       total: number | null;
       envelope: boolean;
+      /**
+       * Continuation for the next stable-traversal page; null when the
+       * traversal ended OR when the server speaks only legacy offset (then
+       * loadMore uses offset=rows.length).
+       */
+      nextContinuation: string | null;
     };
 
 /** Matches the list route's default first-page limit (`limit=50, offset=0`). */
@@ -203,6 +215,7 @@ export function PaymentActivityCard() {
         hasMore,
         total,
         envelope,
+        nextContinuation: data.nextContinuation ?? null,
       });
     } catch (error) {
       // error-policy:J4 transport failure becomes a visible error state with
@@ -223,17 +236,25 @@ export function PaymentActivityCard() {
     });
   }, [fetchStates]);
 
-  /** Fetches the next page (offset = rows already shown) and appends it.
-   *  Failures leave the existing rows intact with an inline retry — a paging
-   *  failure must never tear down already-loaded history. */
+  /**
+   * Fetches the next page of the stable keyset traversal (#30982): the
+   * request carries the server-owned continuation, and rows are appended.
+   * With no continuation (legacy offset server), falls back to
+   * offset=rows-already-shown — the pre-#30982 protocol. Failures leave the
+   * existing rows intact with an inline retry — a paging failure must never
+   * tear down already-loaded history. */
   const loadMore = useCallback(async () => {
     if (phase.kind !== "ready" || loadingMore || !phase.hasMore) return;
     setLoadingMore(true);
     setLoadMoreError(null);
     try {
-      const data = await api<PaymentStatesResponse>(
-        `/api/v1/billing/payment-states?offset=${phase.rows.length}`,
-      );
+      const url =
+        phase.nextContinuation !== null
+          ? `/api/v1/billing/payment-states?continuation=${encodeURIComponent(
+              phase.nextContinuation,
+            )}`
+          : `/api/v1/billing/payment-states?offset=${phase.rows.length}`;
+      const data = await api<PaymentStatesResponse>(url);
       if (
         !data ||
         !Array.isArray(data.states) ||
@@ -256,6 +277,7 @@ export function PaymentActivityCard() {
         hasMore,
         total,
         envelope: true,
+        nextContinuation: data.nextContinuation ?? null,
       });
     } catch (error) {
       setLoadMoreError(
@@ -610,38 +632,59 @@ export function PaymentActivityCard() {
                   data-testid="payment-activity-count"
                 >
                   {t("cloud.billingTab.paymentActivityCount", {
-                    defaultValue: "Showing {{shown}} of {{total}} payments",
+                    defaultValue: "Showing {{shown}} payments",
                     shown: phase.rows.length,
-                    total: phase.total,
                   })}
                 </p>
               ) : null}
-              {phase.hasMore ? (
+              <div className="flex flex-wrap items-center gap-3">
+                {phase.hasMore ? (
+                  <Button
+                    variant="linkMono"
+                    type="button"
+                    disabled={loadingMore}
+                    onClick={() => void loadMore()}
+                    data-testid="payment-activity-load-more"
+                  >
+                    {loadingMore
+                      ? t("cloud.billingTab.paymentActivityLoadingMore", {
+                          defaultValue: "Loading older payments…",
+                        })
+                      : t("cloud.billingTab.paymentActivityLoadMore", {
+                          defaultValue: "Load older payments",
+                        })}
+                  </Button>
+                ) : phase.envelope ? (
+                  <p
+                    className="text-xs font-mono text-muted-strong"
+                    data-testid="payment-activity-end"
+                  >
+                    {t("cloud.billingTab.paymentActivityEndReached", {
+                      defaultValue: "End of loaded payment history",
+                    })}
+                  </p>
+                ) : null}
+                {/*
+                 * #30982 refresh contract: the stable traversal intentionally
+                 * keeps already-shown rows fixed, so purchases created after
+                 * this traversal began never appear on their own. Refresh
+                 * restarts the traversal from the newest rows — the explicit
+                 * way a user sees a payment made in another tab. Wording
+                 * never claims all current payments are shown; refresh is
+                 * that contract.
+                 */}
                 <Button
                   variant="linkMono"
                   type="button"
                   disabled={loadingMore}
-                  onClick={() => void loadMore()}
-                  data-testid="payment-activity-load-more"
+                  onClick={() => void fetchStates()}
+                  data-testid="payment-activity-refresh"
                 >
-                  {loadingMore
-                    ? t("cloud.billingTab.paymentActivityLoadingMore", {
-                        defaultValue: "Loading older payments…",
-                      })
-                    : t("cloud.billingTab.paymentActivityLoadMore", {
-                        defaultValue: "Load older payments",
-                      })}
-                </Button>
-              ) : phase.envelope ? (
-                <p
-                  className="text-xs font-mono text-muted-strong"
-                  data-testid="payment-activity-end"
-                >
-                  {t("cloud.billingTab.paymentActivityAllShown", {
-                    defaultValue: "All payments shown",
+                  {t("cloud.billingTab.paymentActivityRefresh", {
+                    defaultValue: "Refresh",
                   })}
-                </p>
-              ) : null}
+                </Button>
+              </div>
             </div>
           </div>
         ) : null}
