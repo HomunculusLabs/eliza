@@ -1805,6 +1805,7 @@ export async function runV5MessageRuntimeStage1(
 						actionResults: egressActionResults,
 						actions: args.runtime.actions,
 						evaluator: plannerResult.evaluator,
+						stateValues: plannerState.values,
 					});
 		// A reply an action callback already delivered this turn (verbatim or as
 		// a strict superset) is a planner echo: the suppression below drops it, so
@@ -1834,6 +1835,7 @@ export async function runV5MessageRuntimeStage1(
 				reply: plannerResult.finalMessage ?? "",
 				actionResults: egressActionResults,
 				evaluator: plannerResult.evaluator,
+				stateValues: plannerState.values,
 			});
 			plannerResult = {
 				...plannerResult,

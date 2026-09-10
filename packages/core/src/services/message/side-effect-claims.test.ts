@@ -4,8 +4,10 @@
 
 import { describe, expect, it } from "vitest";
 import {
+	numericalTokenHoldingClaims,
 	replyClaimsCompletedSideEffect,
 	replyClaimsEmptyTrackedWorkState,
+	replyClaimsNumericalTokenHolding,
 } from "./side-effect-claims.js";
 
 describe("side-effect-claims", () => {
@@ -269,5 +271,78 @@ describe("side-effect-claims — extended branch coverage", () => {
 				),
 			).toBe(false);
 		});
+	});
+});
+
+describe("numericalTokenHoldingClaims (#30960)", () => {
+	it("detects the reproduced fabricated balance reply", () => {
+		expect(
+			replyClaimsNumericalTokenHolding("Your wallet balance is 4 SOL."),
+		).toBe(true);
+		expect(
+			numericalTokenHoldingClaims("Your wallet balance is 4 SOL."),
+		).toEqual([{ symbol: "SOL", amount: 4 }]);
+	});
+
+	it("detects holding/ownership/portfolio assertion shapes", () => {
+		expect(replyClaimsNumericalTokenHolding("You hold 12 USDC.")).toBe(true);
+		expect(
+			replyClaimsNumericalTokenHolding("You own 0.05 ETH in reserves."),
+		).toBe(true);
+		expect(
+			replyClaimsNumericalTokenHolding("Your portfolio contains 1,234.5 BONK."),
+		).toBe(true);
+		expect(
+			replyClaimsNumericalTokenHolding("The wallet holds 2.5 SOL right now."),
+		).toBe(true);
+		expect(
+			replyClaimsNumericalTokenHolding("You currently have 3 WETH staked."),
+		).toBe(true);
+	});
+
+	it("does not treat valuations as holding quantities", () => {
+		expect(
+			replyClaimsNumericalTokenHolding("Total value: $1,234.56 (2.5 SOL)."),
+		).toBe(false);
+		expect(
+			replyClaimsNumericalTokenHolding("Your holdings are worth 0.05 ETH."),
+		).toBe(false);
+		expect(
+			replyClaimsNumericalTokenHolding(
+				"The portfolio is valued at $500 across assets.",
+			),
+		).toBe(false);
+	});
+
+	it("passes through questions, offers, conditionals, and negations", () => {
+		expect(replyClaimsNumericalTokenHolding("Is your balance 4 SOL?")).toBe(
+			false,
+		);
+		expect(
+			replyClaimsNumericalTokenHolding(
+				"If your balance is 4 SOL, we can stake it.",
+			),
+		).toBe(false);
+		expect(
+			replyClaimsNumericalTokenHolding(
+				"You don't hold 4 SOL anymore — you moved it.",
+			),
+		).toBe(false);
+		expect(
+			replyClaimsNumericalTokenHolding("You no longer have 3 WETH staked."),
+		).toBe(false);
+	});
+
+	it("passes through non-financial numerals and narration", () => {
+		expect(replyClaimsNumericalTokenHolding("I have 3 options for you.")).toBe(
+			false,
+		);
+		expect(replyClaimsNumericalTokenHolding("You sent 4 messages today.")).toBe(
+			false,
+		);
+		expect(replyClaimsNumericalTokenHolding("You have 1 note.")).toBe(false);
+		expect(replyClaimsNumericalTokenHolding("You have 3 reminders set.")).toBe(
+			false,
+		);
 	});
 });

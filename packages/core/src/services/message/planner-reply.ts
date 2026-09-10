@@ -243,6 +243,7 @@ export async function finalizePlannerReply(
 					actionResults,
 					actions: args.runtime.actions,
 					evaluator: plannerResult.evaluator,
+					stateValues: finalPlannerState.values,
 				});
 	if (finalReplyEgressDecision.verdict === "reject") {
 		recoveredReply = await resolvePlannedReplyEgress({
@@ -251,6 +252,7 @@ export async function finalizePlannerReply(
 			reply: effectiveReplyText,
 			actionResults,
 			evaluator: plannerResult.evaluator,
+			stateValues: finalPlannerState.values,
 		});
 		effectiveReplyText = recoveredReply.text;
 		replyRecovered = true;
@@ -435,6 +437,7 @@ export async function finalizePlannerReply(
 			message: args.message,
 			reply: zeroDeliveryRecovery.text,
 			actionResults,
+			stateValues: finalPlannerState.values,
 		});
 		effectiveReplyText = recoveredReply.text;
 		strippedPlannedReplyText = effectiveReplyText;

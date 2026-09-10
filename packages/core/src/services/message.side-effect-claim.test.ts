@@ -2024,7 +2024,9 @@ describe("financial mutation claim egress (#30958)", () => {
 		});
 	});
 
-	it("does not fire on balance observations", () => {
+	it("grounds balance observations in this turn's wallet reads (#30960)", () => {
+		// Balance observations became claim-governed by #30960: without a
+		// matching observation they reject; with one they allow.
 		const replies = [
 			"Your wallet balance is 2.5 SOL.",
 			"You currently hold 12 USDC on Base.",
@@ -2037,8 +2039,22 @@ describe("financial mutation claim egress (#30958)", () => {
 					actionResults: [],
 					actions: [],
 				}),
-			).toEqual({ verdict: "allow" });
+			).toMatchObject({
+				verdict: "reject",
+				kind: "numerical_token_holding",
+			});
 		}
+		expect(
+			evaluatePlannedReplyEgress({
+				reply: "Your wallet balance is 2.5 SOL.",
+				actionResults: [],
+				actions: [],
+				stateValues: {
+					token_0_symbol: "SOL",
+					token_0_amount: "2.500000",
+				},
+			}),
+		).toEqual({ verdict: "allow" });
 	});
 
 	it("does not fire on questions, offers, conditionals, or negations", () => {
@@ -2119,5 +2135,236 @@ describe("financial mutation claim egress (#30958)", () => {
 			verdict: "reject",
 			kind: "completed_side_effect",
 		});
+	});
+});
+
+// ── Numerical token-holding claims (#30960) ─────────────────────────────────
+// A final reply may assert a specific token quantity only when this turn's
+// wallet reads (WALLET search_address) or wallet provider state actually
+// observed it. An unrelated successful action, an unavailable read, a
+// malformed observation, or a valuation never grounds the claim.
+describe("numerical token-holding claim egress (#30960)", () => {
+	const searchAddressResult = (
+		items: Array<{ symbol: string; uiAmount: number }>,
+	): ActionResult => ({
+		success: true,
+		text: "Wallet lookup complete.",
+		data: {
+			actionName: "WALLET",
+			subaction: "search_address",
+			results: [
+				{
+					address: "TestWallet11111111111111111111111111111111",
+					chain: "solana",
+					result: { data: { items } },
+				},
+			],
+		},
+	});
+	// The unrelated successful SEARCH action from the live reproduction: public
+	// documentation only, no balance observation anywhere.
+	const unrelatedSearchResult: ActionResult = {
+		success: true,
+		text: "Found 3 public documentation pages.",
+		data: { actionName: "SEARCH" },
+	};
+	const failedSearchAddressResult: ActionResult = {
+		success: false,
+		text: "Token info service is not available.",
+		error: "SERVICE_UNAVAILABLE",
+		data: { actionName: "WALLET", subaction: "search_address" },
+	};
+
+	it("rejects the reproduced fabricated balance claim with an unrelated success", () => {
+		const reply = "Your wallet balance is 4 SOL.";
+		expect(
+			evaluatePlannedReplyEgress({
+				reply,
+				actionResults: [unrelatedSearchResult],
+				actions: [],
+			}),
+		).toMatchObject({
+			verdict: "reject",
+			kind: "numerical_token_holding",
+		});
+	});
+
+	it("rejects a holding claim with no observations at all", () => {
+		const reply = "You hold 12 USDC.";
+		expect(
+			evaluatePlannedReplyEgress({
+				reply,
+				actionResults: [],
+				actions: [],
+			}),
+		).toMatchObject({
+			verdict: "reject",
+			kind: "numerical_token_holding",
+		});
+	});
+
+	it("rejects a holding claim grounded only by an unavailable read", () => {
+		const reply = "Your wallet balance is 4 SOL.";
+		expect(
+			evaluatePlannedReplyEgress({
+				reply,
+				actionResults: [failedSearchAddressResult],
+				actions: [],
+			}),
+		).toMatchObject({
+			verdict: "reject",
+			kind: "numerical_token_holding",
+		});
+	});
+
+	it("rejects a mismatched holding claim (wrong amount)", () => {
+		const reply = "Your wallet balance is 4 SOL.";
+		expect(
+			evaluatePlannedReplyEgress({
+				reply,
+				actionResults: [
+					searchAddressResult([{ symbol: "SOL", uiAmount: 2.5 }]),
+				],
+				actions: [],
+			}),
+		).toMatchObject({
+			verdict: "reject",
+			kind: "numerical_token_holding",
+		});
+	});
+
+	it("rejects a mismatched holding claim (wrong symbol)", () => {
+		const reply = "Your wallet balance is 4 SOL.";
+		expect(
+			evaluatePlannedReplyEgress({
+				reply,
+				actionResults: [searchAddressResult([{ symbol: "USDC", uiAmount: 4 }])],
+				actions: [],
+			}),
+		).toMatchObject({
+			verdict: "reject",
+			kind: "numerical_token_holding",
+		});
+	});
+
+	it("allows a holding claim grounded by a matching search_address observation", () => {
+		const reply = "Your wallet balance is 4 SOL.";
+		expect(
+			evaluatePlannedReplyEgress({
+				reply,
+				actionResults: [
+					searchAddressResult([
+						{ symbol: "SOL", uiAmount: 4 },
+						{ symbol: "USDC", uiAmount: 123.45 },
+					]),
+				],
+				actions: [],
+			}),
+		).toEqual({ verdict: "allow" });
+	});
+
+	it("allows a holding claim grounded by solana provider state values", () => {
+		const reply = "Your wallet balance is 4 SOL.";
+		expect(
+			evaluatePlannedReplyEgress({
+				reply,
+				actionResults: [],
+				actions: [],
+				stateValues: {
+					token_0_symbol: "SOL",
+					token_0_amount: "4.000000",
+					total_sol: "99.9",
+					total_usd: "15000.00",
+					sol_price: "150.20",
+				},
+			}),
+		).toEqual({ verdict: "allow" });
+	});
+
+	it("rejects a holding claim whose only observation is the SOL valuation total", () => {
+		const reply = "Your wallet balance is 99.9 SOL.";
+		expect(
+			evaluatePlannedReplyEgress({
+				reply,
+				actionResults: [],
+				actions: [],
+				stateValues: {
+					total_sol: "99.9",
+					total_usd: "15000.00",
+				},
+			}),
+		).toMatchObject({
+			verdict: "reject",
+			kind: "numerical_token_holding",
+		});
+	});
+
+	it("rejects a holding claim grounded only by the EVM token/balance pair of a different token", () => {
+		const reply = "You hold 3 WETH.";
+		expect(
+			evaluatePlannedReplyEgress({
+				reply,
+				actionResults: [],
+				actions: [],
+				stateValues: { token: "USDC", balance: "3.0" },
+			}),
+		).toMatchObject({
+			verdict: "reject",
+			kind: "numerical_token_holding",
+		});
+	});
+
+	it("allows a holding claim grounded by the EVM token/balance provider pair", () => {
+		const reply = "You hold 3 WETH.";
+		expect(
+			evaluatePlannedReplyEgress({
+				reply,
+				actionResults: [],
+				actions: [],
+				stateValues: { token: "WETH", balance: "3.0", hasBalance: "true" },
+			}),
+		).toEqual({ verdict: "allow" });
+	});
+
+	it("rejects partial grounding (one of two claimed holdings unobserved)", () => {
+		const reply = "Your wallet balance is 4 SOL. You also hold 12 USDC.";
+		expect(
+			evaluatePlannedReplyEgress({
+				reply,
+				actionResults: [searchAddressResult([{ symbol: "SOL", uiAmount: 4 }])],
+				actions: [],
+			}),
+		).toMatchObject({
+			verdict: "reject",
+			kind: "numerical_token_holding",
+		});
+	});
+
+	it("allows a valuation sentence without grounding (valuations are not holdings)", () => {
+		const reply = "Total value: $1,234.56 (2.5 SOL).";
+		expect(
+			evaluatePlannedReplyEgress({
+				reply,
+				actionResults: [],
+				actions: [],
+			}),
+		).toEqual({ verdict: "allow" });
+	});
+
+	it("keeps legitimate nonfinancial statements distinct", () => {
+		const replies = [
+			"You sent 4 messages today.",
+			"I have 3 options for you.",
+			"Is your balance 4 SOL?",
+		];
+		for (const reply of replies) {
+			expect(
+				evaluatePlannedReplyEgress({
+					reply,
+					actionResults: [],
+					actions: [],
+				}),
+			).toEqual({ verdict: "allow" });
+		}
 	});
 });

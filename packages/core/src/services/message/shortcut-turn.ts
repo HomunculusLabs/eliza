@@ -161,6 +161,7 @@ export async function runShortcutGate(args: {
 			message: args.message,
 			reply: captured,
 			actionResults: shortcutActionResults,
+			stateValues: resultState.values,
 		});
 
 	// #8792: report the interaction so the proactive-comment decider can react.

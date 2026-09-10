@@ -38,6 +38,10 @@ export {
 	plannedReplyHasClaimGroundingReceipt,
 	resolvePlannedReplyEgress,
 } from "./message/egress-policy.js";
+export {
+	numericalHoldingClaimIsGrounded,
+	type BalanceObservation,
+} from "./message/egress-policy.js";
 export { persistInferenceTimingSummary } from "./message/inference-timing.js";
 export { runV5MessageRuntimeStage1 } from "./message/pipeline.js";
 export {
@@ -284,15 +288,19 @@ export {
 // guard; the detectors live in a leaf module so the action can import them
 // without pulling in this service.
 import {
+	numericalTokenHoldingClaims,
 	replyClaimsCompletedSideEffect,
 	replyClaimsEmptyTrackedWorkState,
 	replyClaimsInProgressWork,
+	replyClaimsNumericalTokenHolding,
 } from "./message/side-effect-claims.ts";
 
 export {
+	numericalTokenHoldingClaims,
 	replyClaimsCompletedSideEffect,
 	replyClaimsEmptyTrackedWorkState,
 	replyClaimsInProgressWork,
+	replyClaimsNumericalTokenHolding,
 };
 
 /**

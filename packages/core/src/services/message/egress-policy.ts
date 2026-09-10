@@ -35,15 +35,19 @@ import { normalizeActionIdentifier } from "./direct-action-heuristics";
 import {
 	financialClaimMatchesOperation,
 	financialClaimOperationFamily,
+	type NumericalTokenHoldingClaim,
+	numericalTokenHoldingClaims,
 	replyClaimsCompletedFinancialMutation,
 	replyClaimsCompletedSideEffect,
 	replyClaimsEmptyTrackedWorkState,
+	replyClaimsNumericalTokenHolding,
 } from "./side-effect-claims.ts";
 
 export type PlannedReplyClaimKind =
 	| "completed_side_effect"
 	| "empty_tracked_state"
-	| "completed_financial_mutation";
+	| "completed_financial_mutation"
+	| "numerical_token_holding";
 
 export function appliedEffectReceiptIdsForReply(
 	reply: string,
@@ -144,6 +148,165 @@ export function financialClaimGroundingReceiptIds(
 }
 
 /**
+ * A token quantity this turn actually observed for a symbol, from a wallet
+ * read result or wallet provider state (#30960). `source` names where it came
+ * from so diagnostics can tell an action observation from a provider one.
+ */
+export interface BalanceObservation {
+	readonly symbol: string;
+	readonly amount: number;
+	readonly source: string;
+}
+
+// Relative tolerance when comparing a claimed quantity to an observation: the
+// provider surfaces rounded fixed(6) amounts, so 4.0000004 vs 4 must match.
+const BALANCE_MATCH_RELATIVE_TOLERANCE = 1e-9;
+// Absolute floor: amounts smaller than this (dust) compare exactly.
+const BALANCE_MATCH_ABSOLUTE_TOLERANCE = 1e-9;
+
+function balanceClaimMatchesObservation(
+	claim: NumericalTokenHoldingClaim,
+	observation: BalanceObservation,
+): boolean {
+	if (claim.symbol !== observation.symbol) return false;
+	const delta = Math.abs(claim.amount - observation.amount);
+	return (
+		delta <= BALANCE_MATCH_ABSOLUTE_TOLERANCE ||
+		delta <=
+			BALANCE_MATCH_RELATIVE_TOLERANCE *
+				Math.max(Math.abs(claim.amount), Math.abs(observation.amount))
+	);
+}
+
+function parseFiniteNumber(value: unknown): number | undefined {
+	if (typeof value === "number" && Number.isFinite(value)) return value;
+	if (typeof value === "string") {
+		const parsed = Number.parseFloat(value.replace(/,/g, ""));
+		if (Number.isFinite(parsed)) return parsed;
+	}
+	return undefined;
+}
+
+/**
+ * Balance observations from this turn's successful WALLET `search_address`
+ * (Birdeye portfolio) results. The routed result's `data` carries
+ * `results: [{ address, chain, result: { data: { items: [...] } } }]`; each
+ * item's `uiAmount` is the token quantity and `symbol` the ticker. Failed,
+ * unavailable, and non-search_address results contribute nothing — an
+ * unrelated success must never stand in for a balance (#30960).
+ */
+function balanceObservationsFromActionResults(
+	results: readonly ActionResult[],
+): BalanceObservation[] {
+	const observations: BalanceObservation[] = [];
+	for (const result of results) {
+		if (result.success !== true) continue;
+		const data = result.data as Record<string, unknown> | undefined;
+		if (
+			data?.actionName !== "WALLET" ||
+			data.subaction !== "search_address"
+		) {
+			continue;
+		}
+		const routed = data.results;
+		if (!Array.isArray(routed)) continue;
+		for (const entry of routed) {
+			const record = entry as Record<string, unknown> | null;
+			const nested = record?.result as Record<string, unknown> | undefined;
+			const items = nested?.data
+				? (nested.data as Record<string, unknown>).items
+				: undefined;
+			if (!Array.isArray(items)) continue;
+			for (const item of items) {
+				const itemRecord = item as Record<string, unknown>;
+				const symbol =
+					typeof itemRecord.symbol === "string"
+						? itemRecord.symbol.toUpperCase()
+						: undefined;
+				const amount = parseFiniteNumber(itemRecord.uiAmount);
+				if (symbol && amount !== undefined && amount >= 0) {
+					observations.push({
+						symbol,
+						amount,
+						source: "wallet.search_address",
+					});
+				}
+			}
+		}
+	}
+	return observations;
+}
+
+/**
+ * Balance observations from wallet provider state values: the Solana wallet
+ * provider's `token_<i>_symbol` / `token_<i>_amount` pairs and the EVM
+ * `tokenBalanceProvider`'s `token` / `balance` pair. Valuation keys
+ * (`total_sol`, `*_usd`, `*_sol` on portfolio totals, `*_price`) are
+ * deliberately NOT observations — a SOL valuation is not a SOL holding, and a
+ * USD price is not a token quantity (#30960 acceptance criteria).
+ */
+function balanceObservationsFromStateValues(
+	values: Record<string, unknown> | undefined,
+): BalanceObservation[] {
+	const observations: BalanceObservation[] = [];
+	if (!values || typeof values !== "object") return observations;
+	// Solana wallet provider: indexed token rows.
+	const symbolByIndex = new Map<number, string>();
+	for (const [key, value] of Object.entries(values)) {
+		const rowMatch = /^token_(\d+)_symbol$/.exec(key);
+		if (rowMatch && typeof value === "string") {
+			symbolByIndex.set(Number(rowMatch[1]), value.toUpperCase());
+		}
+	}
+	for (const [key, value] of Object.entries(values)) {
+		const rowMatch = /^token_(\d+)_amount$/.exec(key);
+		if (!rowMatch) continue;
+		const index = Number(rowMatch[1]);
+		const symbol = symbolByIndex.get(index);
+		const amount = parseFiniteNumber(value);
+		if (symbol && amount !== undefined && amount >= 0) {
+			observations.push({ symbol, amount, source: "provider.values" });
+		}
+	}
+	// EVM tokenBalanceProvider: single `token` / `balance` pair.
+	const evmToken =
+		typeof values.token === "string" ? values.token.toUpperCase() : undefined;
+	const evmBalance = parseFiniteNumber(values.balance);
+	if (evmToken && evmBalance !== undefined && evmBalance >= 0) {
+		observations.push({
+			symbol: evmToken,
+			amount: evmBalance,
+			source: "provider.values",
+		});
+	}
+	return observations;
+}
+
+/**
+ * True when every numerical token-holding claim in the reply is grounded by a
+ * matching balance observation from this turn's wallet reads or wallet
+ * provider state (#30960). Mismatched, missing, and partial grounding all
+ * reject; valuation observations never ground a holding claim.
+ */
+export function numericalHoldingClaimIsGrounded(args: {
+	reply: string;
+	results: readonly ActionResult[];
+	stateValues?: Record<string, unknown>;
+}): boolean {
+	const claims = numericalTokenHoldingClaims(args.reply);
+	if (claims.length === 0) return true;
+	const observations = [
+		...balanceObservationsFromActionResults(args.results),
+		...balanceObservationsFromStateValues(args.stateValues),
+	];
+	return claims.every((claim) =>
+		observations.some((observation) =>
+			balanceClaimMatchesObservation(claim, observation),
+		),
+	);
+}
+
+/**
  * An action result grounds only the capability it actually proves.
  * Empty tracked-work claims require a `resource:tracked-work` read action.
  * Completion claims require exact action-owned or evaluator-authored text bound to an active
@@ -159,7 +322,15 @@ export function plannedReplyHasClaimGroundingReceipt(args: {
 	results: readonly ActionResult[];
 	actions: readonly Action[];
 	evaluator?: EvaluatorOutput;
+	stateValues?: Record<string, unknown>;
 }): boolean {
+	if (args.kind === "numerical_token_holding") {
+		return numericalHoldingClaimIsGrounded({
+			reply: args.reply,
+			results: args.results,
+			stateValues: args.stateValues,
+		});
+	}
 	if (args.kind === "completed_financial_mutation") {
 		return (
 			financialClaimGroundingReceiptIds(
@@ -238,12 +409,13 @@ export function evaluatePlannedReplyEgress(args: {
 	actionResults: readonly ActionResult[];
 	actions: readonly Action[];
 	evaluator?: EvaluatorOutput;
+	stateValues?: Record<string, unknown>;
 }): PlannedReplyEgressDecision {
 	const reply = args.reply.trim();
 	if (!reply) return { verdict: "allow" };
 	if (replyClaimsCompletedFinancialMutation(reply)) {
 		if (
-			plannedReplyHasClaimGroundingReceipt({
+			!plannedReplyHasClaimGroundingReceipt({
 				kind: "completed_financial_mutation",
 				reply,
 				results: args.actionResults,
@@ -251,12 +423,29 @@ export function evaluatePlannedReplyEgress(args: {
 				evaluator: args.evaluator,
 			})
 		) {
-			return { verdict: "allow" };
+			return {
+				verdict: "reject",
+				kind: "completed_financial_mutation",
+			};
 		}
-		return {
-			verdict: "reject",
-			kind: "completed_financial_mutation",
-		};
+		// A grounded mutation claim may sit beside a numerical holding claim
+		// ("transfer sent; your balance is now 3 SOL") — keep evaluating.
+	}
+	if (replyClaimsNumericalTokenHolding(reply)) {
+		if (
+			!plannedReplyHasClaimGroundingReceipt({
+				kind: "numerical_token_holding",
+				reply,
+				results: args.actionResults,
+				actions: args.actions,
+				stateValues: args.stateValues,
+			})
+		) {
+			return {
+				verdict: "reject",
+				kind: "numerical_token_holding",
+			};
+		}
 	}
 	if (replyClaimsCompletedSideEffect(reply)) {
 		if (
@@ -305,12 +494,14 @@ export async function resolvePlannedReplyEgress(args: {
 	reply: string;
 	actionResults: readonly ActionResult[];
 	evaluator?: EvaluatorOutput;
+	stateValues?: Record<string, unknown>;
 }): Promise<{ text: string; effectReceiptIds: readonly string[] }> {
 	const decision = evaluatePlannedReplyEgress({
 		reply: args.reply,
 		actionResults: args.actionResults,
 		actions: args.runtime.actions,
 		evaluator: args.evaluator,
+		stateValues: args.stateValues,
 	});
 	if (args.reply.trim() && decision.verdict === "allow") {
 		const financialGrounding = financialClaimGroundingReceiptIds(
@@ -373,6 +564,14 @@ export async function resolvePlannedReplyEgress(args: {
 			!(
 				rewrittenDecision?.kind === "completed_financial_mutation" &&
 				financialClaimGroundingReceiptIds(reply, args.actionResults).length > 0
+			) &&
+			!(
+				rewrittenDecision?.kind === "numerical_token_holding" &&
+				numericalHoldingClaimIsGrounded({
+					reply,
+					results: args.actionResults,
+					stateValues: args.stateValues,
+				})
 			))
 	) {
 		const error = new ElizaError(

@@ -718,6 +718,111 @@ export function replyClaimsCompletedFinancialMutation(reply: string): boolean {
 	return false;
 }
 
+/**
+ * True when a reply ASSERTS a specific numerical token-holding quantity
+ * ("Your wallet balance is 4 SOL.", "You currently hold 12 USDC."). Such a
+ * claim is grounded only by a matching balance observation from this turn's
+ * actual wallet reads (#30960; observed live: an unrelated successful SEARCH
+ * action followed by a delivered "Your wallet balance is 4 SOL." with no
+ * balance observation and no external request). Valuation-shaped sentences
+ * ("Total value: $1,234 (2.5 SOL)", "worth 0.05 ETH") are NOT holding
+ * quantities and never fire; questions, offers, conditionals, and negations
+ * pass through like every other tier here.
+ */
+export interface NumericalTokenHoldingClaim {
+	/** Upper-cased token symbol the reply names ("SOL", "USDC"). */
+	readonly symbol: string;
+	/** Claimed quantity, parsed from the reply's numeral (commas stripped). */
+	readonly amount: number;
+}
+
+// Tickers that routinely appear lower-cased in prose; everything else must be
+// an uppercase ticker-shaped token (3+ chars) to count as a symbol.
+const KNOWN_LOWER_TICKERS = new Set([
+	"sol",
+	"eth",
+	"btc",
+	"usdc",
+	"usdt",
+	"usds",
+	"weth",
+	"wsteth",
+	"wbtc",
+	"pol",
+]);
+
+function isClaimableTokenSymbol(symbol: string): boolean {
+	if (KNOWN_LOWER_TICKERS.has(symbol.toLowerCase())) return true;
+	// Tickers surface UPPERCASE in prose; common nouns ("note", "message")
+	// surface lowercase. `symbol` here is the ORIGINAL match text, so this
+	// rejects "You have 1 note." while accepting "4 SOL" / "12 USDC".
+	return symbol === symbol.toUpperCase() && /^[A-Z0-9]{3,10}$/.test(symbol);
+}
+
+// A holding-assertion sentence names balances, holdings, ownership, or a
+// portfolio/wallet having an amount. Bare "have" is gated on a you-subject so
+// ordinary narration ("I have 3 options for you") passes through.
+const TOKEN_HOLDING_SENTENCE_PREDICATE =
+	/\bbalances?\b|\bhold(?:s|ing|ings)?\b|\bowns?\b|\byou\s+(?:currently\s+)?(?:have|has)\b|\bportfolio\b|\bwallet\s+(?:shows?|contains?|holds?|has)\b/i;
+// Valuation sentences report what the holdings are WORTH, not how many tokens
+// are held. Treating one as a holding claim would ground it against valuation
+// observations the acceptance criteria explicitly forbid using (#30960).
+const VALUATION_SENTENCE_PATTERN =
+	/\$\s*\d|\btotal\s+value\b|\bworth\b|\bvalued\s+at\b|\bprice[sd]?\b|\busd\s+value\b/i;
+// The claimed quantity: a numeral (not a dollar figure, not mid-number) a
+// ticker-shaped symbol either touches or follows by whitespace.
+const NUMERICAL_TOKEN_HOLDING_CLAIM_PATTERN =
+	/(?<![\d$])(\d[\d,]*(?:\.\d+)?)\s*([A-Za-z][A-Za-z0-9]{1,9})\b/g;
+// Negated possession ("you don't hold 4 SOL", "no longer hold") is not an
+// assertion of the claimed quantity.
+const NEGATED_HOLDING_LEAD_PATTERN =
+	/\b(?:do(?:es)?n['’]t|not|no\s+longer|never|can(?:not|['’]t))\s+[^.!?]{0,40}$/i;
+// A subordinator opening the sentence makes the holding hypothetical ("If your
+// balance is 4 SOL, …"), not a report of observed state.
+const CONDITIONAL_HOLDING_SENTENCE_LEAD_PATTERN =
+	/^\s*(?:if|unless|once|when|whenever|whether)\b/i;
+
+/**
+ * Every numerical token-holding claim in the reply. Only assertion-shaped
+ * sentences contribute; see {@link replyClaimsNumericalTokenHolding}.
+ */
+export function numericalTokenHoldingClaims(
+	reply: string,
+): readonly NumericalTokenHoldingClaim[] {
+	const text = reply.trim();
+	if (!text) return [];
+	const claims: NumericalTokenHoldingClaim[] = [];
+	const sentences = text.split(/(?<=[.!?。！？])\s+|\n+/);
+	for (const sentence of sentences) {
+		if (!TOKEN_HOLDING_SENTENCE_PREDICATE.test(sentence)) continue;
+		if (VALUATION_SENTENCE_PATTERN.test(sentence)) continue;
+		if (CONDITIONAL_HOLDING_SENTENCE_LEAD_PATTERN.test(sentence.trimStart()))
+			continue;
+		for (const match of sentence.matchAll(
+			NUMERICAL_TOKEN_HOLDING_CLAIM_PATTERN,
+		)) {
+			const amount = Number.parseFloat(match[1]?.replace(/,/g, "") ?? "NaN");
+			const rawSymbol = match[2] ?? "";
+			if (!Number.isFinite(amount) || !isClaimableTokenSymbol(rawSymbol)) {
+				continue;
+			}
+			if (
+				NEGATED_HOLDING_LEAD_PATTERN.test(sentence.slice(0, match.index)) ||
+				sideEffectClaimSentenceIsQuestion(sentence, match.index)
+			) {
+				continue;
+			}
+			claims.push({ symbol: rawSymbol.toUpperCase(), amount });
+		}
+	}
+	return claims;
+}
+
+/** True when the reply asserts any numerical token-holding quantity. */
+export function replyClaimsNumericalTokenHolding(reply: string): boolean {
+	return numericalTokenHoldingClaims(reply).length > 0;
+}
+
 /** Operation family a financial completion claim names, for receipt matching. */
 export type FinancialClaimOperationFamily =
 	| "transfer"
