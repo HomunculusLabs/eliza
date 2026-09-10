@@ -4,7 +4,8 @@
  * owner actor selection, and machine-readable HTTP translation are real.
  */
 
-import type { IAgentRuntime } from "@elizaos/core";
+import crypto from "node:crypto";
+import { type IAgentRuntime, ServiceType } from "@elizaos/core";
 import { describe, expect, it, vi } from "vitest";
 import { AgreementKnowledgeError } from "../lifeops/household/agreement-knowledge.js";
 import { AGREEMENT_UPLOAD_METADATA_BYTES } from "../lifeops/household/agreement-upload-limits.js";
@@ -16,11 +17,16 @@ function context(input: {
   pathname: string;
   body?: unknown;
   agreements: Record<string, unknown>;
+  fileStorage?: { readPrivate: (fileName: string) => Promise<Buffer | null> };
 }) {
   const responses: Array<{ data: unknown; status: number }> = [];
   const cache = new Map<string, unknown>();
   const runtime = {
-    getService: vi.fn(() => ({ agreements: input.agreements })),
+    getService: vi.fn((type: string) =>
+      input.fileStorage && type === ServiceType.REMOTE_FILES
+        ? input.fileStorage
+        : { agreements: input.agreements },
+    ),
     getCache: vi.fn(async (key: string) => cache.get(key)),
     setCache: vi.fn(async (key: string, value: unknown) => {
       cache.set(key, value);
@@ -182,5 +188,79 @@ describe("agreement knowledge routes", () => {
         },
       },
     });
+  });
+
+  it("answers a transcription outage at commit with 503, not document blame", async () => {
+    const createAgreementVersion = vi.fn(async () => {
+      throw new AgreementKnowledgeError(
+        "Agreement page 2 transcription failed: vision provider returned HTTP 503",
+        "AGREEMENT_TRANSCRIPTION_UNAVAILABLE",
+        { pageNumber: 2 },
+        new Error("vision provider returned HTTP 503"),
+      );
+    });
+    const chunkSha = crypto
+      .createHash("sha256")
+      .update("%PDF-agree")
+      .digest("hex");
+    const contentIdentity = crypto
+      .createHash("sha256")
+      .update(
+        [
+          "agreement-upload-content-v1",
+          "10",
+          "4194304",
+          `0:10:${chunkSha}`,
+        ].join("\n"),
+        "utf8",
+      )
+      .digest("hex");
+    const manifest = {
+      uploadId: "upload-1",
+      ownerEntityId: "self",
+      agreementKey: "parenting-plan",
+      title: "Parenting agreement",
+      originalFilename: "agreement.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 10,
+      chunkSizeBytes: 4194304,
+      chunkCount: 1,
+      chunks: [{ index: 0, size: 10, sha256: chunkSha, fileName: "c0.bin" }],
+      status: "uploading",
+      artifactId: null,
+    };
+    const harness = context({
+      method: "POST",
+      pathname: "/api/lifeops/agreement-uploads/upload-1/commit",
+      body: { contentIdentity },
+      agreements: { createAgreementVersion },
+      fileStorage: {
+        readPrivate: async () => Buffer.from("%PDF-agree", "utf8"),
+      },
+    });
+    // Seed the resumable-upload manifest the same way beginAgreementUpload +
+    // acceptAgreementChunk persist it, so commit reaches artifact creation.
+    await (
+      harness.runtime as unknown as {
+        setCache: (key: string, value: unknown) => Promise<boolean>;
+      }
+    ).setCache("lifeops:agreement-upload:v1:upload-1", manifest);
+    await expect(handleAgreementKnowledgeRoutes(harness.ctx)).resolves.toBe(
+      true,
+    );
+    expect(createAgreementVersion).toHaveBeenCalledTimes(1);
+    expect(harness.responses).toEqual([
+      {
+        status: 503,
+        data: {
+          error: {
+            code: "AGREEMENT_TRANSCRIPTION_UNAVAILABLE",
+            message:
+              "Agreement page 2 transcription failed: vision provider returned HTTP 503",
+            context: { pageNumber: 2 },
+          },
+        },
+      },
+    ]);
   });
 });

@@ -572,4 +572,154 @@ describe("parenting-agreement knowledge — real PGlite", () => {
       }),
     ).rejects.toMatchObject({ code: "AGREEMENT_INVALID_CONTRACT" });
   });
+
+  it("classifies a failed OCR page as a transcription outage, not a document defect", async () => {
+    const service = createAgreementKnowledgeService(runtime);
+    const { registerOcrWithCoordsService } = await import(
+      "@elizaos/plugin-vision/ocr-with-coords"
+    );
+    // The default deterministic PDF stub ignores ocrPage; route it through
+    // the agreement service's OCR callback so classification is exercised.
+    class OcrDrivenPdfService extends AgreementTestPdfService {
+      override async extractCompleteDocument(
+        bytes: Buffer | Uint8Array,
+        options?: {
+          ocrPage?: (input: {
+            pageNumber: number;
+            pngBytes: Uint8Array;
+          }) => Promise<string>;
+        },
+      ) {
+        if (options?.ocrPage) {
+          await options.ocrPage({
+            pageNumber: 1,
+            pngBytes: new Uint8Array([1]),
+          });
+        }
+        return await super.extractCompleteDocument(bytes);
+      }
+    }
+    runtime.services.set(ServiceType.PDF, [new OcrDrivenPdfService(runtime)]);
+    const outage = new Error("vision provider returned HTTP 503");
+    registerOcrWithCoordsService({
+      name: "failing-ocr-for-test",
+      describe: async () => {
+        throw outage;
+      },
+    });
+    try {
+      const rejected = service.createAgreementVersion({
+        agreementKey: "ocr-outage",
+        title: "OCR outage during commit",
+        originalFilename: "ocr-outage.pdf",
+        mimeType: "application/pdf",
+        bytes: pdf("ocr outage page"),
+        uploadedByEntityId: SELF_ENTITY_ID,
+      });
+      await expect(rejected).rejects.toBeInstanceOf(AgreementKnowledgeError);
+      await expect(rejected).rejects.toMatchObject({
+        code: "AGREEMENT_TRANSCRIPTION_UNAVAILABLE",
+        context: { pageNumber: 1 },
+      });
+      await expect(rejected).rejects.toMatchObject({ cause: outage });
+    } finally {
+      registerOcrWithCoordsService(null);
+    }
+    // With the service restored, the same content commits exactly once.
+    registerOcrWithCoordsService({
+      name: "recovering-ocr-for-test",
+      describe: async () => ({ blocks: [{ text: "recovered ocr text" }] }),
+    });
+    try {
+      const artifact = await service.createAgreementVersion({
+        agreementKey: "ocr-outage",
+        title: "OCR outage during commit",
+        originalFilename: "ocr-outage.pdf",
+        mimeType: "application/pdf",
+        bytes: pdf("ocr outage page"),
+        uploadedByEntityId: SELF_ENTITY_ID,
+      });
+      expect(artifact).toMatchObject({ version: 1 });
+    } finally {
+      registerOcrWithCoordsService(null);
+      runtime.services.set(ServiceType.PDF, [
+        new AgreementTestPdfService(runtime),
+      ]);
+    }
+  });
+
+  it("classifies a vision model provider failure as a transcription outage", async () => {
+    const service = createAgreementKnowledgeService(runtime);
+    // Replace the deterministic PDF service with one whose vision dispatch
+    // fails the way a provider outage does: a typed ElizaError carrying
+    // MODEL_PROVIDER_FAILED with the original 503 as its cause.
+    const { ElizaError } = await import("@elizaos/core");
+    const providerOutage = Object.assign(
+      new Error("vision upstream returned 503"),
+      { status: 503 },
+    );
+    class OutagePdfService extends AgreementTestPdfService {
+      override async extractCompleteDocument(
+        _bytes: Buffer | Uint8Array,
+      ): Promise<never> {
+        throw new ElizaError(
+          'Model provider "vision" failed: transcription unavailable',
+          {
+            code: "MODEL_PROVIDER_FAILED",
+            cause: providerOutage,
+            severity: "ephemeral",
+          },
+        );
+      }
+    }
+    runtime.services.set(ServiceType.PDF, [new OutagePdfService(runtime)]);
+    try {
+      const rejected = service.createAgreementVersion({
+        agreementKey: "vision-outage",
+        title: "Vision provider outage during commit",
+        originalFilename: "vision-outage.pdf",
+        mimeType: "application/pdf",
+        bytes: pdf("vision outage page"),
+        uploadedByEntityId: SELF_ENTITY_ID,
+      });
+      await expect(rejected).rejects.toMatchObject({
+        code: "AGREEMENT_TRANSCRIPTION_UNAVAILABLE",
+      });
+      await expect(rejected).rejects.toMatchObject({
+        cause: { code: "MODEL_PROVIDER_FAILED" },
+      });
+    } finally {
+      runtime.services.set(ServiceType.PDF, [
+        new AgreementTestPdfService(runtime),
+      ]);
+    }
+  });
+
+  it("still blames the document when extraction fails without a service outage", async () => {
+    const service = createAgreementKnowledgeService(runtime);
+    class CorruptPdfService extends AgreementTestPdfService {
+      override async extractCompleteDocument(
+        _bytes: Buffer | Uint8Array,
+      ): Promise<never> {
+        throw new Error("Invalid PDF structure: xref table not found");
+      }
+    }
+    runtime.services.set(ServiceType.PDF, [new CorruptPdfService(runtime)]);
+    try {
+      await expect(
+        service.createAgreementVersion({
+          agreementKey: "corrupt-pdf",
+          title: "Structurally invalid PDF",
+          originalFilename: "corrupt.pdf",
+          mimeType: "application/pdf",
+          bytes: pdf("corrupt structure"),
+          uploadedByEntityId: SELF_ENTITY_ID,
+        }),
+      ).rejects.toMatchObject({ code: "AGREEMENT_INVALID_CONTRACT" });
+    } finally {
+      runtime.services.set(ServiceType.PDF, [
+        new AgreementTestPdfService(runtime),
+      ]);
+    }
+  });
 });

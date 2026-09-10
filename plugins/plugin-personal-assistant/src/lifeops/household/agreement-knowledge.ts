@@ -191,7 +191,8 @@ type AgreementKnowledgeErrorCode =
   | "AGREEMENT_DUPLICATE_CONTENT"
   | "AGREEMENT_INVALID_CONTRACT"
   | "AGREEMENT_OBLIGATION_CONFLICT"
-  | "AGREEMENT_STORAGE_UNAVAILABLE";
+  | "AGREEMENT_STORAGE_UNAVAILABLE"
+  | "AGREEMENT_TRANSCRIPTION_UNAVAILABLE";
 
 export class AgreementKnowledgeError extends ElizaError {
   override readonly name = "AgreementKnowledgeError";
@@ -764,6 +765,29 @@ function requirePositiveInteger(value: number, field: string): number {
   return value;
 }
 
+/**
+ * Classify extraction failures that came from the transcription dependency
+ * (vision model dispatch or the OCR service) rather than the document bytes.
+ * These are recoverable outages: the upload stays retained and a retry after
+ * the service recovers must succeed, so they must never blame the document
+ * with `AGREEMENT_INVALID_CONTRACT`. Provider SDKs surface HTTP failures as
+ * errors with a numeric `status`, while core's model dispatcher already wraps
+ * bare provider failures as `ElizaError` with `MODEL_PROVIDER_FAILED`.
+ */
+function isTranscriptionServiceFailure(error: unknown): boolean {
+  if (error instanceof AgreementKnowledgeError) {
+    return error.code === "AGREEMENT_TRANSCRIPTION_UNAVAILABLE";
+  }
+  if (error instanceof ElizaError) {
+    if (error.code === "MODEL_PROVIDER_FAILED") return true;
+    const status = (error.context as Record<string, unknown> | undefined)
+      ?.status;
+    return typeof status === "number" && status >= 500;
+  }
+  const status = (error as { status?: unknown } | null | undefined)?.status;
+  return typeof status === "number" && status >= 500;
+}
+
 export class AgreementKnowledgeService {
   private readonly now: () => Date;
 
@@ -912,22 +936,48 @@ export class AgreementKnowledgeService {
       );
     }
     let extracted: PdfCompleteDocument;
+    const ocr = await resolveAgreementOcr();
     try {
-      const ocr = await resolveAgreementOcr();
       extracted = await pdf.extractCompleteDocument(bytes, {
         ocrPage: ocr
           ? async ({ pageNumber, pngBytes }) => {
-              const result = await ocr.describe({
-                displayId: `agreement-pdf-page-${pageNumber}`,
-                sourceX: 0,
-                sourceY: 0,
-                pngBytes,
-              });
-              return result.blocks.map((block) => block.text).join("\n");
+              try {
+                const result = await ocr.describe({
+                  displayId: `agreement-pdf-page-${pageNumber}`,
+                  sourceX: 0,
+                  sourceY: 0,
+                  pngBytes,
+                });
+                return result.blocks.map((block) => block.text).join("\n");
+              } catch (error) {
+                // error-policy:J2 context-adding rethrow: a failed OCR page is a
+                // transcription-service outage, not a malformed document; the
+                // boundary must answer 503 so the retained upload can retry.
+                throw new AgreementKnowledgeError(
+                  `Agreement page ${pageNumber} transcription failed: ${error instanceof Error ? error.message : String(error)}`,
+                  "AGREEMENT_TRANSCRIPTION_UNAVAILABLE",
+                  { pageNumber },
+                  error,
+                );
+              }
             }
           : undefined,
       });
     } catch (error) {
+      if (
+        error instanceof AgreementKnowledgeError &&
+        error.code === "AGREEMENT_TRANSCRIPTION_UNAVAILABLE"
+      ) {
+        throw error;
+      }
+      if (isTranscriptionServiceFailure(error)) {
+        throw new AgreementKnowledgeError(
+          `The complete parenting-agreement PDF could not be extracted: ${error instanceof Error ? error.message : String(error)}`,
+          "AGREEMENT_TRANSCRIPTION_UNAVAILABLE",
+          undefined,
+          error,
+        );
+      }
       throw new AgreementKnowledgeError(
         `The complete parenting-agreement PDF could not be extracted: ${error instanceof Error ? error.message : String(error)}`,
         "AGREEMENT_INVALID_CONTRACT",

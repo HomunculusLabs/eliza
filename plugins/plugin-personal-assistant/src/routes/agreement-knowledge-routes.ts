@@ -82,6 +82,7 @@ function statusFor(error: AgreementKnowledgeError): number {
     case "AGREEMENT_DUPLICATE_CONTENT":
       return 409;
     case "AGREEMENT_STORAGE_UNAVAILABLE":
+    case "AGREEMENT_TRANSCRIPTION_UNAVAILABLE":
       return 503;
     default:
       return 400;
