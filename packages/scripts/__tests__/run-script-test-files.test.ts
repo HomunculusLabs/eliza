@@ -80,9 +80,14 @@ describe("isolated script-test runner arguments", () => {
     );
 
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain(
-      `[script-tests] failed: ${missingTestFile} (exit 1)`,
-    );
+    const failureLine = result.stderr
+      .split("\n")
+      .find((line) =>
+        line.startsWith(`[script-tests] failed: ${missingTestFile} `),
+      );
+    expect(failureLine).toBeDefined();
+    const exit = Number(failureLine?.match(/\bexit=(\d+)/)?.[1] ?? "none");
+    expect(exit).toBe(1);
   });
 });
 
