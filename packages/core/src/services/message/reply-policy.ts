@@ -12,6 +12,7 @@ import type { MessageTerminalFailure } from "../../types/message-service";
 import type { Content, Media, UUID } from "../../types/primitives";
 import type { IAgentRuntime } from "../../types/runtime";
 import type { State } from "../../types/state";
+import { isPlainObject } from "../../utils/type-guards";
 import type { StrategyMode, StrategyResult } from "./contracts.js";
 import { normalizeActionIdentifier } from "./direct-action-heuristics";
 
@@ -64,12 +65,49 @@ export function trackSettledPlannerToolResult(
 }
 
 /**
- * The most recent completed tool result whose `userFacingText` can still
- * rescue a turn after the planner loop dies: successful, non-terminal, and not
- * already delivered to the user through an action callback. Diagnostic
- * `text` is never a candidate — the wire contract says it must not render as
- * assistant prose — so a turn whose tools produced only diagnostics still
- * falls through to the caller's failure handling.
+ * True when a failed tool result is a pending preview awaiting user
+ * confirmation rather than a terminal outcome — the same marker set the
+ * planner-loop treats as "nothing persisted yet, awaiting input". Such a
+ * result must not hold failure authority at the rescue seam: its
+ * `success: false` records that nothing was committed, not that the user
+ * must be told the operation failed. Mirrors the planner-loop's private
+ * `hasRequiresConfirmationMarker`, including the untrusted `data.values`
+ * adapter shape where only a plain record may contribute markers.
+ */
+function requiresConfirmationStylePreview(result: PlannerToolResult): boolean {
+	const data = result.data;
+	if (!data) return false;
+	if (
+		data.requiresConfirmation === true ||
+		data.awaitingUserInput === true ||
+		data.lifeDraft !== undefined
+	) {
+		return true;
+	}
+	const values = isPlainObject(data.values) ? data.values : undefined;
+	return (
+		values?.requiresConfirmation === true || values?.awaitingUserInput === true
+	);
+}
+
+/**
+ * The most recent settled tool result whose user-facing text can still rescue
+ * a turn after the planner loop dies: non-terminal and not already delivered
+ * to the user through an action callback. The scan is failure-aware
+ * (#30970): rescuing an EARLIER operation's success prose requires that no
+ * LATER failed result holds terminal failure authority — the issue's live
+ * shape was `[todo completed, verification read failed, provider HTTP-429]`
+ * and the rescue replayed the stale completion message, silently dropping
+ * the failed verification and the remaining calendar read. A verified
+ * failure (`success: false` with `verifiedUserFacing: true`) is itself
+ * deliverable rescue text; an UNVERIFIED terminal failure is undeliverable
+ * but still masks earlier success prose, so the scan yields nothing and the
+ * turn falls through to the caller's explicit failure handling. A later
+ * success supersedes an earlier failure, and pending confirmation previews,
+ * tool-declared read-only misses, and coaching guards never mask anything.
+ * Diagnostic `text` is never a candidate — the wire contract says it must
+ * not render as assistant prose — so a turn whose tools produced only
+ * diagnostics still falls through to the caller's failure handling.
  */
 export function preservedSettledToolResult(
 	settled: ReadonlyArray<{ name: string; result: PlannerToolResult }>,
@@ -77,7 +115,29 @@ export function preservedSettledToolResult(
 ): (PlannerToolResult & { userFacingText: string }) | undefined {
 	for (let index = settled.length - 1; index >= 0; index--) {
 		const entry = settled[index];
-		if (entry?.result.success !== true) continue;
+		if (entry?.result.success !== true) {
+			if (!entry) continue;
+			if (isTerminalPlannerToolName(entry.name)) continue;
+			// Tool-declared exploratory misses and coaching guards leave no
+			// broken state (planner-loop parity) and must not mask earlier
+			// success prose.
+			const data = entry.result.data as
+				| { readOnlyOperation?: unknown; coachingFailure?: unknown }
+				| undefined;
+			if (data?.readOnlyOperation === true || data?.coachingFailure === true) {
+				continue;
+			}
+			if (requiresConfirmationStylePreview(entry.result)) {
+				// A pending preview is an interaction, not an outcome; it is
+				// deliverable rescue text only when it is verified.
+				if (entry.result.verifiedUserFacing !== true) continue;
+			} else if (entry.result.verifiedUserFacing !== true) {
+				// An unverified terminal failure cannot be delivered, and it
+				// masks every earlier success: none of them is a complete
+				// result for the workflow that failed (#30970).
+				return undefined;
+			}
+		}
 		if (isTerminalPlannerToolName(entry.name)) continue;
 		const candidate = entry.result.userFacingText?.trim();
 		if (!candidate) continue;
@@ -220,11 +280,14 @@ export function answerlessToolTurnReport(args: {
 	actions: readonly Action[] | undefined;
 	stageOneAck: string;
 }): string {
-	const successful = preservedSettledToolResult(
+	// Newest eligible outcome wins (#30970): an undelivered verified success,
+	// or — newer — an undelivered verified failure that must not be masked by
+	// an earlier operation's success prose.
+	const preserved = preservedSettledToolResult(
 		args.settledToolResults,
 		args.deliveredVisibleTexts,
 	);
-	if (successful) return successful.userFacingText;
+	if (preserved) return preserved.userFacingText;
 	const failed = preservedVerifiedFailure(
 		args.settledToolResults,
 		args.deliveredVisibleTexts,

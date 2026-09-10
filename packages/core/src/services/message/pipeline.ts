@@ -1719,9 +1719,11 @@ export async function runV5MessageRuntimeStage1(
 						}),
 					};
 				}
-				// error-policy:J4 a completed tool's user-facing result is a designed
-				// degrade when later planning/evaluation fails; report the loop
-				// failure and deliver the tool's known-good text.
+				// error-policy:J4 a completed tool's user-facing result — success
+				// prose, or per #30970 the newest verified failure's own text
+				// when it outranks an earlier success — is a designed degrade
+				// when later planning/evaluation fails; report the loop
+				// failure and deliver the tool's grounded text.
 				endStatus = "errored";
 				args.runtime.reportError("MessageService.plannerLoop", error, {
 					roomId: args.message.roomId,
