@@ -468,6 +468,11 @@ async function runPlannerLoopIterations(
 	let silentFailedFinishRecoveries = 0;
 	let repeatedNonTerminalToolCalls = 0;
 	let memorySearchBudgetDeadRounds = 0;
+	// #30974: the planner has made at least one explicit turn-scope declaration
+	// this turn (native eliza_turn_scope argument or JSON completed boolean) —
+	// subsequent batches must keep declaring valid scope per non-terminal call.
+	let anyPlannerScopeDeclaration = false;
+	let scopeDeclarationRejections = 0;
 	// In coding mode the agent's whole job is to DO work via FILE/SHELL, so a
 	// terminal REPLY before any non-terminal tool has run is almost always the
 	// "Creating the app now…" narration that leaves nothing on disk. Force the
@@ -922,6 +927,10 @@ async function runPlannerLoopIterations(
 			// "no opinion" and cannot erase an earlier explicit pending scope.
 			if (plannerOutput.completed !== undefined) {
 				lastPlannerExplicitCompleted = plannerOutput.completed;
+				// #30974 note: the scope-declaration flag is deliberately NOT
+				// raised here — the admission gate below must first see the
+				// pre-declaration state, or a declaring batch that legally
+				// mixes scoped and unscoped calls would reject itself.
 				// The evaluator renders the immutable base plus modelHistory, so a
 				// context-only assignment would hide this declaration from its model.
 				appendPlannerModelFeedbackEvent(trajectory, {
@@ -1691,6 +1700,120 @@ async function runPlannerLoopIterations(
 									: ("IGNORE" as const),
 							}),
 				};
+			}
+
+			// #30974 admission gate: once the planner has made ANY explicit
+			// turn-scope declaration (native lane: a prior batch carried
+			// eliza_turn_scope; JSON lane: completed was set), a subsequent
+			// native batch that omits or corrupts the declaration on any
+			// non-terminal call is rejected BEFORE any call executes. The
+			// live failure mode: after `more_work_pending`, later batches
+			// dropped the field, executed anyway, and the pending authority
+			// then outranked a successful evaluator FINISH — the owner got a
+			// generic interruption instead of the verified results. Terminal
+			// calls (REPLY/STOP/IGNORE) never carry scope and stay exempt.
+			// JSON-lane batches are exempt wholesale: their first-class scope
+			// signal is the top-level `completed` boolean, not per-call
+			// arguments, so a missing per-call verdict there is not a
+			// protocol violation (`turnScopeByCall` is only ever populated
+			// for the native lane).
+			const scopeRejection =
+				anyPlannerScopeDeclaration &&
+				!synthesizingRequiredModelReply &&
+				plannerOutput.turnScopeByCall !== undefined
+					? turnScopeAdmissionRejection(plannerOutput)
+					: null;
+			if (scopeRejection) {
+				scopeDeclarationRejections++;
+				params.runtime.logger?.warn?.(
+					{
+						iteration,
+						missing: scopeRejection.missing,
+						invalid: scopeRejection.invalid,
+					},
+					"[planner-loop] rejected a planner batch with missing or invalid eliza_turn_scope declarations before execution",
+				);
+				appendPlannerModelFeedbackEvent(trajectory, {
+					id: `turn-scope-rejected:${iteration}`,
+					type: "instruction",
+					source: "planner-loop",
+					createdAt: Date.now(),
+					metadata: {
+						missing: scopeRejection.missing,
+						invalid: scopeRejection.invalid,
+					},
+					content:
+						`The previous batch was rejected and NOT executed: ${scopeRejection.reason} ` +
+						"This turn already used an explicit eliza_turn_scope declaration, so every subsequent tool call must carry one. " +
+						'Re-issue the complete batch with a valid explicit eliza_turn_scope value ("final" or "more_work_pending") on every call. ' +
+						"The rejected calls and their full arguments are reproduced below.",
+				});
+				// Prompt integrity: the rejected model output itself must stay in
+				// the model-facing history — complete, uncapped, unsummarized — so
+				// the repair round can re-issue the same calls with corrected
+				// scope. The instruction above references this assistant turn.
+				trajectory.modelHistory?.push({
+					role: "assistant",
+					content: [
+						...(plannerOutput.thought
+							? [
+									{
+										type: "text" as const,
+										text: redactDiagnosticText(plannerOutput.thought),
+									},
+								]
+							: []),
+						...plannerOutput.toolCalls.map((toolCall) => ({
+							type: "tool-call" as const,
+							toolCallId:
+								toolCall.id ??
+								`tc-${iteration}-${toolCall.name}-${scopeRejection.missing.length + scopeRejection.invalid.length}`,
+							toolName: toolCall.name,
+							input:
+								projectCompleteToolArgsForModel(
+									toolCall.params ?? {},
+									redactDiagnosticText,
+								) ?? {},
+						})),
+					],
+				});
+				trajectory.steps.push({
+					iteration,
+					thought: plannerOutput.thought,
+					rejectedToolCalls: plannerOutput.toolCalls,
+					rejectionReason: "missing_or_invalid_turn_scope",
+				});
+				if (scopeDeclarationRejections > config.maxRepeatedToolCalls) {
+					throw new ElizaError(
+						"The planner repeatedly declared an invalid or missing turn scope after an explicit pending declaration; no calls from the rejected batches were executed.",
+						{
+							code: "PLANNER_TURN_SCOPE_PROTOCOL",
+							context: {
+								iteration,
+								rejections: scopeDeclarationRejections,
+								lastMissing: scopeRejection.missing,
+								lastInvalid: scopeRejection.invalid,
+							},
+						},
+					);
+				}
+				continue;
+			}
+			scopeDeclarationRejections = 0;
+			// An admissible batch that declared valid scope raises the bar for
+			// every LATER batch this turn (#30974). Deliberately after the gate
+			// above: the declaring batch itself may legally mix scoped and
+			// unscoped calls — only subsequent batches must carry scope on
+			// every non-terminal call. Both lanes count: a native
+			// eliza_turn_scope argument on any call, or the JSON lane's
+			// first-class `completed` boolean.
+			if (
+				plannerOutput.completed !== undefined ||
+				plannerOutput.turnScopeByCall?.some(
+					(scope) => scope === "final" || scope === "more_work_pending",
+				)
+			) {
+				anyPlannerScopeDeclaration = true;
 			}
 
 			const nonTerminalCalls = plannerOutput.toolCalls
@@ -2805,14 +2928,26 @@ export function withTurnScopeToolArg(
 function extractTurnScopeSignal(calls: PlannerToolCall[]): {
 	toolCalls: PlannerToolCall[];
 	completed: boolean | undefined;
+	turnScopeByCall: TurnScopeDeclaration[];
 } {
 	let sawPending = false;
 	let sawFinal = false;
+	const turnScopeByCall: TurnScopeDeclaration[] = [];
 	const toolCalls = calls.map((call) => {
 		const value = call.params?.[TURN_SCOPE_ARG];
-		if (value === undefined) return call;
-		if (value === TURN_SCOPE_MORE_WORK_PENDING) sawPending = true;
-		else if (value === TURN_SCOPE_FINAL) sawFinal = true;
+		if (value === undefined) {
+			turnScopeByCall.push(undefined);
+			return call;
+		}
+		if (value === TURN_SCOPE_MORE_WORK_PENDING) {
+			sawPending = true;
+			turnScopeByCall.push("more_work_pending");
+		} else if (value === TURN_SCOPE_FINAL) {
+			sawFinal = true;
+			turnScopeByCall.push("final");
+		} else {
+			turnScopeByCall.push("invalid");
+		}
 		const { [TURN_SCOPE_ARG]: _scope, ...params } = call.params as Record<
 			string,
 			unknown
@@ -2822,7 +2957,55 @@ function extractTurnScopeSignal(calls: PlannerToolCall[]): {
 	return {
 		toolCalls,
 		completed: sawPending ? false : sawFinal ? true : undefined,
+		turnScopeByCall,
 	};
+}
+
+/**
+ * Per-call verdict for the reserved turn-scope argument, aligned by index with
+ * the stripped `PlannerToolCall[]` returned alongside it: `undefined` means
+ * the call omitted the argument and `"invalid"` means it carried an
+ * unrecognized value. Consumed by the loop's post-pending admission gate
+ * (#30974); the JSON lane does not surface it because its first-class signal
+ * is the top-level `completed` boolean.
+ */
+type TurnScopeDeclaration =
+	| "final"
+	| "more_work_pending"
+	| "invalid"
+	| undefined;
+
+/**
+ * #30974 admission verdict for a planner batch that follows an explicit
+ * pending declaration: every non-terminal call must then carry a valid
+ * `eliza_turn_scope` value. Terminal calls (REPLY/STOP/IGNORE) never carry
+ * scope and are exempt. Returns null when the batch is admissible.
+ */
+function turnScopeAdmissionRejection(output: {
+	toolCalls: PlannerToolCall[];
+	turnScopeByCall?: TurnScopeDeclaration[];
+}): { missing: string[]; invalid: string[]; reason: string } | null {
+	const missing: string[] = [];
+	const invalid: string[] = [];
+	output.toolCalls.forEach((call, index) => {
+		if (isTerminalToolCall(call)) return;
+		const scope = output.turnScopeByCall?.[index];
+		if (scope === undefined) missing.push(call.name);
+		else if (scope === "invalid") invalid.push(call.name);
+	});
+	if (missing.length === 0 && invalid.length === 0) return null;
+	const parts: string[] = [];
+	if (missing.length > 0) {
+		parts.push(
+			`${missing.join(", ")} ${missing.length === 1 ? "was" : "were"} missing the required eliza_turn_scope argument.`,
+		);
+	}
+	if (invalid.length > 0) {
+		parts.push(
+			`${invalid.join(", ")} carried an unrecognized eliza_turn_scope value (must be exactly "final" or "more_work_pending").`,
+		);
+	}
+	return { missing, invalid, reason: parts.join(" ") };
 }
 
 export function parsePlannerOutput(raw: string | GenerateTextResult): {
@@ -2835,6 +3018,12 @@ export function parsePlannerOutput(raw: string | GenerateTextResult): {
 	 * declarations. `undefined` means the planner expressed no opinion.
 	 */
 	completed?: boolean;
+	/**
+	 * Native lane only: per-call `eliza_turn_scope` verdicts aligned by index
+	 * with `toolCalls` (#30974). Lets the loop reject a batch before any call
+	 * executes once the planner has made an explicit pending declaration.
+	 */
+	turnScopeByCall?: TurnScopeDeclaration[];
 	raw: Record<string, unknown>;
 } {
 	if (typeof raw === "string") {
@@ -2905,6 +3094,7 @@ export function parsePlannerOutput(raw: string | GenerateTextResult): {
 					: text,
 		thought: controlText?.thought,
 		completed: merged.completed ?? controlText?.completed,
+		turnScopeByCall: merged.turnScopeByCall,
 		raw: {
 			text: raw.text,
 			toolCalls: raw.toolCalls,
@@ -3284,6 +3474,26 @@ async function dispatchPlannerModelCall(params: {
 		providerAttributionState: params.providerAttributionState,
 	});
 
+	// #30974: the native lane's per-call scope verdicts are a loop-admission
+	// signal, not prompt data. When the parsed output carried them (native
+	// lane) they already round-tripped through the merge below; when it did
+	// not, derive them from the raw native calls so the pending-scope
+	// admission gate can reject an invalid batch before any call executes.
+	// An empty native-call list means this was a text/JSON-lane response —
+	// the gate must stay inert there (JSON scope is the top-level
+	// `completed` boolean), so absence of native calls yields `undefined`
+	// rather than an empty (all-missing) verdict array.
+	if (
+		parsed.turnScopeByCall === undefined &&
+		typeof raw !== "string" &&
+		raw.toolCalls !== undefined &&
+		normalizeToolCalls(raw.toolCalls).length > 0
+	) {
+		const verdicts = extractTurnScopeSignal(
+			normalizeToolCalls(raw.toolCalls),
+		).turnScopeByCall;
+		return { ...parsed, turnScopeByCall: verdicts };
+	}
 	return parsed;
 }
 

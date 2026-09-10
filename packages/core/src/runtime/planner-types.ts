@@ -241,6 +241,15 @@ export interface PlannerStep {
 	result?: PlannerToolResult;
 	terminalMessage?: string;
 	terminalOnly?: boolean;
+	/**
+	 * #30974: a planner batch rejected before any call executed because a
+	 * non-terminal call lacked a valid `eliza_turn_scope` declaration after
+	 * the turn already used one. The calls were never dispatched; this entry
+	 * preserves the rejected batch as trajectory evidence.
+	 */
+	rejectedToolCalls?: PlannerToolCall[];
+	/** Why the sibling `rejectedToolCalls` batch was refused admission. */
+	rejectionReason?: "missing_or_invalid_turn_scope";
 }
 
 export interface PlannerTrajectory {
