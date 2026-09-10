@@ -3987,10 +3987,16 @@ export async function startApiServer(opts?: {
     ["system", "plugins"],
   );
 
-  // Warm per-provider model caches in background (non-blocking)
-  void getOrFetchAllProviders().catch((err) => {
-    logger.warn("[api] Provider cache warm-up failed:", err);
-  });
+  // Warm per-provider model caches in background (non-blocking). Isolated API
+  // consumers opt out via skipDeferredStartupWork so a background discovery
+  // write cannot race their teardown (the late `state/models/<provider>.json`
+  // write recreated a directory mid-removal and failed cleanup with ENOTEMPTY,
+  // #30976); ordinary startup still warms the caches.
+  if (!opts?.skipDeferredStartupWork) {
+    void getOrFetchAllProviders().catch((err) => {
+      logger.warn("[api] Provider cache warm-up failed:", err);
+    });
+  }
 
   let detachApiLogListener: (() => void) | null = null;
   const captureStructuredLog = (entry: LogEntry): void => {
