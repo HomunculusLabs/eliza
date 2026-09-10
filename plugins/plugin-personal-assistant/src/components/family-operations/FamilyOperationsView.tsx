@@ -42,6 +42,7 @@ import { PacketDraftEditor } from "./PacketDraftEditor.js";
 import type {
   FamilyOperationsAdapter,
   FamilyOperationsSnapshot,
+  FamilyRecipientSetupView,
 } from "./types.js";
 
 type Tab = "agreements" | "calendar" | "school" | "packets";
@@ -906,6 +907,213 @@ function SchoolPanel({
   );
 }
 
+/**
+ * Owner-reviewed monthly-email recipient setup. The owner chooses an existing
+ * person, enters a delivery address, reviews the exact person/address pair,
+ * and explicitly confirms before it becomes selectable for a monthly draft.
+ * Confirming a delivery address is an owner action only — it grants no
+ * workspace, document, or chat access, and no message is sent here.
+ */
+function RecipientSetupCard({
+  adapter,
+  refresh,
+  hasSelectableRecipient,
+}: {
+  adapter: FamilyOperationsAdapter;
+  refresh: () => Promise<void>;
+  hasSelectableRecipient: boolean;
+}) {
+  const [setup, setSetup] = useState<{
+    status: "ready";
+    data: FamilyRecipientSetupView;
+  } | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [personId, setPersonId] = useState("");
+  const [address, setAddress] = useState("");
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadSetup = useCallback(async () => {
+    setLoadError(null);
+    try {
+      setSetup({ status: "ready", data: await adapter.loadRecipientSetup() });
+    } catch (cause) {
+      setSetup(null);
+      setLoadError(
+        cause instanceof Error
+          ? cause.message
+          : "Recipient setup is unavailable",
+      );
+    }
+  }, [adapter]);
+
+  useEffect(() => {
+    void loadSetup();
+  }, [loadSetup]);
+
+  const selectedPerson =
+    setup?.status === "ready"
+      ? setup.data.people.find((person) => person.entityId === personId)
+      : undefined;
+  const trimmedAddress = address.trim();
+  const reviewable =
+    Boolean(selectedPerson) && trimmedAddress.length > 0 && !busy;
+
+  const confirm = async () => {
+    if (!selectedPerson) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const next = await adapter.confirmRecipientAddress({
+        entityId: selectedPerson.entityId,
+        address: trimmedAddress,
+      });
+      setSetup({ status: "ready", data: next });
+      setConfirming(false);
+      setAddress("");
+      setNotice(
+        `Confirmed ${selectedPerson.name} — ${trimmedAddress}. It is now selectable for a monthly draft.`,
+      );
+      await refresh();
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "Recipient confirmation failed",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card
+      title="Email recipient setup"
+      detail="Owner-confirmed delivery addresses for monthly packets. Confirming an address does not message the recipient or grant them any access."
+    >
+      {loadError ? (
+        <Unavailable message={loadError} />
+      ) : setup === null ? (
+        <Empty>Loading recipient setup…</Empty>
+      ) : (
+        <div style={{ display: "grid", gap: 10 }}>
+          {setup.data.people.length === 0 ? (
+            <Empty>
+              No people yet. Add a person from Relationships or chat first.
+            </Empty>
+          ) : null}
+          {hasSelectableRecipient ? null : (
+            <p>
+              Add and confirm a recipient email address before preparing an
+              external draft.
+            </p>
+          )}
+          {setup.data.people
+            .filter((person) => person.confirmedAddresses.length > 0)
+            .map((person) => (
+              <ul
+                key={person.entityId}
+                style={{
+                  display: "grid",
+                  gap: 2,
+                  listStyle: "none",
+                  margin: 0,
+                  padding: 0,
+                }}
+                aria-label={`Confirmed recipients for ${person.name}`}
+              >
+                <strong>{person.name}</strong>
+                {person.confirmedAddresses.map((record) => (
+                  <li key={record.address}>
+                    {record.address} — confirmed {date(record.confirmedAt)}
+                  </li>
+                ))}
+              </ul>
+            ))}
+          {confirming ? (
+            <div style={{ display: "grid", gap: 8 }}>
+              <label htmlFor="recipient-setup-person">Person</label>
+              <Select value={personId} onValueChange={setPersonId}>
+                <SelectTrigger
+                  id="recipient-setup-person"
+                  aria-label="Recipient person"
+                >
+                  <SelectValue placeholder="Choose a person" />
+                </SelectTrigger>
+                <SelectContent>
+                  {setup.data.people.map((person) => (
+                    <SelectItem key={person.entityId} value={person.entityId}>
+                      {person.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <label
+                htmlFor="recipient-setup-address"
+                style={{ display: "grid", gap: 6 }}
+              >
+                Delivery email address
+                <Input
+                  aria-label="Delivery email address"
+                  id="recipient-setup-address"
+                  value={address}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                    setAddress(event.target.value)
+                  }
+                  placeholder="recipient@example.com"
+                />
+              </label>
+              {reviewable ? (
+                <p>
+                  Review before confirming: monthly packets will be sent to{" "}
+                  <strong>{selectedPerson?.name}</strong> at{" "}
+                  <strong>{trimmedAddress}</strong>. This confirms a delivery
+                  address only — it does not message {selectedPerson?.name} or
+                  grant any access.
+                </p>
+              ) : null}
+              <div style={{ display: "flex", gap: 8 }}>
+                <Button disabled={!reviewable} onClick={() => void confirm()}>
+                  <Check size={16} /> Confirm recipient address
+                </Button>
+                <Button
+                  disabled={busy}
+                  variant="outline"
+                  onClick={() => {
+                    setConfirming(false);
+                    setAddress("");
+                    setError(null);
+                  }}
+                >
+                  <X size={16} /> Cancel
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <div>
+              <Button
+                disabled={setup.data.people.length === 0}
+                onClick={() => {
+                  setConfirming(true);
+                  setNotice(null);
+                  setError(null);
+                }}
+              >
+                <UsersRound size={16} /> Add recipient address
+              </Button>
+            </div>
+          )}
+          {notice ? <Unavailable message={notice} /> : null}
+          {error ? <Unavailable message={error} /> : null}
+        </div>
+      )}
+    </Card>
+  );
+}
+
 function PacketPanel({
   state,
   emailOptions,
@@ -1006,12 +1214,15 @@ function PacketPanel({
           Connect an email account with permission to send approved email in
           Mail &amp; Calendars.
         </p>
-      ) : emailOptions.data.recipients.length === 0 ? (
-        <p>
-          Add and verify your recipient's email address before preparing an
-          external draft.
-        </p>
       ) : null}
+      <RecipientSetupCard
+        adapter={adapter}
+        refresh={refresh}
+        hasSelectableRecipient={
+          emailOptions.status !== "unavailable" &&
+          emailOptions.data.recipients.length > 0
+        }
+      />
       <Card
         title="Monthly email"
         detail="Choose your sending account and a verified recipient. Review the exact email before approving delivery."

@@ -87,8 +87,25 @@ export interface FamilyOperationsSnapshot {
   emailOptions: Loadable<FamilyEmailOptions>;
 }
 
+export interface FamilyRecipientSetupView {
+  people: Array<{
+    entityId: string;
+    name: string;
+    confirmedAddresses: Array<{
+      address: string;
+      confirmedAt: string;
+      confirmedBy: string;
+    }>;
+  }>;
+}
+
 export interface FamilyOperationsAdapter {
   load(): Promise<FamilyOperationsSnapshot>;
+  loadRecipientSetup(): Promise<FamilyRecipientSetupView>;
+  confirmRecipientAddress(input: {
+    entityId: string;
+    address: string;
+  }): Promise<FamilyRecipientSetupView>;
   uploadAgreement(input: AgreementUploadInput): Promise<void>;
   decideObligation(
     obligation: ParentingAgreementObligation,

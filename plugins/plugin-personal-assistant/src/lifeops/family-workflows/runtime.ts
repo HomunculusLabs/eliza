@@ -7,7 +7,12 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { resolveKnowledgeGraphService } from "@elizaos/agent";
-import { ElizaError, type IAgentRuntime, Service } from "@elizaos/core";
+import {
+  basicEmailValid,
+  ElizaError,
+  type IAgentRuntime,
+  Service,
+} from "@elizaos/core";
 import {
   CALENDAR_OWNER_MUTATION_GATEWAY_SERVICE,
   CalendarService,
@@ -56,8 +61,35 @@ export interface FamilyEmailOptions {
   accounts: Array<{ grantId: string; label: string }>;
   recipients: Array<{ entityId: string; name: string; address: string }>;
 }
+/**
+ * Owner-confirmed email delivery addresses projected from person Entities.
+ * `ownerConfirmed` identities are distinct from guest-authenticated identity
+ * verification: confirming a delivery address grants no workspace, document,
+ * or chat access — it only makes the pair selectable for a monthly draft.
+ */
+export interface FamilyRecipientSetupOptions {
+  people: Array<{
+    entityId: string;
+    name: string;
+    confirmedAddresses: Array<{
+      address: string;
+      confirmedAt: string;
+      confirmedBy: string;
+    }>;
+  }>;
+}
 export const FAMILY_MONTHLY_SYSTEM_OPERATION =
   "family.monthlyCoordination" as const;
+
+/** Attribute key on person Entities holding owner-confirmed delivery addresses. */
+export const FAMILY_RECIPIENT_ADDRESSES_ATTRIBUTE =
+  "family.recipientEmailAddresses" as const;
+
+export interface FamilyRecipientAddressRecord {
+  address: string;
+  confirmedAt: string;
+  confirmedBy: string;
+}
 
 const RUN_LEASE_MS = 10 * 60_000;
 const RUN_SCHEMA = [
@@ -73,6 +105,27 @@ const RUN_SCHEMA = [
 
 function hash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+/**
+ * Read owner-confirmed delivery-address records off a person Entity
+ * attribute. Malformed stored values project as zero confirmed addresses
+ * rather than a fabricated healthy list.
+ */
+function recipientAddressRecords(
+  attribute: { value: unknown } | undefined,
+): FamilyRecipientAddressRecord[] {
+  const value = attribute?.value;
+  if (!Array.isArray(value)) return [];
+  return value.filter(
+    (record): record is FamilyRecipientAddressRecord =>
+      typeof record === "object" &&
+      record !== null &&
+      typeof (record as FamilyRecipientAddressRecord).address === "string" &&
+      typeof (record as FamilyRecipientAddressRecord).confirmedAt ===
+        "string" &&
+      typeof (record as FamilyRecipientAddressRecord).confirmedBy === "string",
+  );
 }
 
 function calendarClaim(event: LifeOpsCalendarEvent): FamilyPacketClaim {
@@ -465,22 +518,170 @@ export class FamilyWorkflowRuntimeService extends Service {
           );
         return [{ grantId: account.grant.id, label }];
       }),
-      recipients: people.flatMap((person) =>
-        person.identities
+      recipients: people.flatMap((person) => {
+        const verified = person.identities
           .filter(
             (identity) =>
               identity.verified &&
               ["email", "gmail"].includes(identity.platform.toLowerCase()),
           )
-          .map((identity) => ({
+          .map((identity) => identity.handle);
+        const ownerConfirmed = recipientAddressRecords(
+          person.attributes?.[FAMILY_RECIPIENT_ADDRESSES_ATTRIBUTE],
+        ).map((record) => record.address);
+        const seen = new Set<string>();
+        return [...verified, ...ownerConfirmed]
+          .filter((address) => {
+            const key = address.toLowerCase();
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          })
+          .map((address) => ({
             entityId: person.entityId,
             name: person.preferredName,
-            address: identity.handle,
-          })),
-      ),
+            address,
+          }));
+      }),
     };
   }
 
+  /**
+   * Owner-reviewed delivery addresses selectable for monthly drafts. An
+   * address appears here only after the owner explicitly confirmed the exact
+   * person/address pair through {@link confirmRecipientAddress}; verified
+   * guest identities surface separately through {@link emailOptions}.
+   */
+  async recipientSetupOptions(): Promise<FamilyRecipientSetupOptions> {
+    const people = await this.listRecipientPeople();
+    return {
+      people: people.map((person) => ({
+        entityId: person.entityId,
+        name: person.preferredName,
+        confirmedAddresses: recipientAddressRecords(
+          person.attributes?.[FAMILY_RECIPIENT_ADDRESSES_ATTRIBUTE],
+        ),
+      })),
+    };
+  }
+
+  private async listRecipientPeople() {
+    const graph = resolveKnowledgeGraphService(this.runtime);
+    if (!graph) throw new Error("Verified contacts are unavailable");
+    return graph.getEntityStore(this.runtime.agentId).list({ type: "person" });
+  }
+
+  /**
+   * Record the owner's explicit confirmation of one person/address delivery
+   * pair. The route must have already shown the exact pair for review; this
+   * method re-validates shape, ownership, and ambiguity at confirm time so a
+   * stale or racing review cannot confirm the wrong target. Retrying the same
+   * pair is idempotent (the original confirmation is preserved); a different
+   * address for the same person is added alongside, never replacing.
+   */
+  async confirmRecipientAddress(input: {
+    entityId: string;
+    address: string;
+    confirmedBy: string;
+  }): Promise<FamilyRecipientSetupOptions> {
+    const entityId = input.entityId.trim();
+    const address = input.address.trim();
+    if (!entityId) throw this.recipientError("entityId is required");
+    if (!basicEmailValid(address))
+      throw this.recipientError("Enter a valid email address");
+    if (entityId === SELF_ENTITY_ID)
+      throw this.recipientError(
+        "The owner is the sender; choose a recipient person",
+      );
+    const graph = resolveKnowledgeGraphService(this.runtime);
+    if (!graph) throw new Error("Verified contacts are unavailable");
+    const store = graph.getEntityStore(this.runtime.agentId);
+    const people = await store.list({ type: "person" });
+    const matches = people.filter(
+      (person) => person.entityId.toLowerCase() === entityId.toLowerCase(),
+    );
+    if (matches.length === 0)
+      throw this.recipientError("Choose an existing person or create one");
+    if (matches.length > 1)
+      throw this.recipientError(
+        "Ambiguous identity match; ask the owner to disambiguate",
+      );
+    const person = matches[0];
+    if (!person) throw this.recipientError("Person not found");
+    const existing = recipientAddressRecords(
+      person.attributes?.[FAMILY_RECIPIENT_ADDRESSES_ATTRIBUTE],
+    );
+    const already = existing.find(
+      (record) => record.address.toLowerCase() === address.toLowerCase(),
+    );
+    const now = this.now().toISOString();
+    const records = already
+      ? existing
+      : [
+          ...existing,
+          { address, confirmedAt: now, confirmedBy: input.confirmedBy },
+        ];
+    await store.upsert({
+      entityId: person.entityId,
+      type: person.type,
+      preferredName: person.preferredName,
+      ...(person.fullName ? { fullName: person.fullName } : {}),
+      identities: person.identities,
+      attributes: {
+        ...person.attributes,
+        [FAMILY_RECIPIENT_ADDRESSES_ATTRIBUTE]: {
+          value: records,
+          confidence: 1,
+          evidence: [`owner-confirmed:${input.confirmedBy}`],
+          updatedAt: now,
+        },
+      },
+      state: person.state,
+      tags: person.tags,
+      visibility: person.visibility,
+    });
+    return this.recipientSetupOptions();
+  }
+
+  private recipientError(message: string): ElizaError {
+    return new ElizaError(`[FamilyWorkflowRuntime] ${message}`, {
+      code: "FAMILY_RECIPIENT_SETUP_INVALID",
+      context: { message },
+    });
+  }
+
+  /**
+   * Validate that a draft's delivery address is either a guest-verified email
+   * identity or an owner-confirmed delivery address recorded for that exact
+   * Entity. Draft creation still calls {@link validateRecipientIdentity} for
+   * the guest path; this check owns the owner-confirmed path.
+   */
+  async requireConfirmedRecipientAddress(input: {
+    recipientEntityId: string;
+    recipient: string;
+  }): Promise<void> {
+    const graph = resolveKnowledgeGraphService(this.runtime);
+    const entity = await graph
+      ?.getEntityStore(this.runtime.agentId)
+      .get(input.recipientEntityId);
+    const confirmed = recipientAddressRecords(
+      entity?.attributes?.[FAMILY_RECIPIENT_ADDRESSES_ATTRIBUTE],
+    ).some(
+      (record) =>
+        record.address.toLowerCase() === input.recipient.trim().toLowerCase(),
+    );
+    if (!confirmed)
+      throw this.recipientError(
+        "recipient address is not owner-confirmed for the selected person",
+      );
+  }
+
+  /**
+   * Validate the delivery channel for a draft recipient: for email drafts the
+   * address must be either a guest-verified email identity or an
+   * owner-confirmed delivery address on that exact Entity; non-email drafts
+   * keep the verified messaging-identity requirement unchanged.
+   */
   async validateRecipientIdentity(input: {
     recipientEntityId: string;
     recipient: string;
@@ -490,23 +691,31 @@ export class FamilyWorkflowRuntimeService extends Service {
       ?.getEntityStore(this.runtime.agentId)
       .get(input.recipientEntityId);
     const recipient = input.recipient.trim();
-    if (
-      !entity?.identities.some(
-        (identity) =>
-          identity.verified &&
-          (input.email
-            ? ["email", "gmail"]
-            : ["imessage", "blooio", "sms", "phone"]
-          ).includes(identity.platform.toLowerCase()) &&
-          (input.email
-            ? identity.handle.toLowerCase() === recipient.toLowerCase()
-            : identity.handle === recipient),
-      )
-    ) {
-      throw new Error(
-        "[FamilyWorkflowRuntime] recipient is not a verified identity for the selected delivery channel",
+    const verifiedIdentity = entity?.identities.some(
+      (identity) =>
+        identity.verified &&
+        (input.email
+          ? ["email", "gmail"]
+          : ["imessage", "blooio", "sms", "phone"]
+        ).includes(identity.platform.toLowerCase()) &&
+        (input.email
+          ? identity.handle.toLowerCase() === recipient.toLowerCase()
+          : identity.handle === recipient),
+    );
+    if (verifiedIdentity) return;
+    if (input.email) {
+      // Email drafts also accept owner-confirmed delivery addresses — the
+      // packet screen's explicit recipient-setup flow records them.
+      const ownerConfirmed = recipientAddressRecords(
+        entity?.attributes?.[FAMILY_RECIPIENT_ADDRESSES_ATTRIBUTE],
+      ).some(
+        (record) => record.address.toLowerCase() === recipient.toLowerCase(),
       );
+      if (ownerConfirmed) return;
     }
+    throw new Error(
+      "[FamilyWorkflowRuntime] recipient is not a verified identity for the selected delivery channel",
+    );
   }
 
   async requestDraftApproval(args: {

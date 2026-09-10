@@ -14,6 +14,7 @@ import type {
   FamilyOperationsAdapter,
   FamilyOperationsSnapshot,
   FamilyPacketView,
+  FamilyRecipientSetupView,
   LinkedCalendarView,
   Loadable,
   SchoolWorkflowView,
@@ -201,6 +202,23 @@ async function loadPackets(): Promise<Loadable<FamilyPacketView[]>> {
 }
 
 export const defaultFamilyOperationsAdapter: FamilyOperationsAdapter = {
+  async loadRecipientSetup(): Promise<FamilyRecipientSetupView> {
+    return request<FamilyRecipientSetupView>(
+      "/api/lifeops/family-workflows/recipient-setup",
+    );
+  },
+  async confirmRecipientAddress(input): Promise<FamilyRecipientSetupView> {
+    return request<FamilyRecipientSetupView>(
+      "/api/lifeops/family-workflows/recipient-setup/confirm",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          entityId: input.entityId,
+          address: input.address,
+        }),
+      },
+    );
+  },
   async load(): Promise<FamilyOperationsSnapshot> {
     const [agreements, calendarLinks, school, packets, emailOptions] =
       await Promise.all([

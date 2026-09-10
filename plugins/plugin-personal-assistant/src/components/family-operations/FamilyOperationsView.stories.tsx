@@ -29,6 +29,8 @@ const adapter = {
   configureSchool: async () => undefined,
   approveSchoolDiff: async () => undefined,
   generatePacket: async () => undefined,
+  loadRecipientSetup: async () => ({ people: [] }),
+  confirmRecipientAddress: async () => ({ people: [] }),
 } as unknown as FamilyOperationsAdapter;
 
 const meta = {

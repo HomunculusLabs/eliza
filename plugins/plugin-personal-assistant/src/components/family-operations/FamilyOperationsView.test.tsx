@@ -98,6 +98,8 @@ function snapshot(): FamilyOperationsSnapshot {
 function adapter(data = snapshot()): FamilyOperationsAdapter {
   return {
     load: vi.fn(async () => data),
+    loadRecipientSetup: vi.fn(async () => ({ people: [] })),
+    confirmRecipientAddress: vi.fn(async () => ({ people: [] })),
     decideObligation: vi.fn(async (obligation, decision, reason) => ({
       ...obligation,
       status: decision === "approve" ? "approved" : "rejected",
@@ -424,5 +426,104 @@ describe("FamilyOperationsView", () => {
         3,
       ),
     );
+  });
+
+  it("walks the owner-reviewed recipient setup flow: choose person, review exact pair, confirm", async () => {
+    const local = adapter();
+    const emptyRecipients = await local.load();
+    emptyRecipients.emailOptions = {
+      status: "ready",
+      data: {
+        accounts: [{ grantId: "sender-1", label: "owner@example.com" }],
+        recipients: [],
+      },
+    };
+    (local.loadRecipientSetup as ReturnType<typeof vi.fn>).mockResolvedValue({
+      people: [{ entityId: "guest-1", name: "Alex", confirmedAddresses: [] }],
+    });
+    (
+      local.confirmRecipientAddress as ReturnType<typeof vi.fn>
+    ).mockResolvedValue({
+      people: [
+        {
+          entityId: "guest-1",
+          name: "Alex",
+          confirmedAddresses: [
+            {
+              address: "alex@example.com",
+              confirmedAt: "2026-09-10T16:00:00.000Z",
+              confirmedBy: "self",
+            },
+          ],
+        },
+      ],
+    });
+    render(<FamilyOperationsView adapter={local} />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Monthly packet" }),
+    );
+    // The dead-end message now offers the setup action (loads async).
+    expect(
+      await screen.findByText(/Add and confirm a recipient email address/i),
+    ).toBeTruthy();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Add recipient address" }),
+    );
+    fireEvent.change(await screen.findByLabelText("Person"), {
+      target: { value: "guest-1" },
+    });
+    fireEvent.change(await screen.findByLabelText("Delivery email address"), {
+      target: { value: "alex@example.com" },
+    });
+    // The exact person/address pair is shown for review before the confirm
+    // button does anything (person and address render as emphasis nodes).
+    const review = await screen.findAllByText((_, element) =>
+      Boolean(
+        element?.textContent?.includes(
+          "monthly packets will be sent to Alex at alex@example.com",
+        ),
+      ),
+    );
+    expect(review.length).toBeGreaterThan(0);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Confirm recipient address" }),
+    );
+    await waitFor(() =>
+      expect(local.confirmRecipientAddress).toHaveBeenCalledWith({
+        entityId: "guest-1",
+        address: "alex@example.com",
+      }),
+    );
+    // Confirming a delivery address never drafts or sends a packet.
+    expect(local.createPacketDraft).not.toHaveBeenCalled();
+    expect(local.requestPacketApproval).not.toHaveBeenCalled();
+  });
+
+  it("surfaces recipient confirmation failure as a visible error, not a success notice", async () => {
+    const local = adapter();
+    (local.loadRecipientSetup as ReturnType<typeof vi.fn>).mockResolvedValue({
+      people: [{ entityId: "guest-1", name: "Alex", confirmedAddresses: [] }],
+    });
+    (
+      local.confirmRecipientAddress as ReturnType<typeof vi.fn>
+    ).mockRejectedValue(new Error("Enter a valid email address"));
+    render(<FamilyOperationsView adapter={local} />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Monthly packet" }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Add recipient address" }),
+    );
+    fireEvent.change(await screen.findByLabelText("Person"), {
+      target: { value: "guest-1" },
+    });
+    fireEvent.change(await screen.findByLabelText("Delivery email address"), {
+      target: { value: "bad" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Confirm recipient address" }),
+    );
+    expect(await screen.findByText(/valid email address/i)).toBeTruthy();
+    expect(screen.queryByText(/Confirmed Alex/i)).toBeNull();
   });
 });

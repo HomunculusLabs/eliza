@@ -41,6 +41,44 @@ export async function handleFamilyWorkflowRoutes(
       return true;
     }
     if (
+      method === "GET" &&
+      pathname === "/api/lifeops/family-workflows/recipient-setup"
+    ) {
+      json(res, await runtimeService.recipientSetupOptions());
+      return true;
+    }
+    if (
+      method === "POST" &&
+      pathname === "/api/lifeops/family-workflows/recipient-setup/confirm"
+    ) {
+      const body = await readJsonBody<{
+        entityId?: unknown;
+        address?: unknown;
+      }>(req, res);
+      if (!body) return true;
+      if (
+        typeof body.entityId !== "string" ||
+        !body.entityId.trim() ||
+        typeof body.address !== "string"
+      ) {
+        ctx.error(res, "entityId and address are required", 400);
+        return true;
+      }
+      // The route is owner-only (LifeOps route gate); the confirming actor is
+      // the authenticated admin entity, never a guest identity.
+      const actor = String(ctx.state.adminEntityId ?? "self");
+      json(
+        res,
+        await runtimeService.confirmRecipientAddress({
+          entityId: body.entityId.trim(),
+          address: body.address,
+          confirmedBy: actor,
+        }),
+        201,
+      );
+      return true;
+    }
+    if (
       method === "PUT" &&
       pathname === "/api/lifeops/family-workflows/school/source"
     ) {
