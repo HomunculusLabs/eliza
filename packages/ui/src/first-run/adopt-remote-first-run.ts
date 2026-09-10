@@ -3,24 +3,21 @@
  *
  * Device + desktop remote-connect-at-URL onboarding (deep link and the Settings
  * "Connect a remote agent" entry) funnels through here AFTER the client base has
- * been pointed at the remote (`applyLaunchConnection({ kind: "remote" })`). It
- * makes the connected remote the device's completed first-run target so the
- * startup poll lands on home instead of re-showing onboarding on the next launch.
+ * been pointed at the remote (`applyLaunchConnection({ kind: "remote" })`).
  *
- * This is the headless equivalent of the legacy `finishRemote` step that used to
- * live in the full-screen onboarding controller, with one deliberate
- * improvement: it PROBES the remote's first-run status first and only writes
- * when the host has not finished its own first-run. Connecting to an
- * already-configured host therefore adopts it as-is instead of clobbering its
- * deployment target — the destructive overwrite the unconditional legacy POST
- * could cause.
+ * Adoption is strictly read-only against the host (#30988): connecting a device
+ * must never reconfigure where the host runs. The remote's first-run status is
+ * probed; an already-configured host is adopted as-is, and a host that has not
+ * finished its own setup is reported as needing explicit setup — the device then
+ * surfaces that host's onboarding instead of fabricating a completed config. A
+ * probe failure (unreachable or unauthorized) is a visible connection error:
+ * no setup write, no device-local completion, no queued-chat release.
  *
  * It is intentionally dependency-injected (the client surface is the only
  * dependency) so it can be unit-tested without the React shell or a live server.
  */
 
 import type { UiLanguage } from "../i18n";
-import { buildFirstRunSubmitPlan } from "./first-run";
 import { releasePendingFirstRunText } from "./first-run-pending-text";
 
 /**
@@ -54,7 +51,6 @@ export function normalizeRemoteAgentUrl(value: string): string {
 /** The minimal client surface this use case needs (a subset of `ElizaClient`). */
 export interface RemoteFirstRunClient {
   getFirstRunStatus(): Promise<{ complete: boolean }>;
-  submitFirstRun(data: Record<string, unknown>): Promise<void>;
 }
 
 export interface AdoptRemoteAgentFirstRunInput {
@@ -67,63 +63,61 @@ export interface AdoptRemoteAgentFirstRunInput {
 }
 
 export interface AdoptRemoteAgentFirstRunResult {
-  /** True when the remote already reported a completed first-run (no write). */
+  /** True when the remote already reported a completed first-run. */
   alreadyComplete: boolean;
+  /**
+   * True when the remote is reachable but has NOT finished its own first-run.
+   * The caller must route the user to that host's explicit setup — adoption
+   * never writes a config, so it cannot make an unconfigured host ready.
+   */
+  hostNeedsSetup: boolean;
 }
 
 /**
- * Ensures the connected remote is recorded as the device's completed first-run
- * target. Returns whether the remote was already complete (so callers can skip
- * a redundant "configured" notice).
- *
- * Throws if the remote cannot be reached for the completion write — surfacing a
- * real connection failure rather than silently landing the user on a dead shell.
+ * Inspects the connected remote's first-run state without writing anything to
+ * it. Throws a visible connection error when the status probe fails — an
+ * unreachable or unauthorized remote must not be adopted.
  */
 export async function adoptRemoteAgentFirstRun(
   client: RemoteFirstRunClient,
-  input: AdoptRemoteAgentFirstRunInput,
+  _input?: AdoptRemoteAgentFirstRunInput,
 ): Promise<AdoptRemoteAgentFirstRunResult> {
-  let alreadyComplete = false;
+  let status: { complete: boolean };
   try {
-    alreadyComplete = (await client.getFirstRunStatus()).complete === true;
-  } catch {
-    // error-policy:J4 a fresh host with no persisted first-run state, or one
-    // whose build predates the status route, is the expected "needs adoption"
-    // shape — fall through to the completion write below. A genuinely
-    // unreachable remote re-fails there, so the failure still surfaces.
-    alreadyComplete = false;
+    status = await client.getFirstRunStatus();
+  } catch (err) {
+    // error-policy:J2 context-adding rethrow — the probe failure is the
+    // connection failure the user must see; nothing was written and the
+    // caller's completion/release must not run.
+    throw new Error(
+      "Could not verify the remote agent is reachable and configured.",
+      { cause: err },
+    );
   }
 
-  if (alreadyComplete) {
-    return { alreadyComplete: true };
+  if (status.complete === true) {
+    return { alreadyComplete: true, hostNeedsSetup: false };
   }
-
-  const plan = buildFirstRunSubmitPlan({
-    draft: {
-      agentName: "",
-      runtime: "remote",
-      localInference: "all-local",
-      remoteApiBase: input.apiBase,
-      remoteToken: input.token ?? "",
-    },
-    uiLanguage: input.uiLanguage ?? "en",
-  });
-
-  await client.submitFirstRun(plan.payload);
-  return { alreadyComplete: false };
+  return { alreadyComplete: false, hostNeedsSetup: true };
 }
 
 /**
- * Adopts the remote, commits the local first-run gate, then releases any typed
- * onboarding requests to the real composer. A failed adoption performs neither
- * local completion nor release.
+ * Adopts the remote and — only once the remote itself reports a completed
+ * first-run — commits the local first-run gate and releases any typed
+ * onboarding requests to the real composer. A remote that still needs setup
+ * performs neither: the user is routed to that host's explicit onboarding, so
+ * model readiness is never fabricated. A failed adoption (probe error)
+ * performs neither local completion nor release.
  */
 export async function completeRemoteAgentFirstRun(
   client: RemoteFirstRunClient,
-  input: AdoptRemoteAgentFirstRunInput,
+  input: AdoptRemoteAgentFirstRunInput | undefined,
   completeFirstRun: () => void,
 ): Promise<AdoptRemoteAgentFirstRunResult> {
   const result = await adoptRemoteAgentFirstRun(client, input);
+  if (!result.alreadyComplete) {
+    return result;
+  }
   completeFirstRun();
   releasePendingFirstRunText();
   return result;

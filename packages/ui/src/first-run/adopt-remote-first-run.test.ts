@@ -1,6 +1,8 @@
 /**
  * Unit coverage for adopting a remote agent's first-run state (URL
- * normalization, config probe). Client injected, no live agent.
+ * normalization, read-only status probe, adoption outcomes). Client injected,
+ * no live agent. Regression target #30988: adoption must never submit a
+ * first-run payload to the connected host.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -52,36 +54,20 @@ function makeClient(overrides: Partial<RemoteFirstRunClient> = {}): {
 } {
   const getFirstRunStatus = vi.fn(async () => ({ complete: false }));
   const submitFirstRun = vi.fn(async () => undefined);
-  const client: RemoteFirstRunClient = {
+  // The injected double carries submitFirstRun even though the real client
+  // surface no longer needs it, so a regression that reintroduces the
+  // completion write FAILS these assertions instead of throwing at the
+  // call site.
+  const client = {
     getFirstRunStatus,
     submitFirstRun,
     ...overrides,
-  };
+  } as unknown as RemoteFirstRunClient;
   return { client, getFirstRunStatus, submitFirstRun };
 }
 
 describe("adoptRemoteAgentFirstRun", () => {
-  it("adopts a fresh remote: probes then POSTs the remote deployment target", async () => {
-    const { client, submitFirstRun } = makeClient({
-      getFirstRunStatus: vi.fn(async () => ({ complete: false })),
-    });
-
-    const result = await adoptRemoteAgentFirstRun(client, {
-      apiBase: "http://127.0.0.1:31337",
-    });
-
-    expect(result).toEqual({ alreadyComplete: false });
-    expect(submitFirstRun).toHaveBeenCalledTimes(1);
-    const payload = submitFirstRun.mock.calls[0][0] as {
-      deploymentTarget?: { runtime?: string; remoteApiBase?: string };
-    };
-    expect(payload.deploymentTarget?.runtime).toBe("remote");
-    expect(payload.deploymentTarget?.remoteApiBase).toBe(
-      "http://127.0.0.1:31337",
-    );
-  });
-
-  it("does NOT clobber a host that already finished first-run", async () => {
+  it("adopts a configured remote without any setup write", async () => {
     const { client, submitFirstRun } = makeClient({
       getFirstRunStatus: vi.fn(async () => ({ complete: true })),
     });
@@ -90,57 +76,57 @@ describe("adoptRemoteAgentFirstRun", () => {
       apiBase: "https://agent.example.com",
     });
 
-    expect(result).toEqual({ alreadyComplete: true });
+    expect(result).toEqual({ alreadyComplete: true, hostNeedsSetup: false });
     expect(submitFirstRun).not.toHaveBeenCalled();
   });
 
-  it("treats an unreachable status probe as 'needs adoption' and still POSTs", async () => {
+  it("#30988: never submits a first-run payload to an incomplete host — reports it instead", async () => {
+    const { client, submitFirstRun } = makeClient({
+      getFirstRunStatus: vi.fn(async () => ({ complete: false })),
+    });
+
+    const result = await adoptRemoteAgentFirstRun(client, {
+      apiBase: "http://127.0.0.1:31337",
+    });
+
+    expect(result).toEqual({ alreadyComplete: false, hostNeedsSetup: true });
+    expect(submitFirstRun).not.toHaveBeenCalled();
+  });
+
+  it("#30988: a failed status probe is a visible error with NO setup write", async () => {
     const { client, submitFirstRun } = makeClient({
       getFirstRunStatus: vi.fn(async () => {
         throw new Error("network down");
       }),
     });
 
-    await adoptRemoteAgentFirstRun(client, {
-      apiBase: "http://127.0.0.1:31337",
-    });
-
-    expect(submitFirstRun).toHaveBeenCalledTimes(1);
+    await expect(
+      adoptRemoteAgentFirstRun(client, { apiBase: "http://127.0.0.1:31337" }),
+    ).rejects.toThrow(/could not verify the remote agent/i);
+    expect(submitFirstRun).not.toHaveBeenCalled();
   });
 
-  it("propagates a completion-write failure instead of faking success", async () => {
-    const { client } = makeClient({
-      getFirstRunStatus: vi.fn(async () => ({ complete: false })),
-      submitFirstRun: vi.fn(async () => {
-        throw new Error("remote unreachable");
+  it("#30988: an unauthorized probe surfaces as the same visible error", async () => {
+    const { client, submitFirstRun } = makeClient({
+      getFirstRunStatus: vi.fn(async () => {
+        throw new Error("401 Unauthorized");
       }),
     });
 
     await expect(
-      adoptRemoteAgentFirstRun(client, { apiBase: "http://127.0.0.1:31337" }),
-    ).rejects.toThrow(/remote unreachable/);
-  });
-
-  it("forwards an access token in the submitted plan", async () => {
-    const { client, submitFirstRun } = makeClient();
-
-    await adoptRemoteAgentFirstRun(client, {
-      apiBase: "https://agent.example.com",
-      token: "secret-key",
-    });
-
-    const payload = submitFirstRun.mock.calls[0][0] as {
-      deploymentTarget?: { remoteAccessToken?: string };
-    };
-    expect(payload.deploymentTarget?.remoteAccessToken).toBe("secret-key");
+      adoptRemoteAgentFirstRun(client, {
+        apiBase: "https://agent.example.com",
+      }),
+    ).rejects.toThrow(/could not verify the remote agent/i);
+    expect(submitFirstRun).not.toHaveBeenCalled();
   });
 });
 
 describe("completeRemoteAgentFirstRun", () => {
-  it("releases typed onboarding intent only after successful remote adoption", async () => {
+  it("completes locally and releases typed onboarding intent only for a configured remote", async () => {
     const order: string[] = [];
     const { client } = makeClient({
-      submitFirstRun: vi.fn(async () => void order.push("adopt")),
+      getFirstRunStatus: vi.fn(async () => ({ complete: true })),
     });
     setPendingFirstRunTextReleaseHandler(() => void order.push("release"));
 
@@ -150,14 +136,33 @@ describe("completeRemoteAgentFirstRun", () => {
       () => void order.push("complete"),
     );
 
-    expect(order).toEqual(["adopt", "complete", "release"]);
+    expect(order).toEqual(["complete", "release"]);
   });
 
-  it("does not complete or release when remote adoption fails", async () => {
+  it("#30988: an incomplete host performs neither local completion nor queued-text release", async () => {
     const complete = vi.fn();
     const release = vi.fn();
     const { client } = makeClient({
-      submitFirstRun: vi.fn(async () => {
+      getFirstRunStatus: vi.fn(async () => ({ complete: false })),
+    });
+    setPendingFirstRunTextReleaseHandler(release);
+
+    const result = await completeRemoteAgentFirstRun(
+      client,
+      { apiBase: "http://127.0.0.1:31337" },
+      complete,
+    );
+
+    expect(result).toEqual({ alreadyComplete: false, hostNeedsSetup: true });
+    expect(complete).not.toHaveBeenCalled();
+    expect(release).not.toHaveBeenCalled();
+  });
+
+  it("does not complete or release when the probe fails", async () => {
+    const complete = vi.fn();
+    const release = vi.fn();
+    const { client } = makeClient({
+      getFirstRunStatus: vi.fn(async () => {
         throw new Error("remote unreachable");
       }),
     });
@@ -166,10 +171,10 @@ describe("completeRemoteAgentFirstRun", () => {
     await expect(
       completeRemoteAgentFirstRun(
         client,
-        { apiBase: "https://agent.example.com" },
+        { apiBase: "http://127.0.0.1:31337" },
         complete,
       ),
-    ).rejects.toThrow(/remote unreachable/);
+    ).rejects.toThrow(/could not verify the remote agent/i);
     expect(complete).not.toHaveBeenCalled();
     expect(release).not.toHaveBeenCalled();
   });

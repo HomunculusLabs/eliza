@@ -2658,7 +2658,10 @@ function AppContent() {
         setState("firstRunRemoteConnected", true);
         setState("firstRunRemoteError", null);
         if (shouldCompleteFirstRun) {
-          await completeRemoteAgentFirstRun(
+          // Read-only adoption (#30988): a configured host is adopted as-is; a
+          // host that has not finished its own setup routes the user to that
+          // host's explicit onboarding via the startup re-poll below.
+          const adoption = await completeRemoteAgentFirstRun(
             client,
             {
               apiBase: connection.apiBase,
@@ -2667,6 +2670,13 @@ function AppContent() {
             },
             completeFirstRun,
           );
+          if (adoption.hostNeedsSetup) {
+            setActionNotice(
+              "Connected. This agent hasn't finished setup yet — finish its setup to start chatting.",
+              "info",
+              8000,
+            );
+          }
         }
         setActionNotice("Connected to remote backend.", "success", 4200);
         retryStartup();

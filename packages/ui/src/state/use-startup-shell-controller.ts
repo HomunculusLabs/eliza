@@ -168,11 +168,12 @@ export function useStartupShellController(): StartupShellController {
         setState("firstRunRemoteConnected", true);
         setState("firstRunRemoteError", null);
         if (shouldCompleteFirstRun) {
-          // Adopt the remote as this device's completed first-run target. Probes
-          // first, so an already-configured host is used as-is (no clobber) and
-          // a fresh host is marked complete — either way the startup re-poll
-          // below lands on home rather than onboarding.
-          await completeRemoteAgentFirstRun(
+          // Inspect the remote's first-run state (read-only, #30988): a
+          // configured host is adopted as-is; a host that has not finished
+          // its own setup is reported so the startup re-poll routes the
+          // user to that host's explicit onboarding — adoption never
+          // fabricates a completed config.
+          const adoption = await completeRemoteAgentFirstRun(
             client,
             {
               apiBase: connection.apiBase,
@@ -181,6 +182,13 @@ export function useStartupShellController(): StartupShellController {
             },
             completeFirstRun,
           );
+          if (adoption.hostNeedsSetup) {
+            setActionNotice(
+              "Connected. This agent hasn't finished setup yet — finish its setup to start chatting.",
+              "info",
+              8000,
+            );
+          }
         }
         setActionNotice("Connected to remote backend.", "success", 4200);
         retryStartup();
