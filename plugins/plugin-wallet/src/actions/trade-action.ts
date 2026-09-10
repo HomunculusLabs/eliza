@@ -7,6 +7,7 @@
 import type {
   Action,
   ActionResult,
+  EffectReceipt,
   HandlerCallback,
   HandlerOptions,
   IAgentRuntime,
@@ -409,11 +410,31 @@ async function submitOrder(
     };
   }
   const text = `Submitted ${order.venue} order ${result.data.orderId}.`;
+  const observedAt = new Date().toISOString();
+  const effectReceipt: EffectReceipt = {
+    receiptId: `steward:order:${result.data.orderId}`,
+    operation: "steward.order.submit",
+    resource: {
+      kind: "steward.order",
+      id: result.data.orderId,
+    },
+    artifacts: [],
+    idempotency: { key: idempotencyKey, replayed: false },
+    observedAt,
+    outcome: "applied",
+    commit: {
+      kind: "provider_accepted",
+      id: result.data.orderId,
+      committedAt: observedAt,
+    },
+  };
   return {
     success: true,
     text,
     userFacingText: text,
     verifiedUserFacing: true,
+    userFacingEffectReceiptIds: [effectReceipt.receiptId],
+    effectReceipts: [effectReceipt],
     data: providerRecord({
       success: true,
       outcome: "submitted",

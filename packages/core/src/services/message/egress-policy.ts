@@ -21,6 +21,7 @@ import {
 } from "../../security/trusted-delivery-audience";
 import type { Action, ActionResult } from "../../types/components";
 import {
+	type EffectBearingResult,
 	mergeEffectReceipts,
 	resolveAppliedUserFacingEffectReceipts,
 } from "../../types/effects";
@@ -32,13 +33,17 @@ import { resolveCallbackActionName } from "./action-identifiers.js";
 import { rewriteActionCallbackInCharacter } from "./delivery.js";
 import { normalizeActionIdentifier } from "./direct-action-heuristics";
 import {
+	financialClaimMatchesOperation,
+	financialClaimOperationFamily,
+	replyClaimsCompletedFinancialMutation,
 	replyClaimsCompletedSideEffect,
 	replyClaimsEmptyTrackedWorkState,
 } from "./side-effect-claims.ts";
 
 export type PlannedReplyClaimKind =
 	| "completed_side_effect"
-	| "empty_tracked_state";
+	| "empty_tracked_state"
+	| "completed_financial_mutation";
 
 export function appliedEffectReceiptIdsForReply(
 	reply: string,
@@ -83,12 +88,70 @@ export function appliedEffectReceiptIdsForReply(
 }
 
 /**
+ * Receipt IDs from this turn that ground a financial mutation claim: applied
+ * (or verified replayed no-op) receipts whose operation belongs to the family
+ * the claim names (#30958). Unlike the scheduling tier, the grounding need
+ * not be byte-exact action-owned text — the planner routinely paraphrases a
+ * submitted wallet result — but the operation family must match: a swap
+ * receipt can never substantiate a transfer claim.
+ */
+export function financialClaimGroundingReceiptIds(
+	reply: string,
+	results: readonly ActionResult[],
+	evaluator?: EvaluatorOutput,
+): readonly string[] {
+	const normalizedReply = reply.trim();
+	if (!normalizedReply) return [];
+	const family = financialClaimOperationFamily(normalizedReply);
+	if (!family) return [];
+	const allTurnReceipts = mergeEffectReceipts(
+		...results.map((result) => result.effectReceipts),
+	);
+	const candidates: EffectBearingResult[] = [...results];
+	// An evaluator-authored FINISH that exactly matches the reply is also
+	// admitted, mirroring appliedEffectReceiptIdsForReply's provenance rule.
+	if (
+		evaluator?.decision === "FINISH" &&
+		!evaluator.protocolFailure &&
+		evaluator.messageToUser?.trim() === normalizedReply
+	) {
+		candidates.push({
+			verifiedUserFacing: true,
+			userFacingText: normalizedReply,
+			userFacingEffectReceiptIds: evaluator.effectReceiptIds,
+		});
+	}
+	const groundingIds: string[] = [];
+	for (const result of candidates) {
+		const resolved = resolveAppliedUserFacingEffectReceipts(
+			result,
+			allTurnReceipts,
+		);
+		if (!resolved) continue;
+		for (const receipt of resolved) {
+			if (
+				financialClaimMatchesOperation(
+					family,
+					normalizedReply,
+					receipt.operation,
+				)
+			) {
+				groundingIds.push(receipt.receiptId);
+			}
+		}
+	}
+	return groundingIds;
+}
+
+/**
  * An action result grounds only the capability it actually proves.
  * Empty tracked-work claims require a `resource:tracked-work` read action.
  * Completion claims require exact action-owned or evaluator-authored text bound to an active
  * committed receipt from this turn — applied, or a replayed no-op proving the
  * desired state was already committed; bare success, previews, non-replayed
- * no-ops, failures, and rolled-back effects cannot ground them.
+ * no-ops, failures, and rolled-back effects cannot ground them. Financial
+ * mutation claims additionally require a receipt from the claimed operation
+ * family (see {@link financialClaimGroundingReceiptIds}).
  */
 export function plannedReplyHasClaimGroundingReceipt(args: {
 	kind: PlannedReplyClaimKind;
@@ -97,6 +160,15 @@ export function plannedReplyHasClaimGroundingReceipt(args: {
 	actions: readonly Action[];
 	evaluator?: EvaluatorOutput;
 }): boolean {
+	if (args.kind === "completed_financial_mutation") {
+		return (
+			financialClaimGroundingReceiptIds(
+				args.reply,
+				args.results,
+				args.evaluator,
+			).length > 0
+		);
+	}
 	if (args.kind === "completed_side_effect") {
 		return (
 			appliedEffectReceiptIdsForReply(args.reply, args.results, args.evaluator)
@@ -169,6 +241,23 @@ export function evaluatePlannedReplyEgress(args: {
 }): PlannedReplyEgressDecision {
 	const reply = args.reply.trim();
 	if (!reply) return { verdict: "allow" };
+	if (replyClaimsCompletedFinancialMutation(reply)) {
+		if (
+			plannedReplyHasClaimGroundingReceipt({
+				kind: "completed_financial_mutation",
+				reply,
+				results: args.actionResults,
+				actions: args.actions,
+				evaluator: args.evaluator,
+			})
+		) {
+			return { verdict: "allow" };
+		}
+		return {
+			verdict: "reject",
+			kind: "completed_financial_mutation",
+		};
+	}
 	if (replyClaimsCompletedSideEffect(reply)) {
 		if (
 			plannedReplyHasClaimGroundingReceipt({
@@ -224,6 +313,14 @@ export async function resolvePlannedReplyEgress(args: {
 		evaluator: args.evaluator,
 	});
 	if (args.reply.trim() && decision.verdict === "allow") {
+		const financialGrounding = financialClaimGroundingReceiptIds(
+			args.reply,
+			args.actionResults,
+			args.evaluator,
+		);
+		if (financialGrounding.length > 0) {
+			return { text: args.reply, effectReceiptIds: financialGrounding };
+		}
 		return {
 			text: args.reply,
 			effectReceiptIds: appliedEffectReceiptIdsForReply(
@@ -272,7 +369,11 @@ export async function resolvePlannedReplyEgress(args: {
 		!reply ||
 		(rewritten?.effectReceiptIds.length && !proof) ||
 		(rewrittenDecision?.verdict !== "allow" &&
-			!(rewrittenDecision?.kind === "completed_side_effect" && proof))
+			!(rewrittenDecision?.kind === "completed_side_effect" && proof) &&
+			!(
+				rewrittenDecision?.kind === "completed_financial_mutation" &&
+				financialClaimGroundingReceiptIds(reply, args.actionResults).length > 0
+			))
 	) {
 		const error = new ElizaError(
 			"A grounded conversational reply could not be generated",
@@ -288,7 +389,8 @@ export async function resolvePlannedReplyEgress(args: {
 		text: reply,
 		effectReceiptIds:
 			proof?.map((receipt) => receipt.receiptId) ??
-			appliedEffectReceiptIdsForReply(reply, args.actionResults),
+			appliedEffectReceiptIdsForReply(reply, args.actionResults) ??
+			[],
 	};
 }
 

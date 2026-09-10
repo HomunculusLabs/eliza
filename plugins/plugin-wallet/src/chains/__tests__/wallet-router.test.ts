@@ -216,6 +216,20 @@ describe("wallet router action", () => {
     );
     expect(result?.data?.chain).toBe("base");
     expect(result?.data?.transactionHash).toBe("0xtest");
+    // #30958: a submitted non-dry-run execution binds an applied receipt so
+    // a transfer completion claim can be grounded at the reply egress gate.
+    const receipts = result?.effectReceipts ?? [];
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]).toMatchObject({
+      outcome: "applied",
+      operation: "wallet.transfer",
+      commit: { kind: "provider_accepted", id: "0xtest" },
+    });
+    expect(result?.userFacingEffectReceiptIds).toEqual([
+      receipts[0]?.receiptId,
+    ]);
+    expect(result?.userFacingText).toBe(result?.text);
+    expect(result?.verifiedUserFacing).toBe(true);
   });
 
   it("routes EVM swap through the selected chain handler", async () => {
@@ -436,6 +450,10 @@ describe("wallet router action", () => {
       dryRun: { supported: true },
     });
     expect(base.execute).not.toHaveBeenCalled();
+    // #30958: a dry-run prepared preview never mints a receipt — nothing was
+    // submitted, so nothing may ground a financial completion claim.
+    expect(result?.effectReceipts).toHaveLength(0);
+    expect(result?.userFacingEffectReceiptIds).toBeUndefined();
   });
 
   it("dispatches mode=simulate to handler.simulate without calling execute or the confirmation gate", async () => {

@@ -1916,3 +1916,208 @@ describe("escaped quote boundaries for empty-state egress", () => {
 		).toMatchObject({ verdict: "reject", kind: "empty_tracked_state" });
 	});
 });
+
+// ── Financial mutation completion claims (#30958) ───────────────────────────
+// A final reply may claim a financial mutation completed only when a matching
+// SUBMITTED operation result from this turn grounds it: a swap cannot
+// substantiate a transfer, an inspection cannot substantiate an order, and
+// prepared/simulated/dry-run/failed/unrelated results never can.
+describe("financial mutation claim egress (#30958)", () => {
+	const observedAt = "2026-09-09T00:00:00.000Z";
+	const submittedSwapReceipt: EffectReceipt = {
+		receiptId: "wallet:swap:sig-swap-1",
+		operation: "wallet.swap",
+		resource: { kind: "wallet.swap", id: "sig-swap-1" },
+		artifacts: [],
+		idempotency: { key: null, replayed: false },
+		observedAt,
+		outcome: "applied",
+		commit: {
+			kind: "provider_accepted",
+			id: "sig-swap-1",
+			committedAt: observedAt,
+		},
+	};
+	const submittedTransferReceipt: EffectReceipt = {
+		...submittedSwapReceipt,
+		receiptId: "wallet:transfer:sig-tx-1",
+		operation: "wallet.transfer",
+		resource: { kind: "wallet.transfer", id: "sig-tx-1" },
+		commit: {
+			kind: "provider_accepted",
+			id: "sig-tx-1",
+			committedAt: observedAt,
+		},
+	};
+	const preparedPreviewResult: ActionResult = {
+		success: true,
+		text: "Prepared transfer on base.",
+		data: { actionName: "WALLET" },
+	};
+	const swapResult = (receipt: EffectReceipt): ActionResult => ({
+		success: true,
+		text: "Submitted swap on solana: sig-swap-1.",
+		userFacingText: "Submitted swap on solana: sig-swap-1.",
+		verifiedUserFacing: true,
+		userFacingEffectReceiptIds: [receipt.receiptId],
+		effectReceipts: [receipt],
+		data: { actionName: "WALLET" },
+	});
+
+	it("rejects a transfer completion claim grounded only by a submitted swap", () => {
+		const reply =
+			"Done — I've sent the transfer of 1 SOL to your target address.";
+		expect(
+			evaluatePlannedReplyEgress({
+				reply,
+				actionResults: [swapResult(submittedSwapReceipt)],
+				actions: [],
+			}),
+		).toMatchObject({
+			verdict: "reject",
+			kind: "completed_financial_mutation",
+		});
+	});
+
+	it("allows a transfer completion claim grounded by a matching submitted transfer", () => {
+		const reply = "I've sent the transfer — signature sig-tx-1.";
+		expect(
+			evaluatePlannedReplyEgress({
+				reply,
+				actionResults: [
+					{
+						...swapResult(submittedTransferReceipt),
+						text: "Submitted transfer on solana: sig-tx-1.",
+						userFacingText: "Submitted transfer on solana: sig-tx-1.",
+					},
+				],
+				actions: [],
+			}),
+		).toEqual({ verdict: "allow" });
+	});
+
+	it("rejects a financial completion claim with no tool results at all", () => {
+		const reply = "The payment has been submitted on Base.";
+		expect(
+			evaluatePlannedReplyEgress({
+				reply,
+				actionResults: [],
+				actions: [],
+			}),
+		).toMatchObject({
+			verdict: "reject",
+			kind: "completed_financial_mutation",
+		});
+	});
+
+	it("rejects a financial completion claim grounded only by a prepared preview", () => {
+		const reply = "I have submitted the transfer of 0.5 ETH.";
+		expect(
+			evaluatePlannedReplyEgress({
+				reply,
+				actionResults: [preparedPreviewResult],
+				actions: [],
+			}),
+		).toMatchObject({
+			verdict: "reject",
+			kind: "completed_financial_mutation",
+		});
+	});
+
+	it("does not fire on balance observations", () => {
+		const replies = [
+			"Your wallet balance is 2.5 SOL.",
+			"You currently hold 12 USDC on Base.",
+			"The portfolio shows 0.05 ETH after the move.",
+		];
+		for (const reply of replies) {
+			expect(
+				evaluatePlannedReplyEgress({
+					reply,
+					actionResults: [],
+					actions: [],
+				}),
+			).toEqual({ verdict: "allow" });
+		}
+	});
+
+	it("does not fire on questions, offers, conditionals, or negations", () => {
+		const replies = [
+			"Should I send the transfer now?",
+			"I could submit the swap if you confirm.",
+			"I have not sent the payment yet.",
+			"Once the transfer is submitted, it takes a minute.",
+		];
+		for (const reply of replies) {
+			expect(
+				evaluatePlannedReplyEgress({
+					reply,
+					actionResults: [],
+					actions: [],
+				}),
+			).toEqual({ verdict: "allow" });
+		}
+	});
+
+	it("does not fire on prepared/simulated outcome reports", () => {
+		const replies = [
+			"Prepared transfer on base — reply yes to submit.",
+			"Simulated swap on solana: ok, ~120000 compute units.",
+		];
+		for (const reply of replies) {
+			expect(
+				evaluatePlannedReplyEgress({
+					reply,
+					actionResults: [],
+					actions: [],
+				}),
+			).toEqual({ verdict: "allow" });
+		}
+	});
+
+	it("matches a swap completion claim to the swap receipt operation", () => {
+		const reply = "I've completed the swap — 1 SOL to USDC.";
+		expect(
+			evaluatePlannedReplyEgress({
+				reply,
+				actionResults: [swapResult(submittedSwapReceipt)],
+				actions: [],
+			}),
+		).toEqual({ verdict: "allow" });
+	});
+
+	it("rejects an order completion claim grounded only by an inspection result", () => {
+		const reply = "The order has been submitted to Hyperliquid.";
+		const inspectResult: ActionResult = {
+			success: true,
+			text: "hyperliquid governed account is active.",
+			userFacingText: "hyperliquid governed account is active.",
+			verifiedUserFacing: true,
+			data: { actionName: "TRADE" },
+		};
+		expect(
+			evaluatePlannedReplyEgress({
+				reply,
+				actionResults: [inspectResult],
+				actions: [],
+			}),
+		).toMatchObject({
+			verdict: "reject",
+			kind: "completed_financial_mutation",
+		});
+	});
+
+	it("does not fire on non-financial completed side effects", () => {
+		const reply = "I've set your reminder for 9am.";
+		expect(
+			evaluatePlannedReplyEgress({
+				reply,
+				actionResults: [],
+				actions: [],
+			}),
+		).toMatchObject({
+			verdict: "reject",
+			kind: "completed_side_effect",
+		});
+	});
+});

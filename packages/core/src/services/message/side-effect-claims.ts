@@ -643,6 +643,154 @@ function localeReplyClaimsCompletedSideEffect(text: string): boolean {
 	return false;
 }
 
+// ── Financial mutation claim detection (#30958) ─────────────────────────────
+// A final reply may claim a financial mutation completed ("I've sent the
+// transfer", "the swap went through", "payment submitted") only when a
+// matching submitted operation from this turn grounds it. These detectors
+// fire only on mutation-report grammar; balance observations ("your balance
+// is 2.5 SOL") name no financial mutation noun and stay claim-free.
+const FINANCIAL_SUBJECT_NOUN_PATTERN =
+	/\b(?:transfer|payment|swap|trade|order|bridge|transaction|withdrawal|deposit|purchase|proposal|funds|sol|eth|btc|usdc|usdt)\b/i;
+// Perfective first-person mutation reports ("I've sent the transfer").
+const PERFECTIVE_FINANCIAL_CLAIM_PATTERN =
+	/\bi(?:['’]ve|\s+have|\s+just)\s+(?:(?:just|already|now)\s+)?(?:sent|submitted|transferred|swapped|bridged|bought|sold|executed|placed|paid|withdrawn|deposited|completed|confirmed)\b/gi;
+// Bare simple-past mutation reports ("I sent the transfer"), gated on the
+// same non-assertive lead and question exclusions as the scheduling tier.
+const BARE_PAST_FINANCIAL_CLAIM_PATTERN =
+	/\bi\s+(?:sent|submitted|transferred|swapped|bridged|bought|sold|executed|placed|paid|withdrew|deposited|completed|confirmed)\b/gi;
+// State-of-the-world mutation claims ("the transfer has been submitted",
+// "payment is confirmed", "the swap is complete").
+const STATE_FINANCIAL_CLAIM_PATTERN =
+	/\b(?:transfer|payment|swap|trade|order|bridge|transaction|withdrawal|deposit|purchase|proposal)\s+(?:(?:is|are|was|were)\s+|has\s+been\s+|have\s+been\s+)?(?:submitted|sent|completed|complete|confirmed|executed|processed|filled)\b/gi;
+// Subjectless headline mutation reports ("Submitted transfer on solana: …",
+// "Sent the payment.") — the shape wallet and trade actions themselves emit.
+// Anchored to a sentence start; the containing sentence must still name a
+// financial noun.
+const SUBJECTLESS_FINANCIAL_CLAIM_PATTERN =
+	/(?:^|[.!?]\s+)(?:sent|submitted|transferred|swapped|bridged|bought|sold|executed|paid|withdrawn|deposited|completed)\b/gi;
+// A subordinator opening the containing sentence makes a state claim
+// conditional ("Once the transfer is submitted, it takes a minute"), not a
+// report of finished work. The scheduling tier's lead pattern checks the
+// text immediately before the verb; the state tier's noun sits between the
+// subordinator and the verb, so the sentence start itself is checked here.
+const CONDITIONAL_FINANCIAL_SENTENCE_LEAD_PATTERN =
+	/^\s*(?:if|unless|once|when|whenever|while|before|after|until|whether|should|shall)\b/i;
+
+/**
+ * True when a reply ASSERTS that a financial mutation was submitted or
+ * completed. Balance/holdings observations are reads, not mutation reports,
+ * and never fire here. Questions, offers, conditionals, and negations pass
+ * through — the same grammatical-certainty contract as the scheduling tier.
+ */
+export function replyClaimsCompletedFinancialMutation(reply: string): boolean {
+	const text = reply.trim();
+	if (!text) return false;
+	if (!FINANCIAL_SUBJECT_NOUN_PATTERN.test(text)) return false;
+	for (const match of text.matchAll(PERFECTIVE_FINANCIAL_CLAIM_PATTERN)) {
+		const prefix = text.slice(0, match.index);
+		if (NON_ASSERTIVE_SIDE_EFFECT_LEAD_PATTERN.test(prefix)) continue;
+		if (sideEffectClaimSentenceIsQuestion(text, match.index)) continue;
+		return true;
+	}
+	for (const match of text.matchAll(BARE_PAST_FINANCIAL_CLAIM_PATTERN)) {
+		const prefix = text.slice(0, match.index);
+		if (NON_ASSERTIVE_SIDE_EFFECT_LEAD_PATTERN.test(prefix)) continue;
+		if (sideEffectClaimSentenceIsQuestion(text, match.index)) continue;
+		return true;
+	}
+	for (const match of text.matchAll(STATE_FINANCIAL_CLAIM_PATTERN)) {
+		if (
+			NON_ASSERTIVE_SIDE_EFFECT_LEAD_PATTERN.test(text.slice(0, match.index))
+		) {
+			continue;
+		}
+		const sentence = sentenceContaining(text, match.index);
+		if (CONDITIONAL_FINANCIAL_SENTENCE_LEAD_PATTERN.test(sentence)) {
+			continue;
+		}
+		if (sideEffectClaimSentenceIsQuestion(text, match.index)) continue;
+		return true;
+	}
+	for (const match of text.matchAll(SUBJECTLESS_FINANCIAL_CLAIM_PATTERN)) {
+		if (sideEffectClaimSentenceIsQuestion(text, match.index)) continue;
+		return true;
+	}
+	return false;
+}
+
+/** Operation family a financial completion claim names, for receipt matching. */
+export type FinancialClaimOperationFamily =
+	| "transfer"
+	| "swap"
+	| "bridge"
+	| "order"
+	| "payment"
+	| "governance";
+
+/**
+ * Map a reply's financial claim to the operation family it names, so
+ * grounding can require a matching submitted receipt — a swap receipt cannot
+ * substantiate a transfer claim. Returns undefined when no family matches.
+ * Bridge and swap are tested before transfer because cross-chain phrasing
+ * routinely reuses the word "transfer".
+ */
+export function financialClaimOperationFamily(
+	reply: string,
+): FinancialClaimOperationFamily | undefined {
+	const text = reply.trim().toLowerCase();
+	if (!text) return undefined;
+	if (/\bbridge(?:d|s)?\b|\bcross[- ]chain\b/.test(text)) return "bridge";
+	if (/\bswap(?:ped|s)?\b/.test(text)) return "swap";
+	if (/\btransfer(?:red|s)?\b/.test(text)) return "transfer";
+	if (
+		/\border(?:ed|s)?\b|\bbought\b|\bsold\b|\bpurchase[ds]?\b|\bfilled\b|\btrade[ds]?\b/.test(
+			text,
+		)
+	) {
+		return "order";
+	}
+	if (/\bpayment\b|\bpaid\b/.test(text)) return "payment";
+	if (/\bproposal\b|\bvoted?\b|\bgovernance\b/.test(text)) return "governance";
+	return undefined;
+}
+
+/**
+ * True when a receipt operation belongs to the family a financial claim
+ * names. Governance execution claims ("executed the proposal") additionally
+ * require the execute operation: a queued or proposed governance operation
+ * cannot substantiate execution.
+ */
+export function financialClaimMatchesOperation(
+	family: FinancialClaimOperationFamily,
+	reply: string,
+	operation: string,
+): boolean {
+	const normalized = operation.trim().toLowerCase();
+	const text = reply.trim().toLowerCase();
+	// Boundary-anchored so "wallet.swap" never matches a hypothetical
+	// "wallet.swaps" operation and vice versa.
+	const isOp = (prefix: string): boolean =>
+		normalized === prefix || normalized.startsWith(`${prefix}.`);
+	switch (family) {
+		case "transfer":
+			return isOp("wallet.transfer");
+		case "payment":
+			return isOp("wallet.transfer") || isOp("payment");
+		case "swap":
+			return isOp("wallet.swap");
+		case "bridge":
+			return isOp("wallet.bridge");
+		case "order":
+			return isOp("steward.order") || isOp("wallet.pump_fun_buy");
+		case "governance":
+			if (/\bexecut(?:ed|ion|e)\b/.test(text)) {
+				return isOp("wallet.gov.execute");
+			}
+			return isOp("wallet.gov");
+	}
+	return false;
+}
+
 export function replyClaimsCompletedSideEffect(reply: string): boolean {
 	const text = reply.trim();
 	if (!text) return false;

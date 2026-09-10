@@ -14,6 +14,7 @@
 import type {
   Action,
   ActionResult,
+  EffectReceipt,
   HandlerCallback,
   HandlerOptions,
   IAgentRuntime,
@@ -374,6 +375,69 @@ function resultText(result: WalletRouterResult): string {
   return `Submitted ${execution.subaction} on ${result.handler.chain}${id ? `: ${id}` : "."}`;
 }
 
+/**
+ * Effect receipts for a routed wallet operation (#30958). Only a submitted,
+ * non-dry-run, non-simulated execution carries an applied receipt — its
+ * transaction hash or signature is the provider acceptance proof. Prepared
+ * and simulated outcomes emit NO receipt: their texts ("Prepared transfer
+ * on base.", "Simulated swap …") are planner-visible previews that never
+ * assert completion, and emitting a preview receipt would declare the effect
+ * contract without a user-facing binding, suppressing their callback
+ * delivery in the settlement layer. Failures likewise emit none.
+ */
+function walletRouterEffectReceipts(
+  result: WalletRouterResult,
+): EffectReceipt[] {
+  if (!result.ok) return [];
+  const execution = result.result;
+  if (execution.status !== "submitted" || execution.dryRun) return [];
+  const observedAt = new Date().toISOString();
+  const commitId = execution.transactionHash ?? execution.signature ?? "";
+  const receiptId = `wallet:${execution.subaction}:${commitId || execution.chainId}`;
+  return [
+    {
+      receiptId,
+      operation: `wallet.${execution.subaction}`,
+      resource: {
+        kind: `wallet.${execution.subaction}`,
+        id: commitId || execution.chainId,
+      },
+      artifacts: [],
+      idempotency: { key: null, replayed: false },
+      observedAt,
+      outcome: "applied",
+      commit: {
+        kind: "provider_accepted",
+        id: commitId || receiptId,
+        committedAt: observedAt,
+      },
+    },
+  ];
+}
+
+/**
+ * Bind the settled wallet result's user-facing text to its receipts so the
+ * settlement layer delivers the canonical confirmation (calendar-handler
+ * pattern): `verifiedUserFacing` + exact `userFacingText` + bound receipt
+ * IDs. Only a submitted execution gets a user-facing binding; previews and
+ * failures keep their text planner-visible without claiming completion.
+ */
+function walletRouterUserFacing(
+  text: string,
+  receipts: readonly EffectReceipt[],
+): Pick<
+  ActionResult,
+  "userFacingText" | "verifiedUserFacing" | "userFacingEffectReceiptIds"
+> {
+  const applied = receipts.some((receipt) => receipt.outcome === "applied");
+  if (!applied) return {};
+  return {
+    userFacingText: text,
+    verifiedUserFacing: true,
+    userFacingEffectReceiptIds: receipts.map((receipt) => receipt.receiptId),
+  };
+}
+
 function serviceFromRuntime(
   runtime: IAgentRuntime,
 ): WalletBackendService | null {
@@ -500,6 +564,7 @@ async function runWalletRouter(
 
   const routed = await service.routeWalletAction(executionParams);
   const text = resultText(routed);
+  const effectReceipts = walletRouterEffectReceipts(routed);
   const data = toProviderRecord(
     routed.ok
       ? {
@@ -524,6 +589,8 @@ async function runWalletRouter(
   return {
     success: routed.ok,
     text,
+    ...walletRouterUserFacing(text, effectReceipts),
+    effectReceipts,
     values: routed.ok
       ? {
           walletActionSucceeded: routed.result.status === "submitted",

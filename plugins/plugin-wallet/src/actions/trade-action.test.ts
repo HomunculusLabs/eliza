@@ -264,6 +264,47 @@ describe("tradeRouterAction", () => {
     expect(body.idempotencyKey).toBe(persistedKey);
   });
 
+  it("binds a submitted order to an applied effect receipt for claim grounding (#30958)", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse(200, stewardFixtures.tokenStatusObserved),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(200, stewardFixtures.activeHyperliquidSession),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(200, stewardFixtures.tokenStatusObserved),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(200, stewardFixtures.activeHyperliquidSession),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(200, stewardFixtures.hyperliquidOrderAccepted),
+      );
+    const { runtime } = createRuntime(fetchMock as unknown as typeof fetch);
+
+    const pending = await run(runtime, "buy btc", hyperliquidOrder);
+    expect(pending?.data?.requiresConfirmation).toBe(true);
+    // A pending confirmation preview carries no receipts: nothing was
+    // submitted, so nothing may ground a completion claim.
+    expect(pending?.effectReceipts).toBeUndefined();
+    expect(pending?.userFacingEffectReceiptIds).toBeUndefined();
+
+    const confirmed = await run(runtime, "yes, confirm", hyperliquidOrder);
+    expect(confirmed?.success).toBe(true);
+    const receipts = confirmed?.effectReceipts ?? [];
+    expect(receipts).toHaveLength(1);
+    const receipt = receipts[0] as unknown as Record<string, unknown>;
+    expect(receipt.outcome).toBe("applied");
+    expect(receipt.operation).toBe("steward.order.submit");
+    const commit = receipt.commit as Record<string, unknown>;
+    expect(commit.kind).toBe("provider_accepted");
+    expect(confirmed?.userFacingEffectReceiptIds).toEqual([receipt.receiptId]);
+    expect(confirmed?.userFacingText).toBe(confirmed?.text);
+    expect(confirmed?.verifiedUserFacing).toBe(true);
+  });
+
   it("generates one idempotency key for a pending logical order", async () => {
     const { runtime } = createRuntime(vi.fn() as unknown as typeof fetch);
     const keyFactory = vi.fn(() => "trade-key-1");
