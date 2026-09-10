@@ -37,6 +37,7 @@ describe("isTruthyEnvValue (canonical)", () => {
 			"enable",
 			"t",
 			"truthy",
+			"2",
 			"",
 			"   ",
 		]) {
