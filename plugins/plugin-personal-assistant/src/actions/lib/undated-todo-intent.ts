@@ -367,6 +367,40 @@ function maskSpans(text: string, spans: readonly TextSpan[]): string {
   return characters.join("");
 }
 
+const SEPARATE_OPERATION_INTRODUCERS = {
+  // English patterns that introduce a NEW owner operation in the segment after
+  // an undated-todo directive. Each pattern is matched against text already
+  // normalized to lowercase by `normalizeKeywordMatchText`. A bare connector
+  // ("then", "also") is NOT enough to cut scope — "no due date, then make it
+  // friday" is a correction to the same todo — so every introducer is anchored
+  // by an operation verb whose object is a DIFFERENT item: the pronoun
+  // lookahead rejects "make it a task"/"put it on my calendar" transforms of
+  // THIS todo, and a bare "todo|task" object never cuts scope because
+  // "schedule the todo on friday"/"schedule the first todo tomorrow" are
+  // corrections and cross-references to THIS todo, not new items (#30975).
+  en: [
+    /\b(?:create|add|schedule|put|make|set|remind(?:\s+me)?|book|block|start)\b(?!\s+(?:it|this|that|them)\b)[^.;!?]{0,40}\b(?:calendar|meeting|appointment|event|reminder|alarm|goal|routine|habit|note)\b/u,
+    /\b(?:create|add|make|start)\b(?!\s+(?:it|this|that|them)\b)[^.;!?]{0,20}\b(?:a|an|another|new|second|third)\s+(?:todo|task)\b/u,
+  ],
+} as const;
+
+// A sentence-led anaphoric correction transforms THIS todo even when it
+// appears after a separate-operation introducer, so it must still contradict
+// the no-date directive. Covers both pronoun-led ("make it friday") and
+// definite noun-led ("schedule the todo on friday") references.
+const ANAPHORIC_CORRECTION_INTRODUCERS = [
+  /\b(?:make|schedule|move|put|set|mark|flag|take|turn)\s+(?:it|this|that|them)\b/u,
+  /\b(?:make|schedule|move|put|set|mark|flag|take|turn)\s+the\s+(?:todo|task)\b/u,
+  /\b(?:make|schedule|move|put|set|mark|flag|take|turn)\s+(?:the\s+)?(?:first|previous|earlier|original|other|last|second|third)\s+(?:todo|task|one|item)\b/u,
+] as const;
+
+// Authored multi-step requests keep their whole-message policy: the resolver
+// owns per-todo attribution there, so the raw helpers must not cut scope.
+// Newlines survive: the gate runs on the raw text, and authored steps carry
+// hard line starts ("\n1. ", "\n2. ") even though the directive scan itself
+// normalizes whitespace away.
+const AUTHORED_LIST_LINE = /(?:^|\n)\s*(?:\d+[.)]|[-*])\s+/u;
+
 const TITLE_SCHEDULE_SPANS = [
   new RegExp(
     `\\b(?:call|name|title|label)\\s+(?:it|this|that|the\\s+(?:todo|task|item))?\\s*(?:as\\s+|called\\s+|titled\\s+)?["'“”‘’]?(?:${ENGLISH_TEMPORAL_NAMES}|daily|weekly|monthly|yearly)\\b`,
@@ -406,9 +440,36 @@ function undatedTodoDirectiveState(text: string): UndatedTodoDirectiveState {
   if (!normalized) return "absent";
   const directive = orderedUndatedDirectives(normalized).at(-1);
   if (!directive || directive.kind === "deny") return "absent";
-  return suffixStatesSchedule(normalized.slice(directive.end))
-    ? "scheduled_after_explicit"
-    : "explicit";
+  const suffix = normalized.slice(directive.end);
+  if (!suffixStatesSchedule(suffix)) return "explicit";
+  // Plain-prose operation scoping (#30975): in a message that is not an
+  // authored list, a schedule marker in the suffix only contradicts the
+  // undated directive when it stays within THIS todo's operation. A later
+  // segment that introduces a separate owner operation (another calendar
+  // event, meeting, reminder, ...) owns its own times; its markers must not
+  // correct or complete this todo's authority. Authored lists are excluded:
+  // the resolver owns per-todo attribution there and the raw helpers must
+  // keep their whole-message policy. A sentence-led anaphoric correction
+  // ("make it friday") still transforms THIS todo and keeps contradicting.
+  if (AUTHORED_LIST_LINE.test(text)) return "scheduled_after_explicit";
+  const scopeEnd = SEPARATE_OPERATION_INTRODUCERS.en.reduce<number | null>(
+    (earliest, pattern) => {
+      for (const span of patternSpans(suffix, pattern)) {
+        if (earliest === null || span.start < earliest) earliest = span.start;
+      }
+      return earliest;
+    },
+    null,
+  );
+  const anaphoricCorrection = ANAPHORIC_CORRECTION_INTRODUCERS.some(
+    (pattern) => patternSpans(suffix, pattern).length > 0,
+  );
+  if (scopeEnd !== null && !anaphoricCorrection) {
+    return suffixStatesSchedule(suffix.slice(0, scopeEnd))
+      ? "scheduled_after_explicit"
+      : "explicit";
+  }
+  return "scheduled_after_explicit";
 }
 
 /** True only when the owner's last no-date directive survives later schedule text. */

@@ -1074,6 +1074,45 @@ describe("runLifeOperationHandler clarification contract", () => {
     ]);
   });
 
+  it("saves an explicitly undated plain-prose todo even when a later separate operation supplies its own time (#30975)", async () => {
+    const ownerText =
+      "Add buy milk with no due date. Then create a calendar event called Grocery run from 11:00 to 11:30.";
+    const runtime = makeRuntime((prompt) => {
+      if (prompt.includes("create_definition request")) {
+        return taskPlanJson({
+          requestKind: "todo",
+          title: "Buy milk",
+          cadenceKind: "unscheduled",
+        });
+      }
+      return "";
+    });
+
+    const result = await runLifeOperationHandler(
+      runtime,
+      makeMessage(ownerText),
+      undefined,
+      {
+        parameters: {
+          action: "create",
+          intent: ownerText,
+          ownerSurface: "OWNER_TODOS",
+        },
+      } as HandlerOptions,
+    );
+
+    // The calendar operation's 11:00 belongs to Grocery run, not the todo:
+    // the todo's unscheduled cadence must survive the separate operation and
+    // persist in one turn.
+    expect(result.success).toBe(true);
+    expect(serviceState.createCalls).toEqual([
+      expect.objectContaining({
+        kind: "task",
+        cadence: { kind: "unscheduled" },
+      }),
+    ]);
+  });
+
   it("does not treat a future confirmation clause as current consent", async () => {
     const ownerText =
       "Create a personal todo titled Buy oat milk. It has no due date or reminder. Preview it first and do not save until I confirm.";
